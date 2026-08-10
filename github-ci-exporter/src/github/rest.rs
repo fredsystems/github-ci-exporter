@@ -239,16 +239,28 @@ pub async fn fetch_runs(
 fn fingerprint_workflows(live: &[Workflow]) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
 
-    let mut pairs: Vec<(&str, &str)> = live
+    // Must cover every input the reduction reads: path and name decide
+    // identity and labels, and triggers decide which runs survive. Omitting
+    // triggers would let a trigger-only change keep the same cache key, so the
+    // 304 on an unchanged runs listing would replay a reduction computed
+    // against the old trigger set -- the same stale-reduction bug the
+    // fingerprint exists to prevent.
+    let mut entries: Vec<(&str, &str, Vec<&str>)> = live
         .iter()
-        .map(|w| (w.path.as_str(), w.name.as_str()))
+        .map(|w| {
+            let mut triggers: Vec<&str> = w.triggers.iter().map(String::as_str).collect();
+            // Sorted so an API or file reordering cannot spuriously invalidate.
+            triggers.sort_unstable();
+            (w.path.as_str(), w.name.as_str(), triggers)
+        })
         .collect();
-    pairs.sort_unstable();
+    entries.sort_unstable();
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (path, name) in pairs {
+    for (path, name, triggers) in entries {
         path.hash(&mut hasher);
         name.hash(&mut hasher);
+        triggers.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1007,6 +1019,40 @@ mod tests {
             fingerprint_workflows(&before),
             fingerprint_workflows(&after),
             "a rename changes the output labels and must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_only_triggers_change() {
+        // Regression guard: reduce_runs filters on triggers, so they are part
+        // of the reduction's input. A trigger-only edit leaves the runs
+        // listing unchanged, so the request answers 304; without triggers in
+        // the key the stale reduction would be replayed and runs from the old
+        // trigger set would reappear.
+        let before = wf("CI", &["push", "pull_request"]);
+        let after = wf("CI", &["pull_request"]);
+        assert_ne!(
+            fingerprint_workflows(&before),
+            fingerprint_workflows(&after)
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_trigger_ordering() {
+        // The `on:` mapping order is incidental; reordering it must not force
+        // an uncached refetch of every repository.
+        let a = wf("CI", &["push", "pull_request", "merge_group"]);
+        let b = wf("CI", &["merge_group", "push", "pull_request"]);
+        assert_eq!(fingerprint_workflows(&a), fingerprint_workflows(&b));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_empty_from_populated_triggers() {
+        // Empty means "unknown, accept anything", which is a materially
+        // different reduction from an explicit single trigger.
+        assert_ne!(
+            fingerprint_workflows(&wf("CI", &[])),
+            fingerprint_workflows(&wf("CI", &["push"]))
         );
     }
 
