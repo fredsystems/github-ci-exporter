@@ -493,7 +493,7 @@ impl Client {
             && let Ok(mut cache) = self.cache.lock()
         {
             cache.insert(
-                url,
+                cache_key,
                 CacheEntry {
                     etag,
                     body: encoded,
@@ -792,6 +792,57 @@ mod tests {
             "a new cache key must not replay the old projection"
         );
         assert_eq!(outcome, CacheOutcome::Modified);
+    }
+
+    #[tokio::test]
+    async fn custom_cache_key_is_reused_on_repeat() {
+        // Regression guard: entries were read by cache key but written by URL,
+        // so every `get_cached_as` caller refetched and reprojected. That
+        // silently disabled ETag revalidation for the runs endpoint, the
+        // single largest consumer of the rate-limit budget.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"e1\"")
+                    .set_body_json(json!({"n": 7})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (first, outcome): (i64, _) = client
+            .get_cached_as("/runs#fp=abc", "/runs", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("first");
+        assert_eq!(first, 7);
+        assert_eq!(outcome, CacheOutcome::Modified);
+
+        // The same key must now revalidate and be answered from cache.
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (second, outcome): (i64, _) = client
+            .get_cached_as("/runs#fp=abc", "/runs", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("second");
+        assert_eq!(second, 7, "cached projection must be replayed");
+        assert_eq!(
+            outcome,
+            CacheOutcome::NotModified,
+            "a repeated custom key must revalidate rather than refetch"
+        );
     }
 
     #[tokio::test]
