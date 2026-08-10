@@ -43,7 +43,12 @@ const fn estimate_core_requests(monitored: u64) -> u64 {
 /// schedules are resolved once and refreshed lazily rather than every cycle.
 #[derive(Debug, Default)]
 pub struct WorkflowCache {
-    /// `owner/name` -> workflow name -> expected interval in seconds.
+    /// `owner/name` -> workflow **file path** -> expected interval in seconds.
+    ///
+    /// Keyed by path, not display name, for the same reason the run reducer is:
+    /// the path is the workflow's identity. Keying by name meant a rename plus
+    /// a failed contents lookup dropped the cached interval, because the old
+    /// name was no longer in the live set.
     intervals: HashMap<String, HashMap<String, i64>>,
     /// `owner/name` -> the workflow files currently present in the repo.
     ///
@@ -360,9 +365,10 @@ fn merge_intervals(
     live: &[rest::Workflow],
 ) {
     cached.extend(resolved);
-    let live_names: std::collections::HashSet<&str> =
-        live.iter().map(|w| w.name.as_str()).collect();
-    cached.retain(|name, _| live_names.contains(name.as_str()));
+    // Retained by path, so renaming a workflow does not orphan its interval.
+    let live_paths: std::collections::HashSet<&str> =
+        live.iter().map(|w| w.path.as_str()).collect();
+    cached.retain(|path, _| live_paths.contains(path.as_str()));
 }
 
 /// Publishes whether GitHub will actually run each workflow.
@@ -400,7 +406,7 @@ async fn resolve_definitions(
         match rest::fetch_workflow_definition(client, repo, &workflow.path).await {
             Ok(definition) => {
                 if let Some(interval) = shortest_cron_interval(&definition.crons) {
-                    intervals.insert(workflow.name.clone(), interval);
+                    intervals.insert(workflow.path.clone(), interval);
                 }
                 workflow.triggers = definition.triggers;
             }
@@ -491,7 +497,19 @@ fn record_runs(
     cache: &WorkflowCache,
     now: DateTime<Utc>,
 ) {
-    let intervals = cache.intervals.get(&repo.full_name());
+    let full_name = repo.full_name();
+    let intervals = cache.intervals.get(&full_name);
+    // Runs are labelled by display name, while intervals are keyed by path, so
+    // the workflow set provides the mapping between the two.
+    let path_for_name: HashMap<&str, &str> = cache
+        .workflows
+        .get(&full_name)
+        .map(|ws| {
+            ws.iter()
+                .map(|w| (w.name.as_str(), w.path.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     for run in &runs.latest {
         // A run older than the staleness horizon says nothing about the
@@ -534,7 +552,10 @@ fn record_runs(
             })
             .set(run.created_at.timestamp());
 
-        if let Some(interval) = intervals.and_then(|m| m.get(&run.workflow)) {
+        if let Some(interval) = path_for_name
+            .get(run.workflow.as_str())
+            .and_then(|path| intervals.and_then(|m| m.get(*path)))
+        {
             metrics
                 .workflow_expected_interval
                 .get_or_create(&WorkflowLabels {
@@ -690,41 +711,78 @@ mod tests {
         // Regression guard: replacing the interval map wholesale made
         // workflow_expected_interval_seconds vanish whenever a contents fetch
         // failed, which flaps GitHubScheduledWorkflowStale.
-        let mut cached = HashMap::from([("update-flakes".to_owned(), 604_800_i64)]);
+        let mut cached = HashMap::from([(
+            ".github/workflows/update-flakes.yml".to_owned(),
+            604_800_i64,
+        )]);
         let live = vec![wf("update-flakes", &["schedule"])];
 
         merge_intervals(&mut cached, HashMap::new(), &live);
 
-        assert_eq!(cached.get("update-flakes"), Some(&604_800));
+        assert_eq!(
+            cached.get(".github/workflows/update-flakes.yml"),
+            Some(&604_800)
+        );
     }
 
     #[test]
     fn a_new_interval_overwrites_the_cached_one() {
-        let mut cached = HashMap::from([("update-flakes".to_owned(), 604_800_i64)]);
+        let mut cached = HashMap::from([(
+            ".github/workflows/update-flakes.yml".to_owned(),
+            604_800_i64,
+        )]);
         let live = vec![wf("update-flakes", &["schedule"])];
 
         merge_intervals(
             &mut cached,
-            HashMap::from([("update-flakes".to_owned(), 86_400_i64)]),
+            HashMap::from([(".github/workflows/update-flakes.yml".to_owned(), 86_400_i64)]),
             &live,
         );
 
-        assert_eq!(cached.get("update-flakes"), Some(&86_400));
+        assert_eq!(
+            cached.get(".github/workflows/update-flakes.yml"),
+            Some(&86_400)
+        );
     }
 
     #[test]
     fn intervals_for_deleted_workflows_are_dropped() {
         // Otherwise a removed cron workflow stays "expected to run" forever.
         let mut cached = HashMap::from([
-            ("update-flakes".to_owned(), 604_800_i64),
-            ("gone".to_owned(), 86_400_i64),
+            (
+                ".github/workflows/update-flakes.yml".to_owned(),
+                604_800_i64,
+            ),
+            (".github/workflows/gone.yml".to_owned(), 86_400_i64),
         ]);
         let live = vec![wf("update-flakes", &["schedule"])];
 
         merge_intervals(&mut cached, HashMap::new(), &live);
 
         assert_eq!(cached.len(), 1);
-        assert!(!cached.contains_key("gone"));
+        assert!(!cached.contains_key(".github/workflows/gone.yml"));
+    }
+
+    #[test]
+    fn a_rename_plus_failed_lookup_keeps_the_interval() {
+        // Regression guard: intervals were keyed by display name while
+        // identity is the file path. Renaming a workflow whose contents
+        // lookup then failed orphaned the cached interval, so
+        // workflow_expected_interval_seconds vanished for that cycle and
+        // flapped GitHubScheduledWorkflowStale.
+        let mut cached = HashMap::from([(".github/workflows/CI.yml".to_owned(), 86_400_i64)]);
+
+        // Same file, new display name, and no freshly resolved interval.
+        let mut renamed = wf("Build", &["schedule"]);
+        renamed.path = ".github/workflows/CI.yml".to_owned();
+
+        merge_intervals(&mut cached, HashMap::new(), &[renamed]);
+
+        assert_eq!(
+            cached.get(".github/workflows/CI.yml"),
+            Some(&86_400),
+            "a rename must not orphan the cached interval"
+        );
     }
 
     #[test]
