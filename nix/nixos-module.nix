@@ -21,6 +21,7 @@ let
       listen
       interval
       ;
+    ignore_pulls = cfg.ignorePulls;
     skip_repos_without_workflows = cfg.skipReposWithoutWorkflows;
     state_dir = "/var/lib/github-ci-exporter";
   }
@@ -57,6 +58,34 @@ in
         Repositories to exclude, as `owner/name`. Applied on top of the
         automatic filters, which already drop archived repositories and
         repositories with no workflow files.
+      '';
+    };
+
+    ignorePulls = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "sdr-enthusiasts/docker-vesselalert#32" ];
+      description = ''
+        Individual pull requests to suppress, as `owner/name#number`.
+
+        For a pull request that is genuinely stuck and genuinely not
+        actionable: one opened against a repository you do not own, which the
+        maintainer has not engaged with and which is not yours to close or
+        convert to a draft. Nothing the exporter can measure distinguishes
+        that from a pull request worth chasing, so it has to be declared.
+
+        Suppressed pull requests are dropped from the per-PR series
+        (`github_pull_needs_attention`, `github_pull_ready_to_merge`,
+        `github_pull_created_timestamp_seconds`), so no alert can fire on
+        them. They still count towards `github_repo_pulls_open`, and the
+        number suppressed per repository is published as
+        `github_repo_pulls_ignored` so the difference is explainable.
+
+        Prefer this over adding the repository to `denylist`, which would also
+        hide its CI state and every future pull request on it.
+
+        A malformed entry is a startup error rather than a filter that
+        silently never matches.
       '';
     };
 

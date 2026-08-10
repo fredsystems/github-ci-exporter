@@ -106,6 +106,7 @@ flag alone.
 | `github_repo_issues_open`                          | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_open`                           | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_draft`                          | gauge   | `org`, `repo`, `author_kind`                        |
+| `github_repo_pulls_ignored`                        | gauge   | `org`, `repo`                                       |
 | `github_pull_created_timestamp_seconds`            | gauge   | `org`, `repo`, `number`, `author`, `author_kind`, `draft`, `checks`, `mergeable`, `auto_merge` |
 | `github_pull_needs_attention`                      | gauge   | same as above                                       |
 | `github_pull_ready_to_merge`                       | gauge   | same as above                                       |
@@ -170,6 +171,31 @@ mergeability lazily, so a first query often returns `UNKNOWN` for a PR that is
 in fact conflicting — observed on two PRs that both resolved to `CONFLICTING`
 on re-query.
 
+### Suppressing a pull request
+
+Some PRs are stuck and will stay stuck. A PR opened against a repository you do
+not own, which the maintainer has not engaged with, is not yours to close or
+convert to a draft — and nothing the exporter can measure distinguishes it from
+a PR worth chasing. Those are declared:
+
+```toml
+ignore_pulls = ["sdr-enthusiasts/docker-vesselalert#32"]
+```
+
+A suppressed PR is dropped from `github_pull_needs_attention`,
+`github_pull_ready_to_merge`, and `github_pull_created_timestamp_seconds`, so no
+alert can fire on it. It still counts towards `github_repo_pulls_open`, because
+the repository really does have it open, and the number suppressed is published
+per repository as `github_repo_pulls_ignored` — a published zero included, so
+"nothing is hidden here" is an assertion rather than an assumption.
+
+This is deliberately per-PR. Adding the repository to `denylist` would also
+blind the exporter to its CI and to every future pull request on it.
+
+A malformed entry is a startup error, not a filter that silently never matches:
+the worst outcome would be an operator believing a PR is suppressed while its
+alert keeps firing.
+
 ## Configuration
 
 TOML file, with `GHCI_`-prefixed environment overrides:
@@ -180,6 +206,7 @@ interval = "5m"
 listen = "127.0.0.1:9418"
 state_dir = "/var/lib/github-ci-exporter"
 denylist = []
+ignore_pulls = []
 skip_repos_without_workflows = true
 # max_repo_age = "365d"
 ```
