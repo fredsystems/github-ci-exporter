@@ -98,9 +98,11 @@ pub struct Workflow {
 impl Workflow {
     /// Whether this workflow currently declares `event` as a trigger.
     ///
-    /// `merge_group` accepts `push` too: a merge-queue run reports
-    /// `event = "merge_group"`, but the queue exists to gate what lands on the
-    /// branch, so treating it as branch state is correct.
+    /// Note that `merge_group` never reaches this check. Merge-queue runs
+    /// execute on a `gh-readonly-queue/...` branch, so the runs request's
+    /// `branch=` filter excludes them before reduction -- verified against
+    /// nixos and freminal, where none of their `merge_group` runs appear under
+    /// `branch=main`. The post-merge `push` run is what reports branch state.
     fn declares(&self, event: &str) -> bool {
         if self.triggers.is_empty() {
             return true;

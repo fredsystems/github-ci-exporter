@@ -307,14 +307,62 @@ async fn resolve_monitored(
         }
         // Trigger lists must be resolved before the workflow set is cached,
         // because the run reducer reads them from the cache.
-        let intervals = resolve_definitions(client, &repo, &mut workflows).await;
-        cache.workflows.insert(key.clone(), workflows);
-        cache.intervals.insert(key, intervals);
+        let resolved = resolve_definitions(client, &repo, &mut workflows).await;
+
+        if let Some(previous) = cache.workflows.get(&key) {
+            carry_forward_triggers(&mut workflows, previous);
+        }
+
+        let entry = cache.intervals.entry(key).or_default();
+        merge_intervals(entry, resolved, &workflows);
+
+        cache.workflows.insert(repo.full_name(), workflows);
 
         monitored.push(repo);
     }
 
     monitored
+}
+
+/// Restores trigger lists that this cycle failed to fetch.
+///
+/// `resolve_definitions` leaves `triggers` empty when a file lookup fails, and
+/// an empty list means "accept any event". Without this, a transient contents
+/// error would silently re-admit runs from a superseded trigger configuration
+/// -- reintroducing the frext/bike-fitter false positive for one cycle.
+fn carry_forward_triggers(current: &mut [rest::Workflow], previous: &[rest::Workflow]) {
+    for workflow in current {
+        if !workflow.triggers.is_empty() {
+            continue;
+        }
+        if let Some(old) = previous
+            .iter()
+            .find(|w| w.path == workflow.path && !w.triggers.is_empty())
+        {
+            workflow.triggers.clone_from(&old.triggers);
+        }
+    }
+}
+
+/// Folds newly-resolved cron intervals into the cached set.
+///
+/// Merges rather than replaces: `resolve_definitions` omits any workflow whose
+/// file lookup failed, so replacing wholesale would drop a previously-known
+/// interval. That would make `workflow_expected_interval_seconds` disappear and
+/// reappear, which in turn flaps `GitHubScheduledWorkflowStale` because that
+/// rule compares against it.
+///
+/// Intervals for workflows that no longer exist are dropped, so a deleted cron
+/// workflow stops being expected to run.
+fn merge_intervals(
+    cached: &mut HashMap<String, i64>,
+    resolved: HashMap<String, i64>,
+    live: &[rest::Workflow],
+) {
+    cached.extend(resolved);
+    let live_names: std::collections::HashSet<&str> =
+        live.iter().map(|w| w.name.as_str()).collect();
+    cached.retain(|name, _| live_names.contains(name.as_str()));
 }
 
 /// Publishes whether GitHub will actually run each workflow.
@@ -592,6 +640,91 @@ mod tests {
         let interval = shortest_cron_interval(&["nonsense".to_owned(), "0 12 * * *".to_owned()])
             .expect("valid expression should still resolve");
         assert_eq!(interval, 86_400);
+    }
+
+    fn wf(name: &str, triggers: &[&str]) -> rest::Workflow {
+        rest::Workflow {
+            name: name.to_owned(),
+            path: format!(".github/workflows/{name}.yml"),
+            state: rest::WorkflowState::Active,
+            triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn triggers_are_carried_forward_when_a_lookup_fails() {
+        // A failed contents fetch leaves triggers empty, which means "accept
+        // any event". Without carry-forward that silently re-admits runs from
+        // a superseded trigger for a cycle.
+        let previous = vec![wf("CI", &["pull_request"])];
+        let mut current = vec![wf("CI", &[])];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(current[0].triggers, ["pull_request"]);
+    }
+
+    #[test]
+    fn freshly_resolved_triggers_win_over_cached_ones() {
+        let previous = vec![wf("CI", &["push"])];
+        let mut current = vec![wf("CI", &["pull_request"])];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(
+            current[0].triggers,
+            ["pull_request"],
+            "a real change must not be reverted by the cache"
+        );
+    }
+
+    #[test]
+    fn carry_forward_matches_on_path_not_name() {
+        // A renamed workflow keeps its file path, so its triggers still apply.
+        let previous = vec![wf("CI", &["pull_request"])];
+        let mut renamed = wf("Build", &[]);
+        renamed.path = ".github/workflows/CI.yml".to_owned();
+        let mut current = vec![renamed];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(current[0].triggers, ["pull_request"]);
+    }
+
+    #[test]
+    fn a_failed_lookup_does_not_drop_a_known_interval() {
+        // Regression guard: replacing the interval map wholesale made
+        // workflow_expected_interval_seconds vanish whenever a contents fetch
+        // failed, which flaps GitHubScheduledWorkflowStale.
+        let mut cached = HashMap::from([("update-flakes".to_owned(), 604_800_i64)]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(&mut cached, HashMap::new(), &live);
+
+        assert_eq!(cached.get("update-flakes"), Some(&604_800));
+    }
+
+    #[test]
+    fn a_new_interval_overwrites_the_cached_one() {
+        let mut cached = HashMap::from([("update-flakes".to_owned(), 604_800_i64)]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(
+            &mut cached,
+            HashMap::from([("update-flakes".to_owned(), 86_400_i64)]),
+            &live,
+        );
+
+        assert_eq!(cached.get("update-flakes"), Some(&86_400));
+    }
+
+    #[test]
+    fn intervals_for_deleted_workflows_are_dropped() {
+        // Otherwise a removed cron workflow stays "expected to run" forever.
+        let mut cached = HashMap::from([
+            ("update-flakes".to_owned(), 604_800_i64),
+            ("gone".to_owned(), 86_400_i64),
+        ]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(&mut cached, HashMap::new(), &live);
+
+        assert_eq!(cached.len(), 1);
+        assert!(!cached.contains_key("gone"));
     }
 
     #[test]
