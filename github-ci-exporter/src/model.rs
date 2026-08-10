@@ -182,6 +182,72 @@ impl fmt::Display for Repo {
     }
 }
 
+/// A reference to one pull request, as `owner/name#number`.
+///
+/// Exists so the operator's ignore list is parsed and validated once, at
+/// startup, rather than string-compared per pull request per cycle. A typo in
+/// a configured entry is then a startup error instead of a filter that
+/// silently never matches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PullRef {
+    /// Lowercased `owner/name`, since GitHub treats those case-insensitively.
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PullRef {
+    /// Builds a reference from a repository full name and PR number.
+    #[must_use]
+    pub fn new(repo: &str, number: u64) -> Self {
+        Self {
+            repo: repo.to_ascii_lowercase(),
+            number,
+        }
+    }
+}
+
+impl std::str::FromStr for PullRef {
+    type Err = PullRefError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        let (repo, number) = raw
+            .split_once('#')
+            .ok_or_else(|| PullRefError(raw.to_owned()))?;
+        // `owner/name`, both halves non-empty, no stray extra slash, and no
+        // internal whitespace. Every one of those would otherwise parse into a
+        // reference that can never match an API-supplied name -- `#32`,
+        // `owner#32`, and `owner/name #32` alike -- which is precisely the
+        // silent no-op this validation exists to prevent. Note that only the
+        // *outer* whitespace is trimmed, so an inner space survives into the
+        // comparison.
+        let is_full_name = repo.split_once('/').is_some_and(|(owner, name)| {
+            !owner.is_empty()
+                && !name.is_empty()
+                && !name.contains('/')
+                && !repo.chars().any(char::is_whitespace)
+        });
+        if !is_full_name {
+            return Err(PullRefError(raw.to_owned()));
+        }
+        let number: u64 = number.parse().map_err(|_| PullRefError(raw.to_owned()))?;
+        if number == 0 {
+            return Err(PullRefError(raw.to_owned()));
+        }
+        Ok(Self::new(repo, number))
+    }
+}
+
+impl fmt::Display for PullRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.repo, self.number)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("`{0}` is not a pull request reference; expected `owner/name#number`")]
+pub struct PullRefError(String);
+
 /// Terminal state of the most recent run of a workflow.
 ///
 /// `Running` is distinct from a conclusion: an in-flight run must not clear a
@@ -314,6 +380,67 @@ mod tests {
         assert!(!RunConclusion::Skipped.is_failure());
         assert!(!RunConclusion::Success.is_failure());
         assert!(!RunConclusion::Running.is_failure());
+    }
+
+    #[test]
+    fn pull_ref_parses_the_owner_repo_number_form() {
+        let parsed: PullRef = "sdr-enthusiasts/docker-vesselalert#32"
+            .parse()
+            .expect("a well-formed reference must parse");
+        assert_eq!(parsed.repo, "sdr-enthusiasts/docker-vesselalert");
+        assert_eq!(parsed.number, 32);
+        assert_eq!(parsed.to_string(), "sdr-enthusiasts/docker-vesselalert#32");
+    }
+
+    #[test]
+    fn pull_ref_matching_is_case_insensitive() {
+        // GitHub treats owner and repository names case-insensitively, and the
+        // configured entry is hand-written while the runtime value comes from
+        // the API. They must still match.
+        let configured: PullRef = "SDR-Enthusiasts/Docker-VesselAlert#32"
+            .parse()
+            .expect("parse");
+        assert_eq!(
+            configured,
+            PullRef::new("sdr-enthusiasts/docker-vesselalert", 32)
+        );
+    }
+
+    #[test]
+    fn pull_ref_rejects_malformed_entries() {
+        // Every one of these would otherwise become a filter that silently
+        // never matches, leaving the operator believing a PR is suppressed
+        // while the alert keeps firing.
+        for bad in [
+            "sdr-enthusiasts/docker-vesselalert", // no number
+            "#32",                                // no repository
+            "docker-vesselalert#32",              // no owner
+            "owner/#32",                          // empty name
+            "/name#32",                           // empty owner
+            "owner/name/extra#32",                // not a full name
+            "owner/name#",                        // empty number
+            "owner/name#abc",                     // non-numeric
+            "owner/name#-1",                      // negative
+            "owner/name#0",                       // PR numbers start at 1
+            "owner/name #32",                     // internal whitespace
+            "owner /name#32",
+            "own er/name#32",
+            "owner/na me#32",
+            "owner/name#3 2",
+            "owner/name#\t32",
+            "",
+        ] {
+            assert!(
+                bad.parse::<PullRef>().is_err(),
+                "`{bad}` must be rejected rather than silently never matching"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_ref_tolerates_surrounding_whitespace() {
+        let parsed: PullRef = "  owner/name#7  ".parse().expect("parse");
+        assert_eq!(parsed, PullRef::new("owner/name", 7));
     }
 
     #[test]

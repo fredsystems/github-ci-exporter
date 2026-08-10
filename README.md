@@ -62,6 +62,25 @@ It stores a **projection** of each response rather than the raw payload; the
 Actions runs endpoint alone returns ~1.5 MB per repository, which measured at
 67 MB of cache before projection and 141 KB after.
 
+That makes the cache's contents meaningful only to the code that wrote them,
+which is a trap worth stating plainly: **when a projection's shape changes,
+every persisted entry becomes undecodable while its `ETag` stays valid.** GitHub
+then answers `304` forever and hands back a validator the exporter cannot use.
+This is not hypothetical — it is how the trigger filter below came to be inert
+in production for as long as the cache file survived, silently reverting to
+"accept any event" on every cycle.
+
+Two mechanisms close it, and the redundancy is deliberate:
+
+- The cache file carries a **format version**. A mismatch discards it whole, so
+  a projection change costs exactly one cold sweep.
+- An undecodable entry is treated as a **cache miss**, not an error: the `ETag`
+  is dropped and the resource refetched unconditionally. This recovers from a
+  forgotten version bump, which is the failure mode that actually happened.
+
+Bump `CACHE_FORMAT_VERSION` in `github-ci-exporter/src/github/client.rs`
+whenever a cached projection's serialised shape changes.
+
 ## Repository selection
 
 Repositories are discovered automatically and dropped when they are:
@@ -87,6 +106,7 @@ flag alone.
 | `github_repo_issues_open`                          | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_open`                           | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_draft`                          | gauge   | `org`, `repo`, `author_kind`                        |
+| `github_repo_pulls_ignored`                        | gauge   | `org`, `repo`                                       |
 | `github_pull_created_timestamp_seconds`            | gauge   | `org`, `repo`, `number`, `author`, `author_kind`, `draft`, `checks`, `mergeable`, `auto_merge` |
 | `github_pull_needs_attention`                      | gauge   | same as above                                       |
 | `github_pull_ready_to_merge`                       | gauge   | same as above                                       |
@@ -151,6 +171,31 @@ mergeability lazily, so a first query often returns `UNKNOWN` for a PR that is
 in fact conflicting — observed on two PRs that both resolved to `CONFLICTING`
 on re-query.
 
+### Suppressing a pull request
+
+Some PRs are stuck and will stay stuck. A PR opened against a repository you do
+not own, which the maintainer has not engaged with, is not yours to close or
+convert to a draft — and nothing the exporter can measure distinguishes it from
+a PR worth chasing. Those are declared:
+
+```toml
+ignore_pulls = ["sdr-enthusiasts/docker-vesselalert#32"]
+```
+
+A suppressed PR is dropped from `github_pull_needs_attention`,
+`github_pull_ready_to_merge`, and `github_pull_created_timestamp_seconds`, so no
+alert can fire on it. It still counts towards `github_repo_pulls_open`, because
+the repository really does have it open, and the number suppressed is published
+per repository as `github_repo_pulls_ignored` — a published zero included, so
+"nothing is hidden here" is an assertion rather than an assumption.
+
+This is deliberately per-PR. Adding the repository to `denylist` would also
+blind the exporter to its CI and to every future pull request on it.
+
+A malformed entry is a startup error, not a filter that silently never matches:
+the worst outcome would be an operator believing a PR is suppressed while its
+alert keeps firing.
+
 ## Configuration
 
 TOML file, with `GHCI_`-prefixed environment overrides:
@@ -161,6 +206,7 @@ interval = "5m"
 listen = "127.0.0.1:9418"
 state_dir = "/var/lib/github-ci-exporter"
 denylist = []
+ignore_pulls = []
 skip_repos_without_workflows = true
 # max_repo_age = "365d"
 ```

@@ -131,6 +131,48 @@ struct CacheEntry {
     body: String,
 }
 
+/// On-disk format version for the `ETag` cache.
+///
+/// The cache stores *projections*, not raw responses, so its contents are only
+/// meaningful to the code that produced them. When a projection's shape
+/// changes, every persisted entry for that endpoint becomes undecodable while
+/// its `ETag` stays valid -- so GitHub answers `304` and the exporter has a
+/// validator it cannot use.
+///
+/// That is not hypothetical. Adding the workflow trigger list changed
+/// `WorkflowDefinition` from a bare `Vec<String>` of crons to a struct, and
+/// every cached entry stayed in the old shape across the upgrade. The trigger
+/// lookup failed for every workflow, an empty trigger list means "accept any
+/// event", and the trigger filter was therefore inert in production for as
+/// long as the cache survived -- exactly the frext / bike-fitter-1000 false
+/// positives it was written to fix.
+///
+/// Bump this whenever any cached projection's serialised shape changes. The
+/// per-entry decode fallback in [`Client::get_cached_as`] recovers from a
+/// missed bump, at the cost of one uncached fetch per affected entry.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Versioned envelope for the persisted cache, as read from disk.
+///
+/// The version is checked before the entries are trusted, so a format change
+/// discards the file wholesale instead of yielding a map of undecodable
+/// projections.
+#[derive(Debug, serde::Deserialize)]
+struct CacheFile {
+    version: u32,
+    entries: HashMap<String, CacheEntry>,
+}
+
+/// The same envelope for writing, borrowing the live cache.
+///
+/// Separate from [`CacheFile`] so persisting does not have to clone every
+/// entry while the lock is held.
+#[derive(Debug, Serialize)]
+struct CacheFileRef<'a> {
+    version: u32,
+    entries: &'a HashMap<String, CacheEntry>,
+}
+
 /// Outcome of a conditional request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheOutcome {
@@ -232,23 +274,48 @@ impl Client {
     /// Enables on-disk persistence of the `ETag` cache.
     ///
     /// Without this a restart re-fetches every repository at full cost. A
-    /// corrupt or unreadable cache is a warning, never fatal: the exporter
-    /// simply starts cold.
+    /// corrupt, unreadable, or stale-format cache is a warning, never fatal:
+    /// the exporter simply starts cold.
     #[must_use]
     pub fn with_cache_file(mut self, path: &Path) -> Self {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            match serde_json::from_str::<HashMap<String, CacheEntry>>(&raw) {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match Self::decode_cache_file(&raw) {
                 Ok(entries) => {
                     debug!(count = entries.len(), "restored etag cache");
                     if let Ok(mut cache) = self.cache.lock() {
                         *cache = entries;
                     }
                 }
-                Err(error) => warn!(%error, "ignoring unreadable etag cache"),
+                Err(reason) => warn!(reason, "starting with a cold etag cache"),
+            },
+            // A missing file is the normal first start. Anything else -- a
+            // permission problem, an I/O error -- means the cache is silently
+            // not working, which shows up only as a persistently high request
+            // count, so it is worth a warning.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "no etag cache to restore");
+            }
+            Err(error) => {
+                warn!(path = %path.display(), %error, "could not read etag cache; starting cold");
             }
         }
         self.cache_path = Some(path.to_path_buf());
         self
+    }
+
+    /// Parses a persisted cache file, rejecting anything not written by this
+    /// format version.
+    ///
+    /// A version mismatch is discarded wholesale rather than entry by entry:
+    /// the projections are what changed, so none of them can be trusted, and
+    /// keeping them would mean serving stale reductions for every endpoint
+    /// whose `ETag` is still valid.
+    fn decode_cache_file(raw: &str) -> Result<HashMap<String, CacheEntry>, &'static str> {
+        let file: CacheFile = serde_json::from_str(raw).map_err(|_| "cache file is unreadable")?;
+        if file.version != CACHE_FORMAT_VERSION {
+            return Err("cache was written by a different projection format");
+        }
+        Ok(file.entries)
     }
 
     /// Writes the `ETag` cache to disk, if persistence is enabled.
@@ -265,7 +332,10 @@ impl Client {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let encoded = serde_json::to_string(&*cache)?;
+        let encoded = serde_json::to_string(&CacheFileRef {
+            version: CACHE_FORMAT_VERSION,
+            entries: &cache,
+        })?;
         // Write-then-rename so a crash mid-write cannot leave a truncated
         // cache that would be discarded on next start.
         let tmp = path.with_extension("json.tmp");
@@ -425,7 +495,9 @@ impl Client {
             cache_key.to_owned()
         };
 
-        let cached_etag = self
+        // Cleared if the cached projection turns out to be unusable, so the
+        // retry goes out unconditionally.
+        let mut cached_etag = self
             .cache
             .lock()
             .ok()
@@ -447,6 +519,18 @@ impl Client {
             let status = response.status();
             self.record_rate_limit(response.headers(), RateLimitResource::Core);
 
+            // A 304 answering a request that carried no validator would be a
+            // protocol violation, and treating it as another cache miss would
+            // spin forever. Fail the request instead; the caller degrades to
+            // its own fallback for one cycle.
+            if status == StatusCode::NOT_MODIFIED && cached_etag.is_none() {
+                return Err(ClientError::Status {
+                    status,
+                    url: url.clone(),
+                    body: "304 returned for an unconditional request".to_owned(),
+                });
+            }
+
             if status == StatusCode::NOT_MODIFIED {
                 self.not_modified_total.fetch_add(1, Ordering::Relaxed);
                 let cached = self
@@ -454,31 +538,35 @@ impl Client {
                     .lock()
                     .ok()
                     .and_then(|cache| cache.get(&cache_key).map(|entry| entry.body.clone()));
-                if let Some(cached) = cached {
-                    let value =
-                        serde_json::from_str(&cached).map_err(|source| ClientError::Decode {
-                            url: url.clone(),
-                            source,
-                        })?;
-                    return Ok((value, CacheOutcome::NotModified));
+                // A projection that will not decode is treated as a cache
+                // miss, not as an error. The alternative -- propagating the
+                // decode failure -- is unrecoverable: the ETag stays valid, so
+                // every subsequent cycle gets the same 304 and the same
+                // undecodable body, and the caller degrades to its
+                // lookup-failed fallback forever. That is how the workflow
+                // trigger filter came to be silently inert in production.
+                match cached.as_deref().map(serde_json::from_str) {
+                    Some(Ok(value)) => return Ok((value, CacheOutcome::NotModified)),
+                    Some(Err(error)) => warn!(
+                        %url,
+                        %error,
+                        "cached projection no longer decodes; refetching unconditionally"
+                    ),
+                    // A 304 with no cached projection should be impossible, but
+                    // a pruned entry must not wedge the poll loop.
+                    None => warn!(%url, "304 with no cached body; refetching unconditionally"),
                 }
-                // A 304 with no cached projection should be impossible, but a
-                // pruned entry must not wedge the poll loop. Drop the ETag and
-                // retry unconditionally.
-                warn!(%url, "304 with no cached body; refetching unconditionally");
+                // Drop the unusable entry and go round again without the
+                // validator. Re-entering the loop rather than issuing the
+                // refetch inline keeps `classify_retry` in the path: the
+                // recovery request is as likely to meet a 429 or a 5xx as any
+                // other, and bypassing the backoff would turn a transient
+                // error into a failed cycle.
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.remove(&cache_key);
                 }
-                let response = self.http.get(&url).send().await?;
-                self.requests_total.fetch_add(1, Ordering::Relaxed);
-                let status = response.status();
-                self.record_rate_limit(response.headers(), RateLimitResource::Core);
-                let etag = response
-                    .headers()
-                    .get(ETAG)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                break (self.check_status(status, &url, response).await?, etag);
+                cached_etag = None;
+                continue;
             }
 
             if let Some(delay) = Self::classify_retry(status, response.headers(), attempt) {
@@ -1092,6 +1180,207 @@ mod tests {
                 .map(|e| e.etag.clone())
         };
         assert_eq!(restored_etag.as_deref(), Some("\"e1\""));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_cached_projection_refetches_instead_of_failing() {
+        // Regression guard, and the highest-value test in this file. Adding
+        // the trigger list changed the workflow-definition projection from
+        // `Vec<String>` to a struct. Every persisted entry kept the old shape
+        // while its ETag stayed valid, so GitHub answered 304 forever and the
+        // cached body never decoded. The lookup failed on every cycle, an
+        // empty trigger list means "accept any event", and the trigger filter
+        // was inert in production -- the frext / bike-fitter-1000 false
+        // positives survived the fix that was written to remove them.
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        struct NewShape {
+            crons: Vec<String>,
+            triggers: Vec<String>,
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/contents"))
+            .and(header("if-none-match", "\"still-valid\""))
+            .respond_with(ResponseTemplate::new(304))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // The unconditional refetch that must follow the failed decode.
+        Mock::given(method("GET"))
+            .and(path("/contents"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"fresh\"")
+                    .set_body_json(json!({"on": ["pull_request"]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        // Seed the cache the way a pre-upgrade binary would have left it: a
+        // valid ETag alongside a body in the *old* projection shape.
+        client.cache.lock().expect("lock").insert(
+            format!("{}/contents", server.uri()),
+            CacheEntry {
+                etag: "\"still-valid\"".to_owned(),
+                body: "[\"0 12 * * *\"]".to_owned(),
+            },
+        );
+
+        let (value, outcome): (NewShape, _) = client
+            .get_cached("/contents", |body: serde_json::Value| NewShape {
+                crons: Vec::new(),
+                triggers: body["on"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .await
+            .expect("an undecodable cache entry must not surface as an error");
+
+        assert_eq!(
+            value.triggers,
+            ["pull_request"],
+            "the refetched value must be projected, not the stale cache replayed"
+        );
+        assert_eq!(outcome, CacheOutcome::Modified);
+    }
+
+    #[tokio::test]
+    async fn the_stale_projection_refetch_still_gets_bounded_retries() {
+        // The recovery request is as likely to meet a 429 or a 5xx as any
+        // other. Issuing it outside the retry loop would turn a transient
+        // error into a failed cycle, so it must re-enter the loop rather than
+        // bypass `classify_retry`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .and(header("if-none-match", "\"stale\""))
+            .respond_with(ResponseTemplate::new(304))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // The unconditional retry hits a transient server error first...
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // ...and must then be retried rather than surfacing as an error.
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"fresh\"")
+                    .set_body_json(json!({"n": 5})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.cache.lock().expect("lock").insert(
+            format!("{}/flaky-recovery", server.uri()),
+            CacheEntry {
+                etag: "\"stale\"".to_owned(),
+                // Will not decode as the i64 the projection produces.
+                body: "{\"unexpected\":\"shape\"}".to_owned(),
+            },
+        );
+
+        let (value, _): (i64, _) = client
+            .get_cached("/flaky-recovery", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("a 5xx on the recovery request must be retried, not fatal");
+        assert_eq!(value, 5);
+    }
+
+    #[tokio::test]
+    async fn a_304_without_a_validator_is_an_error_not_a_spin() {
+        // Guard against the refetch loop: a server answering 304 to a request
+        // that carried no If-None-Match would otherwise be treated as another
+        // cache miss and retried forever.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/liar"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let result: Result<(serde_json::Value, _), _> = client.get_cached("/liar", identity).await;
+        assert!(
+            matches!(
+                result.expect_err("must not loop"),
+                ClientError::Status {
+                    status: StatusCode::NOT_MODIFIED,
+                    ..
+                }
+            ),
+            "an unconditional 304 must fail fast"
+        );
+    }
+
+    #[test]
+    fn a_cache_written_by_another_format_version_is_discarded() {
+        // Belt to the per-entry fallback's braces: a version bump drops the
+        // whole file, so a projection change costs exactly one cold sweep
+        // rather than a warning per entry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("etags.json");
+        let stale = serde_json::json!({
+            "version": CACHE_FORMAT_VERSION + 1,
+            "entries": {
+                "https://example.invalid/x": { "etag": "\"e1\"", "body": "{}" }
+            }
+        });
+        std::fs::write(&path, stale.to_string()).expect("write");
+
+        let client = Client::new(
+            "t",
+            "https://example.invalid",
+            "https://example.invalid/graphql",
+        )
+        .expect("client")
+        .with_cache_file(&path);
+
+        assert!(
+            client.cache.lock().expect("lock").is_empty(),
+            "entries from a different projection format must not be trusted"
+        );
+    }
+
+    #[test]
+    fn a_pre_versioning_cache_file_is_discarded() {
+        // The format in production before this envelope existed: a bare map.
+        // It must be rejected rather than parsed, because its projections are
+        // precisely the ones known to be stale.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("etags.json");
+        std::fs::write(
+            &path,
+            r#"{"https://example.invalid/x":{"etag":"\"e1\"","body":"[]"}}"#,
+        )
+        .expect("write");
+
+        let client = Client::new(
+            "t",
+            "https://example.invalid",
+            "https://example.invalid/graphql",
+        )
+        .expect("client")
+        .with_cache_file(&path);
+
+        assert!(client.cache.lock().expect("lock").is_empty());
     }
 
     #[test]

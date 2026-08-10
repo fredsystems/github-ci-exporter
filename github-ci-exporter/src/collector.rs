@@ -1,6 +1,6 @@
 //! Orchestrates one collection cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
@@ -12,7 +12,7 @@ use crate::{
         AuthorLabels, Metrics, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
         WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
     },
-    model::{Repo, SkipReason},
+    model::{PullRef, Repo, SkipReason},
 };
 
 /// GraphQL requests a full cycle needs: discovery pages plus batched activity
@@ -59,6 +59,12 @@ pub struct WorkflowCache {
     /// Repositories monitored by the previous cycle, used to size the
     /// budget pre-flight check.
     monitored_count: u64,
+    /// Pull requests the operator has declared unactionable, parsed once.
+    ///
+    /// The raw strings are validated at startup, so re-parsing them every
+    /// cycle would be pure repeated work for a set that cannot change while
+    /// the process runs.
+    ignored_pulls: Option<HashSet<PullRef>>,
 }
 
 impl WorkflowCache {
@@ -66,6 +72,17 @@ impl WorkflowCache {
     #[must_use]
     pub const fn monitored_count(&self) -> u64 {
         self.monitored_count
+    }
+
+    /// The parsed ignore list, resolved on first use.
+    ///
+    /// A parse failure here is impossible in practice: [`Config::validate`]
+    /// rejects a malformed entry before the poll loop starts. Falling back to
+    /// an empty set is the safe reading if one ever slips through -- it
+    /// suppresses nothing rather than silently suppressing the wrong thing.
+    fn ignored_pulls(&mut self, config: &Config) -> &HashSet<PullRef> {
+        self.ignored_pulls
+            .get_or_insert_with(|| config.ignored_pulls().unwrap_or_default())
     }
 }
 
@@ -163,7 +180,9 @@ pub async fn collect(
 
     // Issues and pull requests, batched.
     match graphql::fetch_activity(client, &monitored).await {
-        Ok(activity) => record_activity(metrics, &monitored, &activity),
+        Ok(activity) => {
+            record_activity(metrics, &monitored, &activity, cache.ignored_pulls(config));
+        }
         Err(error) => error!(%error, "failed to fetch issue/PR activity"),
     }
 
@@ -421,13 +440,23 @@ async fn resolve_definitions(
     intervals
 }
 
+/// Publishes issue and pull-request state.
+///
+/// `ignored` names pull requests the operator has declared unactionable. They
+/// are dropped from the per-PR series -- so no alert can fire on them and they
+/// leave the dashboard's PR tables -- but they remain in the aggregate
+/// `repo_pulls_open` count, because the repository really does still have that
+/// PR open. The number suppressed is published as `repo_pulls_ignored` so the
+/// discrepancy is explainable rather than looking like a collection bug.
 fn record_activity(
     metrics: &Metrics,
     monitored: &[Repo],
     activity: &std::collections::BTreeMap<String, graphql::RepoActivity>,
+    ignored: &HashSet<PullRef>,
 ) {
     for repo in monitored {
-        let Some(entry) = activity.get(&repo.full_name()) else {
+        let full_name = repo.full_name();
+        let Some(entry) = activity.get(&full_name) else {
             continue;
         };
 
@@ -462,7 +491,17 @@ fn record_activity(
                 .set(i64::try_from(*count).unwrap_or(i64::MAX));
         }
 
+        let mut ignored_count = 0i64;
         for pull in &entry.open_pulls {
+            if ignored.contains(&PullRef::new(&full_name, pull.number)) {
+                ignored_count += 1;
+                debug!(
+                    repo = %repo,
+                    number = pull.number,
+                    "suppressing pull request by operator configuration"
+                );
+                continue;
+            }
             let labels = PullLabels {
                 org: repo.owner.clone(),
                 repo: repo.name.clone(),
@@ -487,6 +526,17 @@ fn record_activity(
                 .get_or_create(&labels)
                 .set(i64::from(pull.is_ready_to_merge()));
         }
+
+        // Published unconditionally, including as a zero, so "nothing is being
+        // hidden on this repository" is an assertion the dashboard can make
+        // rather than an absence it has to assume.
+        metrics
+            .pulls_ignored
+            .get_or_create(&RepoLabels {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+            })
+            .set(ignored_count);
     }
 }
 
@@ -804,6 +854,155 @@ mod tests {
     #[test]
     fn estimate_cannot_overflow() {
         assert_eq!(estimate_core_requests(u64::MAX), u64::MAX);
+    }
+
+    /// One repository with one open, non-draft, conflicting PR -- i.e. one that
+    /// `needs_attention` and would alert.
+    fn activity_with_one_stuck_pull(
+        number: u64,
+    ) -> std::collections::BTreeMap<String, graphql::RepoActivity> {
+        use crate::model::{AuthorKind, ChecksState, MergeableState};
+
+        let mut activity = graphql::RepoActivity::default();
+        activity.pulls.insert(AuthorKind::Human, 1);
+        activity.open_pulls.push(graphql::OpenPull {
+            number,
+            author: "kx1t".to_owned(),
+            author_kind: AuthorKind::Human,
+            is_draft: false,
+            created_at: "2025-01-01T00:00:00Z".parse().expect("timestamp"),
+            checks: ChecksState::None,
+            mergeable: MergeableState::Conflicting,
+            auto_merge: false,
+        });
+        std::collections::BTreeMap::from([(
+            "sdr-enthusiasts/docker-vesselalert".to_owned(),
+            activity,
+        )])
+    }
+
+    fn vesselalert() -> Repo {
+        Repo {
+            owner: "sdr-enthusiasts".to_owned(),
+            name: "docker-vesselalert".to_owned(),
+            default_branch: "main".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_ignored_pull_leaves_the_per_pull_series() {
+        // The motivating case: docker-vesselalert#32 is conflicting and open
+        // against someone else's repository. It is not ours to close or draft,
+        // and the maintainer has not engaged, so it must stop alerting.
+        let (metrics, registry) = Metrics::new();
+        let monitored = vec![vesselalert()];
+        let ignored = HashSet::from([PullRef::new("sdr-enthusiasts/docker-vesselalert", 32)]);
+
+        record_activity(
+            &metrics,
+            &monitored,
+            &activity_with_one_stuck_pull(32),
+            &ignored,
+        );
+
+        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        assert!(
+            !rendered.contains("github_pull_needs_attention"),
+            "an ignored PR must not be able to fire an alert:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"number="32""#),
+            "an ignored PR must leave the per-PR series entirely"
+        );
+    }
+
+    #[test]
+    fn an_ignored_pull_still_counts_as_open() {
+        // Suppression is about actionability, not about lying: the repository
+        // really does have an open PR, and repo_pulls_open must keep matching
+        // GitHub's own count.
+        let (metrics, registry) = Metrics::new();
+        let ignored = HashSet::from([PullRef::new("sdr-enthusiasts/docker-vesselalert", 32)]);
+
+        record_activity(
+            &metrics,
+            &[vesselalert()],
+            &activity_with_one_stuck_pull(32),
+            &ignored,
+        );
+
+        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        assert!(
+            rendered.contains(r#"github_repo_pulls_open{org="sdr-enthusiasts",repo="docker-vesselalert",author_kind="human"} 1"#),
+            "the aggregate count must be unchanged:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"github_repo_pulls_ignored{org="sdr-enthusiasts",repo="docker-vesselalert"} 1"#
+            ),
+            "the suppression must be visible, not silent:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pull_not_on_the_ignore_list_is_unaffected() {
+        let (metrics, registry) = Metrics::new();
+        let ignored = HashSet::from([PullRef::new("sdr-enthusiasts/docker-vesselalert", 32)]);
+
+        // Same repository, different PR number.
+        record_activity(
+            &metrics,
+            &[vesselalert()],
+            &activity_with_one_stuck_pull(33),
+            &ignored,
+        );
+
+        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        assert!(
+            rendered.contains(r#"number="33""#),
+            "ignoring #32 must not suppress #33:\n{rendered}"
+        );
+        assert!(rendered.contains(
+            r#"github_repo_pulls_ignored{org="sdr-enthusiasts",repo="docker-vesselalert"} 0"#
+        ));
+    }
+
+    #[test]
+    fn an_ignore_entry_for_another_repo_does_not_match() {
+        let (metrics, registry) = Metrics::new();
+        // Same PR number, different repository.
+        let ignored = HashSet::from([PullRef::new("fredsystems/nixos", 32)]);
+
+        record_activity(
+            &metrics,
+            &[vesselalert()],
+            &activity_with_one_stuck_pull(32),
+            &ignored,
+        );
+
+        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        assert!(
+            rendered.contains(r#"number="32""#),
+            "the ignore list must be scoped per repository:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn zero_ignored_is_published_for_every_repository() {
+        // A published zero means "nothing is hidden here" is an assertion the
+        // dashboard can make, rather than an absence it must assume.
+        let (metrics, registry) = Metrics::new();
+        record_activity(
+            &metrics,
+            &[vesselalert()],
+            &activity_with_one_stuck_pull(32),
+            &HashSet::new(),
+        );
+
+        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        assert!(rendered.contains(
+            r#"github_repo_pulls_ignored{org="sdr-enthusiasts",repo="docker-vesselalert"} 0"#
+        ));
     }
 
     #[test]

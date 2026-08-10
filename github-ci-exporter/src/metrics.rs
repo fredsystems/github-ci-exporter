@@ -86,6 +86,9 @@ pub struct Metrics {
     pub issues_open: Family<AuthorLabels, Gauge>,
     pub pulls_open: Family<AuthorLabels, Gauge>,
     pub pulls_draft: Family<AuthorLabels, Gauge>,
+    /// Open pull requests suppressed by the operator's ignore list. Makes the
+    /// gap between `pulls_open` and the per-PR series explainable.
+    pub pulls_ignored: Family<RepoLabels, Gauge>,
     pub pull_created_timestamp: Family<PullLabels, Gauge>,
     pub pull_needs_attention: Family<PullLabels, Gauge>,
     pub pull_ready_to_merge: Family<PullLabels, Gauge>,
@@ -137,6 +140,13 @@ impl Metrics {
             "repo_pulls_draft",
             "Open draft pull requests by author kind",
             pulls_draft.clone(),
+        );
+
+        let pulls_ignored = Family::<RepoLabels, Gauge>::default();
+        registry.register(
+            "repo_pulls_ignored",
+            "Open pull requests suppressed by the operator's ignore list and therefore absent from the per-PR series",
+            pulls_ignored.clone(),
         );
 
         let pull_created_timestamp = Family::<PullLabels, Gauge>::default();
@@ -305,6 +315,7 @@ impl Metrics {
                 issues_open,
                 pulls_open,
                 pulls_draft,
+                pulls_ignored,
                 pull_created_timestamp,
                 pull_needs_attention,
                 pull_ready_to_merge,
@@ -341,6 +352,7 @@ impl Metrics {
         self.issues_open.clear();
         self.pulls_open.clear();
         self.pulls_draft.clear();
+        self.pulls_ignored.clear();
         self.pull_created_timestamp.clear();
         self.pull_needs_attention.clear();
         self.pull_ready_to_merge.clear();

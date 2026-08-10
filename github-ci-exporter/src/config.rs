@@ -5,6 +5,7 @@
 //! [`Config::resolve_token`].
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -15,6 +16,8 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
+
+use crate::model::PullRef;
 
 /// Default poll interval.
 ///
@@ -44,6 +47,19 @@ pub struct Config {
     /// Repositories to exclude, as `owner/name`. Applied after the automatic
     /// archived/no-workflow filters.
     pub denylist: Vec<String>,
+
+    /// Individual pull requests to exclude, as `owner/name#number`.
+    ///
+    /// For a PR that is genuinely stuck and genuinely not actionable: one
+    /// opened against someone else's repository, which the maintainer has not
+    /// engaged with and which is not ours to close or convert to a draft.
+    /// Nothing the exporter can measure distinguishes that from a PR worth
+    /// chasing, so it has to be declared.
+    ///
+    /// Deliberately per-PR rather than per-repo: denylisting the whole
+    /// repository would also blind the exporter to its CI and to every future
+    /// pull request on it.
+    pub ignore_pulls: Vec<String>,
 
     /// Skip repositories with no push in this window. `None` disables the
     /// check, which is the default: dormant-but-released repos still deserve
@@ -77,6 +93,7 @@ impl Default for Config {
             orgs: Vec::new(),
             interval: DEFAULT_INTERVAL,
             denylist: Vec::new(),
+            ignore_pulls: Vec::new(),
             max_repo_age: None,
             skip_repos_without_workflows: true,
             state_dir: PathBuf::from("/var/lib/github-ci-exporter"),
@@ -95,6 +112,8 @@ pub enum ConfigError {
     NoOrgs,
     #[error("poll interval must be at least 60s to stay within API rate limits, got {0:?}")]
     IntervalTooShort(Duration),
+    #[error("invalid `ignore_pulls` entry: {0}")]
+    IgnorePull(#[from] crate::model::PullRefError),
     #[error("no token available: set GHCI_TOKEN or `token_file`")]
     NoToken,
     #[error("failed to read token file {path}: {source}")]
@@ -146,7 +165,24 @@ impl Config {
         if self.interval < Duration::from_secs(60) {
             return Err(ConfigError::IntervalTooShort(self.interval));
         }
+        // Parsed here purely to reject typos at startup. A malformed entry
+        // would otherwise be a filter that silently never matches, which is
+        // the worst outcome: the operator believes a PR is suppressed and the
+        // alert keeps firing.
+        self.ignored_pulls()?;
         Ok(())
+    }
+
+    /// Parses the operator's `ignore_pulls` entries.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::IgnorePull`] if an entry is not
+    /// `owner/name#number`.
+    pub fn ignored_pulls(&self) -> Result<HashSet<PullRef>, ConfigError> {
+        self.ignore_pulls
+            .iter()
+            .map(|raw| raw.parse::<PullRef>().map_err(ConfigError::IgnorePull))
+            .collect()
     }
 
     /// Resolves the API token from `GHCI_TOKEN`, else `token_file`.
@@ -316,6 +352,61 @@ mod tests {
         };
         assert!(config.is_denylisted("sdr-enthusiasts/foo"));
         assert!(!config.is_denylisted("sdr-enthusiasts/bar"));
+    }
+
+    #[test]
+    fn ignore_pulls_entries_are_parsed() {
+        let config = Config {
+            orgs: vec!["sdr-enthusiasts".into()],
+            ignore_pulls: vec![
+                "sdr-enthusiasts/docker-vesselalert#32".into(),
+                "fredsystems/nixos#1615".into(),
+            ],
+            ..Config::default()
+        };
+        let ignored = config.ignored_pulls().expect("well-formed entries");
+        assert!(ignored.contains(&crate::model::PullRef::new(
+            "sdr-enthusiasts/docker-vesselalert",
+            32
+        )));
+        assert!(ignored.contains(&crate::model::PullRef::new("fredsystems/nixos", 1615)));
+        assert_eq!(ignored.len(), 2);
+    }
+
+    #[test]
+    fn a_malformed_ignore_pull_entry_fails_validation() {
+        // Startup must fail loudly. A silently-ignored bad entry means the
+        // operator believes a PR is suppressed while its alert keeps firing.
+        let config = Config {
+            orgs: vec!["sdr-enthusiasts".into()],
+            ignore_pulls: vec!["sdr-enthusiasts/docker-vesselalert".into()],
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.validate().expect_err("a typo must be rejected"),
+            ConfigError::IgnorePull(_)
+        ));
+    }
+
+    #[test]
+    fn ignore_pulls_defaults_to_empty_and_is_read_from_toml() {
+        assert!(Config::default().ignore_pulls.is_empty());
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+            orgs = ["sdr-enthusiasts"]
+            ignore_pulls = ["sdr-enthusiasts/docker-vesselalert#32"]
+            "#
+        )
+        .expect("write temp config");
+
+        let config = Config::load(Some(file.path())).expect("config should load");
+        assert_eq!(
+            config.ignore_pulls,
+            ["sdr-enthusiasts/docker-vesselalert#32"]
+        );
     }
 
     #[test]
