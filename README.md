@@ -62,6 +62,25 @@ It stores a **projection** of each response rather than the raw payload; the
 Actions runs endpoint alone returns ~1.5 MB per repository, which measured at
 67 MB of cache before projection and 141 KB after.
 
+That makes the cache's contents meaningful only to the code that wrote them,
+which is a trap worth stating plainly: **when a projection's shape changes,
+every persisted entry becomes undecodable while its `ETag` stays valid.** GitHub
+then answers `304` forever and hands back a validator the exporter cannot use.
+This is not hypothetical — it is how the trigger filter below came to be inert
+in production for as long as the cache file survived, silently reverting to
+"accept any event" on every cycle.
+
+Two mechanisms close it, and the redundancy is deliberate:
+
+- The cache file carries a **format version**. A mismatch discards it whole, so
+  a projection change costs exactly one cold sweep.
+- An undecodable entry is treated as a **cache miss**, not an error: the `ETag`
+  is dropped and the resource refetched unconditionally. This recovers from a
+  forgotten version bump, which is the failure mode that actually happened.
+
+Bump `CACHE_FORMAT_VERSION` in `github/client.rs` whenever a cached projection's
+serialised shape changes.
+
 ## Repository selection
 
 Repositories are discovered automatically and dropped when they are:
