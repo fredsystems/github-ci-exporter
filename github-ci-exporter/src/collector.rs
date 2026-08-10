@@ -169,6 +169,17 @@ pub async fn collect(
             .get(&repo.full_name())
             .cloned()
             .unwrap_or_default();
+        // Without a workflow set every run would be discarded as orphaned,
+        // publishing no series at all and making a listing failure look like
+        // "this repository's CI vanished". Skip the fetch rather than spend a
+        // request that cannot produce a result.
+        if live.is_empty() {
+            warn!(
+                repo = %repo,
+                "no workflow set available; skipping run fetch for this cycle"
+            );
+            continue;
+        }
         record_workflow_states(metrics, repo, &live);
         match rest::fetch_runs(client, repo, &live).await {
             Ok(runs) => record_runs(metrics, repo, &runs, cache, now),

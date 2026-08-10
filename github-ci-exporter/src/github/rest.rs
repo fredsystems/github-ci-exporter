@@ -192,13 +192,43 @@ pub async fn fetch_runs(
         "/repos/{}/{}/actions/runs?per_page={RUNS_PER_PAGE}&branch={}",
         repo.owner, repo.name, repo.default_branch
     );
+    // The cached value is a *reduction*, and the reduction depends on `live`
+    // as well as on the response. Deleting or renaming a workflow does not
+    // change the runs listing, so the request would answer 304 and replay a
+    // reduction computed against the previous workflow set -- reviving the
+    // orphaned-run bug this reduction exists to prevent. Folding a fingerprint
+    // of `live` into the cache key invalidates the entry whenever the workflow
+    // set changes, at the cost of one uncached fetch after such a change.
+    let cache_key = format!("{path}#wf={}", fingerprint_workflows(live));
     let (runs, outcome) = client
-        .get_cached(&path, |response: RunsResponse| {
+        .get_cached_as(&cache_key, &path, |response: RunsResponse| {
             reduce_runs(response.workflow_runs, live)
         })
         .await?;
     debug!(repo = %repo, ?outcome, workflows = runs.latest.len(), "fetched runs");
     Ok(runs)
+}
+
+/// A stable fingerprint of the workflow set's identities and display names.
+///
+/// Order-independent so an API reordering cannot spuriously invalidate the
+/// cache, and it covers names as well as paths because a rename must change
+/// the reduction's output labels.
+fn fingerprint_workflows(live: &[Workflow]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut pairs: Vec<(&str, &str)> = live
+        .iter()
+        .map(|w| (w.path.as_str(), w.name.as_str()))
+        .collect();
+    pairs.sort_unstable();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, name) in pairs {
+        path.hash(&mut hasher);
+        name.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Whether a run's trigger reflects the state of the default branch.
@@ -238,6 +268,12 @@ fn is_branch_state_event(event: &str) -> bool {
 ///
 /// Dependabot's security-update runs are excluded: each has a unique generated
 /// name, which would make cardinality unbounded.
+///
+/// Note that while *lookup* is by path, the output is keyed by display name,
+/// because that is the label operators recognise on a dashboard. Two workflow
+/// files declaring the same `name:` therefore collapse into one series. That
+/// is accepted: it does not occur in the monitored organisations, and keying
+/// metrics by file path would make every dashboard and alert harder to read.
 fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
     // Workflow identity is the file path, not the display name: a run created
     // before the workflow gained a `name:` reports the path in the name field,
@@ -839,6 +875,49 @@ mod tests {
         let at_horizon = latest.created_at + STALE_RUN_AGE;
         assert!(!latest.is_stale(at_horizon));
         assert!(latest.is_stale(at_horizon + chrono::TimeDelta::seconds(1)));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_workflow_is_deleted() {
+        // Regression guard: deleting a workflow does not change the runs
+        // listing, so the request answers 304. Without the fingerprint in the
+        // cache key the stale reduction is replayed and the deleted
+        // workflow's runs come back.
+        let before = live(&["CI", "Deploy"]);
+        let after = live(&["CI"]);
+        assert_ne!(
+            fingerprint_workflows(&before),
+            fingerprint_workflows(&after)
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_workflow_is_renamed() {
+        let before = vec![Workflow {
+            name: "CI".to_owned(),
+            path: ".github/workflows/ci.yml".to_owned(),
+            state: WorkflowState::Active,
+        }];
+        let after = vec![Workflow {
+            name: "Build".to_owned(),
+            path: ".github/workflows/ci.yml".to_owned(),
+            state: WorkflowState::Active,
+        }];
+        assert_ne!(
+            fingerprint_workflows(&before),
+            fingerprint_workflows(&after),
+            "a rename changes the output labels and must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent() {
+        // An API reordering must not spuriously invalidate the cache and
+        // force a full uncached sweep.
+        let a = live(&["CI", "Deploy", "Lint"]);
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(fingerprint_workflows(&a), fingerprint_workflows(&b));
     }
 
     #[test]
