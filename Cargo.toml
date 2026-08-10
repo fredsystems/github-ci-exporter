@@ -33,15 +33,24 @@ figment = { version = "0.10.19", features = ["env", "toml"] }
 humantime = "2.3.0"
 humantime-serde = "1.1.1"
 prometheus-client = "0.25.0"
-reqwest = { version = "0.12.24", default-features = false, features = [
+# `rustls` was `rustls-tls` before 0.13. default-features stays off so the
+# native-tls backend and the OpenSSL build dependency it drags in are excluded.
+reqwest = { version = "0.13.4", default-features = false, features = [
   "gzip",
   "json",
-  "rustls-tls",
+  "rustls",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.17"
+# Mozilla's CA bundle, compiled in. reqwest 0.13 replaced its built-in roots
+# with rustls-platform-verifier, which reads the system trust store; that store
+# does not exist in the Nix build sandbox, so TLS setup fails outright with
+# "No CA certificates were loaded from the system". Bundling the roots makes
+# the exporter independent of ambient host state, which also matters at runtime
+# under `DynamicUser` with ProtectSystem=strict.
+webpki-root-certs = "1.0.9"
 tokio = { version = "1.48.0", features = [
   "macros",
   "rt-multi-thread",

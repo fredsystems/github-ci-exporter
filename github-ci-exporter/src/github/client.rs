@@ -190,6 +190,21 @@ impl Client {
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            // Trust Mozilla's bundled CA set rather than the system trust
+            // store. reqwest 0.13 switched to rustls-platform-verifier, which
+            // reads system roots; those are absent in the Nix build sandbox
+            // (TLS setup fails with "No CA certificates were loaded from the
+            // system") and are not guaranteed under a hardened unit with
+            // ProtectSystem=strict. Only api.github.com is contacted, so a
+            // fixed public-CA set is sufficient and makes the binary
+            // independent of ambient host state.
+            .tls_certs_only(
+                webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                    .iter()
+                    .map(|cert| reqwest::Certificate::from_der(cert))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ClientError::Build)?,
+            )
             .build()
             .map_err(ClientError::Build)?;
 
