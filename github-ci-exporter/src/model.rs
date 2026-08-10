@@ -214,11 +214,18 @@ impl std::str::FromStr for PullRef {
         let (repo, number) = raw
             .split_once('#')
             .ok_or_else(|| PullRefError(raw.to_owned()))?;
-        // `owner/name` with both halves non-empty, and no stray extra slash --
-        // otherwise `#32` or `owner#32` would parse as a valid reference and
-        // then never match anything.
+        // `owner/name`, both halves non-empty, no stray extra slash, and no
+        // internal whitespace. Every one of those would otherwise parse into a
+        // reference that can never match an API-supplied name -- `#32`,
+        // `owner#32`, and `owner/name #32` alike -- which is precisely the
+        // silent no-op this validation exists to prevent. Note that only the
+        // *outer* whitespace is trimmed, so an inner space survives into the
+        // comparison.
         let is_full_name = repo.split_once('/').is_some_and(|(owner, name)| {
-            !owner.is_empty() && !name.is_empty() && !name.contains('/')
+            !owner.is_empty()
+                && !name.is_empty()
+                && !name.contains('/')
+                && !repo.chars().any(char::is_whitespace)
         });
         if !is_full_name {
             return Err(PullRefError(raw.to_owned()));
@@ -415,6 +422,12 @@ mod tests {
             "owner/name#abc",                     // non-numeric
             "owner/name#-1",                      // negative
             "owner/name#0",                       // PR numbers start at 1
+            "owner/name #32",                     // internal whitespace
+            "owner /name#32",
+            "own er/name#32",
+            "owner/na me#32",
+            "owner/name#3 2",
+            "owner/name#\t32",
             "",
         ] {
             assert!(

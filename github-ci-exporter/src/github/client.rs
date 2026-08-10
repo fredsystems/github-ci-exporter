@@ -152,15 +152,25 @@ struct CacheEntry {
 /// missed bump, at the cost of one uncached fetch per affected entry.
 const CACHE_FORMAT_VERSION: u32 = 1;
 
-/// Versioned envelope for the persisted cache.
+/// Versioned envelope for the persisted cache, as read from disk.
 ///
 /// The version is checked before the entries are trusted, so a format change
 /// discards the file wholesale instead of yielding a map of undecodable
 /// projections.
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct CacheFile {
     version: u32,
     entries: HashMap<String, CacheEntry>,
+}
+
+/// The same envelope for writing, borrowing the live cache.
+///
+/// Separate from [`CacheFile`] so persisting does not have to clone every
+/// entry while the lock is held.
+#[derive(Debug, Serialize)]
+struct CacheFileRef<'a> {
+    version: u32,
+    entries: &'a HashMap<String, CacheEntry>,
 }
 
 /// Outcome of a conditional request.
@@ -253,8 +263,8 @@ impl Client {
     /// the exporter simply starts cold.
     #[must_use]
     pub fn with_cache_file(mut self, path: &Path) -> Self {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            match Self::decode_cache_file(&raw) {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match Self::decode_cache_file(&raw) {
                 Ok(entries) => {
                     debug!(count = entries.len(), "restored etag cache");
                     if let Ok(mut cache) = self.cache.lock() {
@@ -262,6 +272,16 @@ impl Client {
                     }
                 }
                 Err(reason) => warn!(reason, "starting with a cold etag cache"),
+            },
+            // A missing file is the normal first start. Anything else -- a
+            // permission problem, an I/O error -- means the cache is silently
+            // not working, which shows up only as a persistently high request
+            // count, so it is worth a warning.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "no etag cache to restore");
+            }
+            Err(error) => {
+                warn!(path = %path.display(), %error, "could not read etag cache; starting cold");
             }
         }
         self.cache_path = Some(path.to_path_buf());
@@ -297,9 +317,9 @@ impl Client {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let encoded = serde_json::to_string(&CacheFile {
+        let encoded = serde_json::to_string(&CacheFileRef {
             version: CACHE_FORMAT_VERSION,
-            entries: cache.clone(),
+            entries: &cache,
         })?;
         // Write-then-rename so a crash mid-write cannot leave a truncated
         // cache that would be discarded on next start.
@@ -460,7 +480,9 @@ impl Client {
             cache_key.to_owned()
         };
 
-        let cached_etag = self
+        // Cleared if the cached projection turns out to be unusable, so the
+        // retry goes out unconditionally.
+        let mut cached_etag = self
             .cache
             .lock()
             .ok()
@@ -481,6 +503,18 @@ impl Client {
             self.requests_total.fetch_add(1, Ordering::Relaxed);
             let status = response.status();
             self.record_rate_limit(response.headers(), RateLimitResource::Core);
+
+            // A 304 answering a request that carried no validator would be a
+            // protocol violation, and treating it as another cache miss would
+            // spin forever. Fail the request instead; the caller degrades to
+            // its own fallback for one cycle.
+            if status == StatusCode::NOT_MODIFIED && cached_etag.is_none() {
+                return Err(ClientError::Status {
+                    status,
+                    url: url.clone(),
+                    body: "304 returned for an unconditional request".to_owned(),
+                });
+            }
 
             if status == StatusCode::NOT_MODIFIED {
                 self.not_modified_total.fetch_add(1, Ordering::Relaxed);
@@ -507,20 +541,17 @@ impl Client {
                     // a pruned entry must not wedge the poll loop.
                     None => warn!(%url, "304 with no cached body; refetching unconditionally"),
                 }
-                // Drop the stale ETag and retry unconditionally.
+                // Drop the unusable entry and go round again without the
+                // validator. Re-entering the loop rather than issuing the
+                // refetch inline keeps `classify_retry` in the path: the
+                // recovery request is as likely to meet a 429 or a 5xx as any
+                // other, and bypassing the backoff would turn a transient
+                // error into a failed cycle.
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.remove(&cache_key);
                 }
-                let response = self.http.get(&url).send().await?;
-                self.requests_total.fetch_add(1, Ordering::Relaxed);
-                let status = response.status();
-                self.record_rate_limit(response.headers(), RateLimitResource::Core);
-                let etag = response
-                    .headers()
-                    .get(ETAG)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                break (self.check_status(status, &url, response).await?, etag);
+                cached_etag = None;
+                continue;
             }
 
             if let Some(delay) = Self::classify_retry(status, response.headers(), attempt) {
@@ -1204,6 +1235,84 @@ mod tests {
             "the refetched value must be projected, not the stale cache replayed"
         );
         assert_eq!(outcome, CacheOutcome::Modified);
+    }
+
+    #[tokio::test]
+    async fn the_stale_projection_refetch_still_gets_bounded_retries() {
+        // The recovery request is as likely to meet a 429 or a 5xx as any
+        // other. Issuing it outside the retry loop would turn a transient
+        // error into a failed cycle, so it must re-enter the loop rather than
+        // bypass `classify_retry`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .and(header("if-none-match", "\"stale\""))
+            .respond_with(ResponseTemplate::new(304))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // The unconditional retry hits a transient server error first...
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // ...and must then be retried rather than surfacing as an error.
+        Mock::given(method("GET"))
+            .and(path("/flaky-recovery"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"fresh\"")
+                    .set_body_json(json!({"n": 5})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.cache.lock().expect("lock").insert(
+            format!("{}/flaky-recovery", server.uri()),
+            CacheEntry {
+                etag: "\"stale\"".to_owned(),
+                // Will not decode as the i64 the projection produces.
+                body: "{\"unexpected\":\"shape\"}".to_owned(),
+            },
+        );
+
+        let (value, _): (i64, _) = client
+            .get_cached("/flaky-recovery", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("a 5xx on the recovery request must be retried, not fatal");
+        assert_eq!(value, 5);
+    }
+
+    #[tokio::test]
+    async fn a_304_without_a_validator_is_an_error_not_a_spin() {
+        // Guard against the refetch loop: a server answering 304 to a request
+        // that carried no If-None-Match would otherwise be treated as another
+        // cache miss and retried forever.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/liar"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let result: Result<(serde_json::Value, _), _> = client.get_cached("/liar", identity).await;
+        assert!(
+            matches!(
+                result.expect_err("must not loop"),
+                ClientError::Status {
+                    status: StatusCode::NOT_MODIFIED,
+                    ..
+                }
+            ),
+            "an unconditional 304 must fail fast"
+        );
     }
 
     #[test]

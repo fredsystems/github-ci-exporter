@@ -78,8 +78,8 @@ Two mechanisms close it, and the redundancy is deliberate:
   is dropped and the resource refetched unconditionally. This recovers from a
   forgotten version bump, which is the failure mode that actually happened.
 
-Bump `CACHE_FORMAT_VERSION` in `github/client.rs` whenever a cached projection's
-serialised shape changes.
+Bump `CACHE_FORMAT_VERSION` in `github-ci-exporter/src/github/client.rs`
+whenever a cached projection's serialised shape changes.
 
 ## Repository selection
 

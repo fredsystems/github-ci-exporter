@@ -59,6 +59,12 @@ pub struct WorkflowCache {
     /// Repositories monitored by the previous cycle, used to size the
     /// budget pre-flight check.
     monitored_count: u64,
+    /// Pull requests the operator has declared unactionable, parsed once.
+    ///
+    /// The raw strings are validated at startup, so re-parsing them every
+    /// cycle would be pure repeated work for a set that cannot change while
+    /// the process runs.
+    ignored_pulls: Option<HashSet<PullRef>>,
 }
 
 impl WorkflowCache {
@@ -66,6 +72,17 @@ impl WorkflowCache {
     #[must_use]
     pub const fn monitored_count(&self) -> u64 {
         self.monitored_count
+    }
+
+    /// The parsed ignore list, resolved on first use.
+    ///
+    /// A parse failure here is impossible in practice: [`Config::validate`]
+    /// rejects a malformed entry before the poll loop starts. Falling back to
+    /// an empty set is the safe reading if one ever slips through -- it
+    /// suppresses nothing rather than silently suppressing the wrong thing.
+    fn ignored_pulls(&mut self, config: &Config) -> &HashSet<PullRef> {
+        self.ignored_pulls
+            .get_or_insert_with(|| config.ignored_pulls().unwrap_or_default())
     }
 }
 
@@ -161,13 +178,11 @@ pub async fn collect(
 
     record_repo_inventory(metrics, &monitored, &skipped);
 
-    // Validated at startup, so a parse failure here cannot happen; an empty
-    // set (ignore nothing) is the safe reading if it somehow does.
-    let ignored_pulls = config.ignored_pulls().unwrap_or_default();
-
     // Issues and pull requests, batched.
     match graphql::fetch_activity(client, &monitored).await {
-        Ok(activity) => record_activity(metrics, &monitored, &activity, &ignored_pulls),
+        Ok(activity) => {
+            record_activity(metrics, &monitored, &activity, cache.ignored_pulls(config));
+        }
         Err(error) => error!(%error, "failed to fetch issue/PR activity"),
     }
 
