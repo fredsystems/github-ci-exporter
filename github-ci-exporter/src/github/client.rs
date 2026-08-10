@@ -375,17 +375,46 @@ impl Client {
         R: Serialize + DeserializeOwned,
         F: FnOnce(T) -> R,
     {
+        self.get_cached_as(path, path, project).await
+    }
+
+    /// As [`Self::get_cached`], but with the cache key decoupled from the
+    /// request path.
+    ///
+    /// Needed when the projection depends on inputs beyond the response body:
+    /// the cached value must be invalidated when those inputs change, even
+    /// though the request itself is unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] on transport failure, a non-success status, or
+    /// a body that does not match `T`.
+    pub async fn get_cached_as<T, R, F>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        project: F,
+    ) -> Result<(R, CacheOutcome), ClientError>
+    where
+        T: DeserializeOwned,
+        R: Serialize + DeserializeOwned,
+        F: FnOnce(T) -> R,
+    {
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {
             format!("{}{}", self.api_url, path)
+        };
+        let cache_key = if cache_key == path {
+            url.clone()
+        } else {
+            cache_key.to_owned()
         };
 
         let cached_etag = self
             .cache
             .lock()
             .ok()
-            .and_then(|cache| cache.get(&url).map(|entry| entry.etag.clone()));
+            .and_then(|cache| cache.get(&cache_key).map(|entry| entry.etag.clone()));
 
         // A conditional request answered 304 is free, but that is only known
         // after the fact; the budget must be checked as though it will cost.
@@ -409,7 +438,7 @@ impl Client {
                     .cache
                     .lock()
                     .ok()
-                    .and_then(|cache| cache.get(&url).map(|entry| entry.body.clone()));
+                    .and_then(|cache| cache.get(&cache_key).map(|entry| entry.body.clone()));
                 if let Some(cached) = cached {
                     let value =
                         serde_json::from_str(&cached).map_err(|source| ClientError::Decode {
@@ -423,7 +452,7 @@ impl Client {
                 // retry unconditionally.
                 warn!(%url, "304 with no cached body; refetching unconditionally");
                 if let Ok(mut cache) = self.cache.lock() {
-                    cache.remove(&url);
+                    cache.remove(&cache_key);
                 }
                 let response = self.http.get(&url).send().await?;
                 self.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -464,7 +493,7 @@ impl Client {
             && let Ok(mut cache) = self.cache.lock()
         {
             cache.insert(
-                url,
+                cache_key,
                 CacheEntry {
                     etag,
                     body: encoded,
@@ -723,6 +752,96 @@ mod tests {
             cached_len < 50,
             "cache must hold the projection, not the {}-byte payload (got {cached_len})",
             bulky.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_cache_keys_do_not_share_an_entry() {
+        // A projection that depends on more than the response body must be
+        // invalidated when those inputs change, even though the URL is
+        // identical and the server would answer 304.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"same\"")
+                    .set_body_json(json!({"n": 1})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (first, _): (String, _) = client
+            .get_cached_as("/runs#v1", "/runs", |v: serde_json::Value| {
+                format!("v1:{}", v["n"])
+            })
+            .await
+            .expect("first");
+        assert_eq!(first, "v1:1");
+
+        // Same URL, different key: must re-project rather than replay.
+        let (second, outcome): (String, _) = client
+            .get_cached_as("/runs#v2", "/runs", |v: serde_json::Value| {
+                format!("v2:{}", v["n"])
+            })
+            .await
+            .expect("second");
+        assert_eq!(
+            second, "v2:1",
+            "a new cache key must not replay the old projection"
+        );
+        assert_eq!(outcome, CacheOutcome::Modified);
+    }
+
+    #[tokio::test]
+    async fn custom_cache_key_is_reused_on_repeat() {
+        // Regression guard: entries were read by cache key but written by URL,
+        // so every `get_cached_as` caller refetched and reprojected. That
+        // silently disabled ETag revalidation for the runs endpoint, the
+        // single largest consumer of the rate-limit budget.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"e1\"")
+                    .set_body_json(json!({"n": 7})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (first, outcome): (i64, _) = client
+            .get_cached_as("/runs#fp=abc", "/runs", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("first");
+        assert_eq!(first, 7);
+        assert_eq!(outcome, CacheOutcome::Modified);
+
+        // The same key must now revalidate and be answered from cache.
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (second, outcome): (i64, _) = client
+            .get_cached_as("/runs#fp=abc", "/runs", |v: serde_json::Value| {
+                v["n"].as_i64().unwrap_or_default()
+            })
+            .await
+            .expect("second");
+        assert_eq!(second, 7, "cached projection must be replayed");
+        assert_eq!(
+            outcome,
+            CacheOutcome::NotModified,
+            "a repeated custom key must revalidate rather than refetch"
         );
     }
 

@@ -9,8 +9,8 @@ use crate::{
     config::Config,
     github::{Client, client::RateLimitResource, graphql, rest},
     metrics::{
-        AuthorLabels, Metrics, PullLabels, RepoLabels, ResourceLabels, SkipLabels, WorkflowLabels,
-        WorkflowStateLabels, author_label,
+        AuthorLabels, Metrics, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
+        WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
     },
     model::{Repo, SkipReason},
 };
@@ -45,8 +45,12 @@ const fn estimate_core_requests(monitored: u64) -> u64 {
 pub struct WorkflowCache {
     /// `owner/name` -> workflow name -> expected interval in seconds.
     intervals: HashMap<String, HashMap<String, i64>>,
-    /// `owner/name` -> whether the repo has any workflow files at all.
-    has_workflows: HashMap<String, bool>,
+    /// `owner/name` -> the workflow files currently present in the repo.
+    ///
+    /// Retained so run history can be intersected against it: GitHub keeps
+    /// runs of deleted workflows forever, and reporting them shows failures
+    /// for CI that no longer exists.
+    workflows: HashMap<String, Vec<rest::Workflow>>,
     /// Repositories monitored by the previous cycle, used to size the
     /// budget pre-flight check.
     monitored_count: u64,
@@ -139,36 +143,7 @@ pub async fn collect(
     let (candidates, mut skipped) =
         graphql::partition_repos(discovered, &|name| config.is_denylisted(name), max_age, now);
 
-    // Workflow presence. Repos with no workflow files are content-hosting
-    // repos with no CI signal; they are dropped so the dashboard is not
-    // padded with permanently-empty rows.
-    let mut monitored = Vec::with_capacity(candidates.len());
-    for repo in candidates {
-        let key = repo.full_name();
-        let workflows = match rest::list_workflows(client, &repo).await {
-            Ok(workflows) => workflows,
-            Err(error) => {
-                warn!(repo = %repo, %error, "failed to list workflows; keeping repository");
-                monitored.push(repo);
-                continue;
-            }
-        };
-
-        let has_workflows = !workflows.is_empty();
-        cache.has_workflows.insert(key.clone(), has_workflows);
-
-        if !has_workflows && config.skip_repos_without_workflows {
-            skipped.push((repo, SkipReason::NoWorkflows));
-            continue;
-        }
-
-        // Resolve cron schedules once per workflow set; they change rarely.
-        if let std::collections::hash_map::Entry::Vacant(entry) = cache.intervals.entry(key) {
-            entry.insert(resolve_cron_intervals(client, &repo, &workflows).await);
-        }
-
-        monitored.push(repo);
-    }
+    let monitored = resolve_monitored(client, config, cache, candidates, &mut skipped).await;
 
     info!(
         monitored = monitored.len(),
@@ -189,8 +164,25 @@ pub async fn collect(
 
     // Actions runs, one request per repository.
     for repo in &monitored {
-        match rest::fetch_runs(client, repo).await {
-            Ok(runs) => record_runs(metrics, repo, &runs, cache),
+        let live = cache
+            .workflows
+            .get(&repo.full_name())
+            .cloned()
+            .unwrap_or_default();
+        // Without a workflow set every run would be discarded as orphaned,
+        // publishing no series at all and making a listing failure look like
+        // "this repository's CI vanished". Skip the fetch rather than spend a
+        // request that cannot produce a result.
+        if live.is_empty() {
+            warn!(
+                repo = %repo,
+                "no workflow set available; skipping run fetch for this cycle"
+            );
+            continue;
+        }
+        record_workflow_states(metrics, repo, &live);
+        match rest::fetch_runs(client, repo, &live).await {
+            Ok(runs) => record_runs(metrics, repo, &runs, cache, now),
             Err(error) => warn!(repo = %repo, %error, "failed to fetch workflow runs"),
         }
     }
@@ -281,6 +273,70 @@ fn record_repo_inventory(metrics: &Metrics, monitored: &[Repo], skipped: &[(Repo
     }
 }
 
+/// Determines which candidates actually have CI, caching their workflow sets.
+///
+/// Repositories with no workflow files are content-hosting repos with no CI
+/// signal; they are dropped so the dashboard is not padded with permanently
+/// empty rows.
+async fn resolve_monitored(
+    client: &Client,
+    config: &Config,
+    cache: &mut WorkflowCache,
+    candidates: Vec<Repo>,
+    skipped: &mut Vec<(Repo, SkipReason)>,
+) -> Vec<Repo> {
+    let mut monitored = Vec::with_capacity(candidates.len());
+
+    for repo in candidates {
+        let key = repo.full_name();
+        let workflows = match rest::list_workflows(client, &repo).await {
+            Ok(workflows) => workflows,
+            Err(error) => {
+                // A listing failure is not evidence of absent CI, so the
+                // repository is kept rather than silently dropped.
+                warn!(repo = %repo, %error, "failed to list workflows; keeping repository");
+                monitored.push(repo);
+                continue;
+            }
+        };
+
+        if workflows.is_empty() && config.skip_repos_without_workflows {
+            cache.workflows.remove(&key);
+            skipped.push((repo, SkipReason::NoWorkflows));
+            continue;
+        }
+        cache.workflows.insert(key.clone(), workflows.clone());
+
+        // Cron schedules change rarely, so they are resolved once per set.
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.intervals.entry(key) {
+            entry.insert(resolve_cron_intervals(client, &repo, &workflows).await);
+        }
+
+        monitored.push(repo);
+    }
+
+    monitored
+}
+
+/// Publishes whether GitHub will actually run each workflow.
+///
+/// A workflow auto-disabled for inactivity has silently stopped running; the
+/// `state` label lets an alert distinguish that from a deliberate manual
+/// disable.
+fn record_workflow_states(metrics: &Metrics, repo: &Repo, workflows: &[rest::Workflow]) {
+    for workflow in workflows {
+        metrics
+            .workflow_enabled
+            .get_or_create(&WorkflowEnabledLabels {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+                workflow: workflow.name.clone(),
+                state: workflow.state.as_str().to_owned(),
+            })
+            .set(i64::from(workflow.state == rest::WorkflowState::Active));
+    }
+}
+
 /// Resolves each workflow's expected run interval from its cron schedule.
 async fn resolve_cron_intervals(
     client: &Client,
@@ -360,10 +416,36 @@ fn record_activity(
     }
 }
 
-fn record_runs(metrics: &Metrics, repo: &Repo, runs: &rest::RepoRuns, cache: &WorkflowCache) {
+fn record_runs(
+    metrics: &Metrics,
+    repo: &Repo,
+    runs: &rest::RepoRuns,
+    cache: &WorkflowCache,
+    now: DateTime<Utc>,
+) {
     let intervals = cache.intervals.get(&repo.full_name());
 
     for run in &runs.latest {
+        // A run older than the staleness horizon says nothing about the
+        // current code. Reporting `stale` instead of its original conclusion
+        // keeps an ancient failure from producing an alert that cannot be
+        // cleared without an artificial push. `workflow_run_stale` carries the
+        // fact separately so it stays visible on the dashboard.
+        let stale = run.is_stale(now);
+        metrics
+            .workflow_run_stale
+            .get_or_create(&WorkflowLabels {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+                workflow: run.workflow.clone(),
+            })
+            .set(i64::from(stale));
+
+        let conclusion = if stale {
+            "stale"
+        } else {
+            run.conclusion.as_str()
+        };
         metrics
             .workflow_run_status
             .get_or_create(&WorkflowStateLabels {
@@ -371,7 +453,7 @@ fn record_runs(metrics: &Metrics, repo: &Repo, runs: &rest::RepoRuns, cache: &Wo
                 repo: repo.name.clone(),
                 workflow: run.workflow.clone(),
                 event: run.event.clone(),
-                conclusion: run.conclusion.as_str().to_owned(),
+                conclusion: conclusion.to_owned(),
             })
             .set(1);
 

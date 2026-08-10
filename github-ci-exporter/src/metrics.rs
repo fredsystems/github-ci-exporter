@@ -47,6 +47,14 @@ pub struct WorkflowLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WorkflowEnabledLabels {
+    pub org: String,
+    pub repo: String,
+    pub workflow: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct WorkflowStateLabels {
     pub org: String,
     pub repo: String,
@@ -76,6 +84,8 @@ pub struct Metrics {
     pub workflow_run_timestamp: Family<WorkflowLabels, Gauge>,
     pub workflow_last_success_timestamp: Family<WorkflowLabels, Gauge>,
     pub workflow_expected_interval: Family<WorkflowLabels, Gauge>,
+    pub workflow_enabled: Family<WorkflowEnabledLabels, Gauge>,
+    pub workflow_run_stale: Family<WorkflowLabels, Gauge>,
     pub repo_monitored: Family<RepoLabels, Gauge>,
     pub repos_skipped: Family<SkipLabels, Gauge>,
     pub rate_limit_remaining: Family<ResourceLabels, Gauge>,
@@ -153,6 +163,20 @@ impl Metrics {
             "workflow_expected_interval_seconds",
             "Expected interval between runs, derived from the workflow's cron schedule",
             workflow_expected_interval.clone(),
+        );
+
+        let workflow_enabled = Family::<WorkflowEnabledLabels, Gauge>::default();
+        registry.register(
+            "workflow_enabled",
+            "1 if GitHub will run this workflow; state distinguishes an inactivity auto-disable from a manual one",
+            workflow_enabled.clone(),
+        );
+
+        let workflow_run_stale = Family::<WorkflowLabels, Gauge>::default();
+        registry.register(
+            "workflow_run_stale",
+            "1 if the latest branch-state run is too old to describe current code",
+            workflow_run_stale.clone(),
         );
 
         let repo_monitored = Family::<RepoLabels, Gauge>::default();
@@ -263,6 +287,8 @@ impl Metrics {
                 workflow_run_timestamp,
                 workflow_last_success_timestamp,
                 workflow_expected_interval,
+                workflow_enabled,
+                workflow_run_stale,
                 repo_monitored,
                 repos_skipped,
                 rate_limit_remaining,
@@ -295,6 +321,8 @@ impl Metrics {
         self.workflow_run_timestamp.clear();
         self.workflow_last_success_timestamp.clear();
         self.workflow_expected_interval.clear();
+        self.workflow_enabled.clear();
+        self.workflow_run_stale.clear();
         self.repo_monitored.clear();
         self.repos_skipped.clear();
     }
