@@ -37,6 +37,13 @@ pub struct PullLabels {
     pub author: String,
     pub author_kind: String,
     pub draft: String,
+    /// Rollup state of the head commit's checks: success, failure, pending,
+    /// none, or unknown.
+    pub checks: String,
+    pub mergeable: String,
+    /// Whether auto-merge is armed. A green, mergeable PR with this "false"
+    /// is waiting on a human.
+    pub auto_merge: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -80,6 +87,8 @@ pub struct Metrics {
     pub pulls_open: Family<AuthorLabels, Gauge>,
     pub pulls_draft: Family<AuthorLabels, Gauge>,
     pub pull_created_timestamp: Family<PullLabels, Gauge>,
+    pub pull_needs_attention: Family<PullLabels, Gauge>,
+    pub pull_ready_to_merge: Family<PullLabels, Gauge>,
     pub workflow_run_status: Family<WorkflowStateLabels, Gauge>,
     pub workflow_run_timestamp: Family<WorkflowLabels, Gauge>,
     pub workflow_last_success_timestamp: Family<WorkflowLabels, Gauge>,
@@ -135,6 +144,20 @@ impl Metrics {
             "pull_created_timestamp_seconds",
             "Creation time of each open pull request",
             pull_created_timestamp.clone(),
+        );
+
+        let pull_needs_attention = Family::<PullLabels, Gauge>::default();
+        registry.register(
+            "pull_needs_attention",
+            "1 for an open non-draft PR that is failing checks, conflicting, or green and awaiting a manual merge",
+            pull_needs_attention.clone(),
+        );
+
+        let pull_ready_to_merge = Family::<PullLabels, Gauge>::default();
+        registry.register(
+            "pull_ready_to_merge",
+            "1 for an open non-draft PR whose checks pass and which is mergeable, but has no auto-merge armed",
+            pull_ready_to_merge.clone(),
         );
 
         let workflow_run_status = Family::<WorkflowStateLabels, Gauge>::default();
@@ -283,6 +306,8 @@ impl Metrics {
                 pulls_open,
                 pulls_draft,
                 pull_created_timestamp,
+                pull_needs_attention,
+                pull_ready_to_merge,
                 workflow_run_status,
                 workflow_run_timestamp,
                 workflow_last_success_timestamp,
@@ -317,6 +342,8 @@ impl Metrics {
         self.pulls_open.clear();
         self.pulls_draft.clear();
         self.pull_created_timestamp.clear();
+        self.pull_needs_attention.clear();
+        self.pull_ready_to_merge.clear();
         self.workflow_run_status.clear();
         self.workflow_run_timestamp.clear();
         self.workflow_last_success_timestamp.clear();

@@ -43,7 +43,12 @@ const fn estimate_core_requests(monitored: u64) -> u64 {
 /// schedules are resolved once and refreshed lazily rather than every cycle.
 #[derive(Debug, Default)]
 pub struct WorkflowCache {
-    /// `owner/name` -> workflow name -> expected interval in seconds.
+    /// `owner/name` -> workflow **file path** -> expected interval in seconds.
+    ///
+    /// Keyed by path, not display name, for the same reason the run reducer is:
+    /// the path is the workflow's identity. Keying by name meant a rename plus
+    /// a failed contents lookup dropped the cached interval, because the old
+    /// name was no longer in the live set.
     intervals: HashMap<String, HashMap<String, i64>>,
     /// `owner/name` -> the workflow files currently present in the repo.
     ///
@@ -289,7 +294,7 @@ async fn resolve_monitored(
 
     for repo in candidates {
         let key = repo.full_name();
-        let workflows = match rest::list_workflows(client, &repo).await {
+        let mut workflows = match rest::list_workflows(client, &repo).await {
             Ok(workflows) => workflows,
             Err(error) => {
                 // A listing failure is not evidence of absent CI, so the
@@ -305,17 +310,65 @@ async fn resolve_monitored(
             skipped.push((repo, SkipReason::NoWorkflows));
             continue;
         }
-        cache.workflows.insert(key.clone(), workflows.clone());
+        // Trigger lists must be resolved before the workflow set is cached,
+        // because the run reducer reads them from the cache.
+        let resolved = resolve_definitions(client, &repo, &mut workflows).await;
 
-        // Cron schedules change rarely, so they are resolved once per set.
-        if let std::collections::hash_map::Entry::Vacant(entry) = cache.intervals.entry(key) {
-            entry.insert(resolve_cron_intervals(client, &repo, &workflows).await);
+        if let Some(previous) = cache.workflows.get(&key) {
+            carry_forward_triggers(&mut workflows, previous);
         }
+
+        let entry = cache.intervals.entry(key).or_default();
+        merge_intervals(entry, resolved, &workflows);
+
+        cache.workflows.insert(repo.full_name(), workflows);
 
         monitored.push(repo);
     }
 
     monitored
+}
+
+/// Restores trigger lists that this cycle failed to fetch.
+///
+/// `resolve_definitions` leaves `triggers` empty when a file lookup fails, and
+/// an empty list means "accept any event". Without this, a transient contents
+/// error would silently re-admit runs from a superseded trigger configuration
+/// -- reintroducing the frext/bike-fitter false positive for one cycle.
+fn carry_forward_triggers(current: &mut [rest::Workflow], previous: &[rest::Workflow]) {
+    for workflow in current {
+        if !workflow.triggers.is_empty() {
+            continue;
+        }
+        if let Some(old) = previous
+            .iter()
+            .find(|w| w.path == workflow.path && !w.triggers.is_empty())
+        {
+            workflow.triggers.clone_from(&old.triggers);
+        }
+    }
+}
+
+/// Folds newly-resolved cron intervals into the cached set.
+///
+/// Merges rather than replaces: `resolve_definitions` omits any workflow whose
+/// file lookup failed, so replacing wholesale would drop a previously-known
+/// interval. That would make `workflow_expected_interval_seconds` disappear and
+/// reappear, which in turn flaps `GitHubScheduledWorkflowStale` because that
+/// rule compares against it.
+///
+/// Intervals for workflows that no longer exist are dropped, so a deleted cron
+/// workflow stops being expected to run.
+fn merge_intervals(
+    cached: &mut HashMap<String, i64>,
+    resolved: HashMap<String, i64>,
+    live: &[rest::Workflow],
+) {
+    cached.extend(resolved);
+    // Retained by path, so renaming a workflow does not orphan its interval.
+    let live_paths: std::collections::HashSet<&str> =
+        live.iter().map(|w| w.path.as_str()).collect();
+    cached.retain(|path, _| live_paths.contains(path.as_str()));
 }
 
 /// Publishes whether GitHub will actually run each workflow.
@@ -337,22 +390,31 @@ fn record_workflow_states(metrics: &Metrics, repo: &Repo, workflows: &[rest::Wor
     }
 }
 
-/// Resolves each workflow's expected run interval from its cron schedule.
-async fn resolve_cron_intervals(
+/// Reads each workflow file to recover its cron schedule and its trigger list.
+///
+/// Both come from the same fetch, which is `ETag`-revalidated and therefore
+/// nearly free after the first sweep. `workflows` is updated in place with the
+/// triggers, because the run reducer needs them to discard runs from a
+/// superseded trigger configuration.
+async fn resolve_definitions(
     client: &Client,
     repo: &Repo,
-    workflows: &[rest::Workflow],
+    workflows: &mut [rest::Workflow],
 ) -> HashMap<String, i64> {
     let mut intervals = HashMap::new();
-    for workflow in workflows {
-        match rest::fetch_workflow_crons(client, repo, &workflow.path).await {
-            Ok(crons) => {
-                if let Some(interval) = shortest_cron_interval(&crons) {
-                    intervals.insert(workflow.name.clone(), interval);
+    for workflow in workflows.iter_mut() {
+        match rest::fetch_workflow_definition(client, repo, &workflow.path).await {
+            Ok(definition) => {
+                if let Some(interval) = shortest_cron_interval(&definition.crons) {
+                    intervals.insert(workflow.path.clone(), interval);
                 }
+                workflow.triggers = definition.triggers;
             }
             Err(error) => {
-                debug!(repo = %repo, path = workflow.path, %error, "cron lookup failed");
+                // Leaving `triggers` empty means "accept any event", so a
+                // failed lookup degrades to the previous behaviour rather than
+                // hiding the repository's CI.
+                debug!(repo = %repo, path = workflow.path, %error, "workflow definition lookup failed");
             }
         }
     }
@@ -401,17 +463,29 @@ fn record_activity(
         }
 
         for pull in &entry.open_pulls {
+            let labels = PullLabels {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+                number: pull.number.to_string(),
+                author: pull.author.clone(),
+                author_kind: author_label(pull.author_kind),
+                draft: pull.is_draft.to_string(),
+                checks: pull.checks.as_str().to_owned(),
+                mergeable: pull.mergeable.as_str().to_owned(),
+                auto_merge: pull.auto_merge.to_string(),
+            };
             metrics
                 .pull_created_timestamp
-                .get_or_create(&PullLabels {
-                    org: repo.owner.clone(),
-                    repo: repo.name.clone(),
-                    number: pull.number.to_string(),
-                    author: pull.author.clone(),
-                    author_kind: author_label(pull.author_kind),
-                    draft: pull.is_draft.to_string(),
-                })
+                .get_or_create(&labels)
                 .set(pull.created_at.timestamp());
+            metrics
+                .pull_needs_attention
+                .get_or_create(&labels)
+                .set(i64::from(pull.needs_attention()));
+            metrics
+                .pull_ready_to_merge
+                .get_or_create(&labels)
+                .set(i64::from(pull.is_ready_to_merge()));
         }
     }
 }
@@ -423,7 +497,19 @@ fn record_runs(
     cache: &WorkflowCache,
     now: DateTime<Utc>,
 ) {
-    let intervals = cache.intervals.get(&repo.full_name());
+    let full_name = repo.full_name();
+    let intervals = cache.intervals.get(&full_name);
+    // Runs are labelled by display name, while intervals are keyed by path, so
+    // the workflow set provides the mapping between the two.
+    let path_for_name: HashMap<&str, &str> = cache
+        .workflows
+        .get(&full_name)
+        .map(|ws| {
+            ws.iter()
+                .map(|w| (w.name.as_str(), w.path.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     for run in &runs.latest {
         // A run older than the staleness horizon says nothing about the
@@ -466,7 +552,10 @@ fn record_runs(
             })
             .set(run.created_at.timestamp());
 
-        if let Some(interval) = intervals.and_then(|m| m.get(&run.workflow)) {
+        if let Some(interval) = path_for_name
+            .get(run.workflow.as_str())
+            .and_then(|path| intervals.and_then(|m| m.get(*path)))
+        {
             metrics
                 .workflow_expected_interval
                 .get_or_create(&WorkflowLabels {
@@ -572,6 +661,128 @@ mod tests {
         let interval = shortest_cron_interval(&["nonsense".to_owned(), "0 12 * * *".to_owned()])
             .expect("valid expression should still resolve");
         assert_eq!(interval, 86_400);
+    }
+
+    fn wf(name: &str, triggers: &[&str]) -> rest::Workflow {
+        rest::Workflow {
+            name: name.to_owned(),
+            path: format!(".github/workflows/{name}.yml"),
+            state: rest::WorkflowState::Active,
+            triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn triggers_are_carried_forward_when_a_lookup_fails() {
+        // A failed contents fetch leaves triggers empty, which means "accept
+        // any event". Without carry-forward that silently re-admits runs from
+        // a superseded trigger for a cycle.
+        let previous = vec![wf("CI", &["pull_request"])];
+        let mut current = vec![wf("CI", &[])];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(current[0].triggers, ["pull_request"]);
+    }
+
+    #[test]
+    fn freshly_resolved_triggers_win_over_cached_ones() {
+        let previous = vec![wf("CI", &["push"])];
+        let mut current = vec![wf("CI", &["pull_request"])];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(
+            current[0].triggers,
+            ["pull_request"],
+            "a real change must not be reverted by the cache"
+        );
+    }
+
+    #[test]
+    fn carry_forward_matches_on_path_not_name() {
+        // A renamed workflow keeps its file path, so its triggers still apply.
+        let previous = vec![wf("CI", &["pull_request"])];
+        let mut renamed = wf("Build", &[]);
+        renamed.path = ".github/workflows/CI.yml".to_owned();
+        let mut current = vec![renamed];
+        carry_forward_triggers(&mut current, &previous);
+        assert_eq!(current[0].triggers, ["pull_request"]);
+    }
+
+    #[test]
+    fn a_failed_lookup_does_not_drop_a_known_interval() {
+        // Regression guard: replacing the interval map wholesale made
+        // workflow_expected_interval_seconds vanish whenever a contents fetch
+        // failed, which flaps GitHubScheduledWorkflowStale.
+        let mut cached = HashMap::from([(
+            ".github/workflows/update-flakes.yml".to_owned(),
+            604_800_i64,
+        )]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(&mut cached, HashMap::new(), &live);
+
+        assert_eq!(
+            cached.get(".github/workflows/update-flakes.yml"),
+            Some(&604_800)
+        );
+    }
+
+    #[test]
+    fn a_new_interval_overwrites_the_cached_one() {
+        let mut cached = HashMap::from([(
+            ".github/workflows/update-flakes.yml".to_owned(),
+            604_800_i64,
+        )]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(
+            &mut cached,
+            HashMap::from([(".github/workflows/update-flakes.yml".to_owned(), 86_400_i64)]),
+            &live,
+        );
+
+        assert_eq!(
+            cached.get(".github/workflows/update-flakes.yml"),
+            Some(&86_400)
+        );
+    }
+
+    #[test]
+    fn intervals_for_deleted_workflows_are_dropped() {
+        // Otherwise a removed cron workflow stays "expected to run" forever.
+        let mut cached = HashMap::from([
+            (
+                ".github/workflows/update-flakes.yml".to_owned(),
+                604_800_i64,
+            ),
+            (".github/workflows/gone.yml".to_owned(), 86_400_i64),
+        ]);
+        let live = vec![wf("update-flakes", &["schedule"])];
+
+        merge_intervals(&mut cached, HashMap::new(), &live);
+
+        assert_eq!(cached.len(), 1);
+        assert!(!cached.contains_key(".github/workflows/gone.yml"));
+    }
+
+    #[test]
+    fn a_rename_plus_failed_lookup_keeps_the_interval() {
+        // Regression guard: intervals were keyed by display name while
+        // identity is the file path. Renaming a workflow whose contents
+        // lookup then failed orphaned the cached interval, so
+        // workflow_expected_interval_seconds vanished for that cycle and
+        // flapped GitHubScheduledWorkflowStale.
+        let mut cached = HashMap::from([(".github/workflows/CI.yml".to_owned(), 86_400_i64)]);
+
+        // Same file, new display name, and no freshly resolved interval.
+        let mut renamed = wf("Build", &["schedule"]);
+        renamed.path = ".github/workflows/CI.yml".to_owned();
+
+        merge_intervals(&mut cached, HashMap::new(), &[renamed]);
+
+        assert_eq!(
+            cached.get(".github/workflows/CI.yml"),
+            Some(&86_400),
+            "a rename must not orphan the cached interval"
+        );
     }
 
     #[test]

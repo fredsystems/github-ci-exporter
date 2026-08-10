@@ -83,6 +83,84 @@ impl SkipReason {
     }
 }
 
+/// Aggregate result of the checks on a pull request's head commit.
+///
+/// This is GitHub's `statusCheckRollup`, and unlike on a default-branch commit
+/// it is reliable here: PR-triggered workflows are attached to the head commit
+/// by construction. (On the default branch the rollup was null for 30 of 31
+/// sampled repositories, because most workflows there run on `schedule`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChecksState {
+    Success,
+    Failure,
+    Pending,
+    /// No checks are attached to the head commit at all. Distinct from
+    /// `Pending`: this repository has no PR-triggered CI, so waiting will
+    /// never produce a result.
+    None,
+    Unknown,
+}
+
+impl ChecksState {
+    /// Maps GraphQL's `StatusState`, treating a null rollup as [`Self::None`].
+    #[must_use]
+    pub fn from_api(state: Option<&str>) -> Self {
+        match state {
+            None => Self::None,
+            Some("SUCCESS") => Self::Success,
+            // ERROR is a failed commit status rather than a failed check run;
+            // both mean the same thing to someone deciding whether to merge.
+            Some("FAILURE" | "ERROR") => Self::Failure,
+            Some("PENDING" | "EXPECTED") => Self::Pending,
+            Some(_) => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Pending => "pending",
+            Self::None => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether a pull request can be merged as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeableState {
+    Mergeable,
+    /// Conflicts with the base branch.
+    Conflicting,
+    /// GitHub has not computed it yet. Deliberately its own state rather than
+    /// being folded into `Mergeable`: the value is computed lazily, so a first
+    /// query commonly returns `UNKNOWN` for a PR that is in fact conflicting.
+    /// Treating it as mergeable would report conflicted PRs as ready to merge.
+    Unknown,
+}
+
+impl MergeableState {
+    #[must_use]
+    pub fn from_api(state: Option<&str>) -> Self {
+        match state {
+            Some("MERGEABLE") => Self::Mergeable,
+            Some("CONFLICTING") => Self::Conflicting,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mergeable => "mergeable",
+            Self::Conflicting => "conflicting",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// A repository selected for monitoring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repo {

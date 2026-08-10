@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::client::{Client, ClientError};
-use crate::model::{AuthorKind, Repo, SkipReason};
+use crate::model::{AuthorKind, ChecksState, MergeableState, Repo, SkipReason};
 
 /// Repositories per discovery page. 100 is GraphQL's maximum page size.
 const DISCOVERY_PAGE_SIZE: usize = 100;
@@ -156,6 +156,37 @@ pub struct OpenPull {
     pub author_kind: AuthorKind,
     pub is_draft: bool,
     pub created_at: DateTime<Utc>,
+    /// Aggregate state of checks on the head commit.
+    pub checks: ChecksState,
+    pub mergeable: MergeableState,
+    /// Whether auto-merge is armed. A green, mergeable PR without it is
+    /// waiting on a human to press the button.
+    pub auto_merge: bool,
+}
+
+impl OpenPull {
+    /// Whether this pull request needs someone to act on it.
+    ///
+    /// Drafts are excluded throughout: an open draft is work in progress.
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        !self.is_draft
+            && (self.checks == ChecksState::Failure
+                || self.mergeable == MergeableState::Conflicting
+                || self.is_ready_to_merge())
+    }
+
+    /// Green, conflict-free, and not going to merge itself.
+    ///
+    /// This is the "all checks passed but automerge is off, so it is sitting
+    /// there waiting for a click" case.
+    #[must_use]
+    pub fn is_ready_to_merge(&self) -> bool {
+        !self.is_draft
+            && self.checks == ChecksState::Success
+            && self.mergeable == MergeableState::Mergeable
+            && !self.auto_merge
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +219,51 @@ struct PullNode {
     #[serde(rename = "createdAt")]
     created_at: DateTime<Utc>,
     author: Option<Actor>,
+    mergeable: Option<String>,
+    #[serde(rename = "autoMergeRequest")]
+    auto_merge_request: Option<AutoMergeRequest>,
+    commits: Option<CommitConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoMergeRequest {
+    #[serde(rename = "enabledAt")]
+    _enabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitConnection {
+    nodes: Vec<CommitNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitNode {
+    commit: CommitDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetail {
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusCheckRollup {
+    state: Option<String>,
+}
+
+impl PullNode {
+    /// Rollup state of the head commit's checks.
+    fn checks_state(&self) -> ChecksState {
+        let rollup = self
+            .commits
+            .as_ref()
+            .and_then(|c| c.nodes.first())
+            .and_then(|n| n.commit.status_check_rollup.as_ref());
+        rollup.map_or(ChecksState::None, |r| {
+            ChecksState::from_api(r.state.as_deref())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,7 +303,15 @@ fragment A on Repository {
     nodes { author { login __typename } }
   }
   pullRequests(states: OPEN, first: 100) {
-    nodes { number isDraft createdAt author { login __typename } }
+    nodes {
+      number isDraft createdAt
+      author { login __typename }
+      mergeable
+      autoMergeRequest { enabledAt }
+      commits(last: 1) {
+        nodes { commit { statusCheckRollup { state } } }
+      }
+    }
   }
 }
 ",
@@ -282,6 +366,9 @@ pub async fn fetch_activity(
                     author_kind: kind,
                     is_draft: pull.is_draft,
                     created_at: pull.created_at,
+                    checks: pull.checks_state(),
+                    mergeable: MergeableState::from_api(pull.mergeable.as_deref()),
+                    auto_merge: pull.auto_merge_request.is_some(),
                 });
             }
 
@@ -370,6 +457,121 @@ mod tests {
         );
         assert!(query.contains("fragment A on Repository"));
         assert!(query.contains("__typename"), "bot detection needs typename");
+    }
+
+    fn pull(
+        checks: ChecksState,
+        mergeable: MergeableState,
+        auto_merge: bool,
+        is_draft: bool,
+    ) -> OpenPull {
+        OpenPull {
+            number: 1,
+            author: "someone".to_owned(),
+            author_kind: AuthorKind::Human,
+            is_draft,
+            created_at: Utc::now(),
+            checks,
+            mergeable,
+            auto_merge,
+        }
+    }
+
+    #[test]
+    fn failing_checks_need_attention() {
+        let p = pull(
+            ChecksState::Failure,
+            MergeableState::Mergeable,
+            false,
+            false,
+        );
+        assert!(p.needs_attention());
+        assert!(!p.is_ready_to_merge());
+    }
+
+    #[test]
+    fn green_without_automerge_is_ready_to_merge() {
+        // The case that motivated this: renovate PRs sitting green because
+        // automerge is off on that repo, waiting on a human to click.
+        let p = pull(
+            ChecksState::Success,
+            MergeableState::Mergeable,
+            false,
+            false,
+        );
+        assert!(p.is_ready_to_merge());
+        assert!(p.needs_attention());
+    }
+
+    #[test]
+    fn green_with_automerge_needs_nothing() {
+        let p = pull(ChecksState::Success, MergeableState::Mergeable, true, false);
+        assert!(!p.is_ready_to_merge(), "automerge will land it unattended");
+        assert!(!p.needs_attention());
+    }
+
+    #[test]
+    fn conflicting_needs_attention_even_when_green() {
+        let p = pull(
+            ChecksState::Success,
+            MergeableState::Conflicting,
+            true,
+            false,
+        );
+        assert!(p.needs_attention());
+        assert!(!p.is_ready_to_merge(), "a conflict is not mergeable");
+    }
+
+    #[test]
+    fn unknown_mergeable_is_not_treated_as_mergeable() {
+        // GitHub computes mergeability lazily, so a first query commonly
+        // returns UNKNOWN for a PR that is in fact conflicting -- observed on
+        // nixos#1615 and gitbook-adsb-guide#176, both of which resolved to
+        // CONFLICTING on re-query. Treating UNKNOWN as mergeable would report
+        // conflicted PRs as ready to merge.
+        let p = pull(ChecksState::Success, MergeableState::Unknown, false, false);
+        assert!(!p.is_ready_to_merge());
+    }
+
+    #[test]
+    fn pending_checks_need_nothing_yet() {
+        let p = pull(
+            ChecksState::Pending,
+            MergeableState::Mergeable,
+            false,
+            false,
+        );
+        assert!(!p.needs_attention(), "CI is still running");
+    }
+
+    #[test]
+    fn repos_without_pr_ci_are_not_stuck_pending() {
+        // A repo with no PR-triggered workflows reports no rollup at all.
+        // That must not read as "waiting for CI" forever, nor as ready to
+        // merge, since nothing has verified it.
+        let p = pull(ChecksState::None, MergeableState::Mergeable, false, false);
+        assert!(!p.is_ready_to_merge());
+        assert!(!p.needs_attention());
+    }
+
+    #[test]
+    fn drafts_never_need_attention() {
+        for checks in [ChecksState::Failure, ChecksState::Success] {
+            let p = pull(checks, MergeableState::Mergeable, false, true);
+            assert!(!p.needs_attention(), "an open draft is work in progress");
+            assert!(!p.is_ready_to_merge());
+        }
+    }
+
+    #[test]
+    fn checks_state_maps_error_as_failure() {
+        // ERROR is a failed commit status rather than a failed check run;
+        // both block a merge.
+        assert_eq!(ChecksState::from_api(Some("ERROR")), ChecksState::Failure);
+        assert_eq!(ChecksState::from_api(Some("FAILURE")), ChecksState::Failure);
+        assert_eq!(ChecksState::from_api(Some("SUCCESS")), ChecksState::Success);
+        assert_eq!(ChecksState::from_api(Some("PENDING")), ChecksState::Pending);
+        assert_eq!(ChecksState::from_api(None), ChecksState::None);
     }
 
     #[test]

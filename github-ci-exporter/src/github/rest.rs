@@ -87,6 +87,28 @@ pub struct Workflow {
     pub name: String,
     pub path: String,
     pub state: WorkflowState,
+    /// Events the workflow file currently declares under `on:`.
+    ///
+    /// Empty means unknown (not yet fetched, or unparsable), which is treated
+    /// as "accept any event" so a lookup failure cannot blank a repository.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+}
+
+impl Workflow {
+    /// Whether this workflow currently declares `event` as a trigger.
+    ///
+    /// Note that `merge_group` never reaches this check. Merge-queue runs
+    /// execute on a `gh-readonly-queue/...` branch, so the runs request's
+    /// `branch=` filter excludes them before reduction -- verified against
+    /// nixos and freminal, where none of their `merge_group` runs appear under
+    /// `branch=main`. The post-merge `push` run is what reports branch state.
+    fn declares(&self, event: &str) -> bool {
+        if self.triggers.is_empty() {
+            return true;
+        }
+        self.triggers.iter().any(|t| t == event)
+    }
 }
 
 /// Lists workflows defined by files in `.github/workflows`.
@@ -118,6 +140,8 @@ pub async fn list_workflows(client: &Client, repo: &Repo) -> Result<Vec<Workflow
                     name: w.name,
                     state: WorkflowState::from_api(&w.state),
                     path: w.path,
+                    // Populated by `resolve_definitions`, which reads the file.
+                    triggers: Vec::new(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -217,16 +241,28 @@ pub async fn fetch_runs(
 fn fingerprint_workflows(live: &[Workflow]) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
 
-    let mut pairs: Vec<(&str, &str)> = live
+    // Must cover every input the reduction reads: path and name decide
+    // identity and labels, and triggers decide which runs survive. Omitting
+    // triggers would let a trigger-only change keep the same cache key, so the
+    // 304 on an unchanged runs listing would replay a reduction computed
+    // against the old trigger set -- the same stale-reduction bug the
+    // fingerprint exists to prevent.
+    let mut entries: Vec<(&str, &str, Vec<&str>)> = live
         .iter()
-        .map(|w| (w.path.as_str(), w.name.as_str()))
+        .map(|w| {
+            let mut triggers: Vec<&str> = w.triggers.iter().map(String::as_str).collect();
+            // Sorted so an API or file reordering cannot spuriously invalidate.
+            triggers.sort_unstable();
+            (w.path.as_str(), w.name.as_str(), triggers)
+        })
         .collect();
-    pairs.sort_unstable();
+    entries.sort_unstable();
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (path, name) in pairs {
+    for (path, name, triggers) in entries {
         path.hash(&mut hasher);
         name.hash(&mut hasher);
+        triggers.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -296,6 +332,15 @@ fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
         let Some(workflow) = live_by_path.get(path) else {
             continue;
         };
+        // Run history outlives a trigger change. A workflow that used to run
+        // on push and now runs only on pull_request keeps its old push runs
+        // forever; reporting them describes a configuration that no longer
+        // exists. Observed on frext and bike-fitter-1000, both of which showed
+        // months-old push failures for a ci.yml that declares only
+        // pull_request.
+        if !workflow.declares(&run.event) {
+            continue;
+        }
         let name = workflow.name.clone();
 
         let conclusion = RunConclusion::from_api(&run.status, run.conclusion.as_deref());
@@ -359,25 +404,46 @@ struct ContentResponse {
 ///
 /// # Errors
 /// Returns [`ClientError`] if the file cannot be fetched.
-pub async fn fetch_workflow_crons(
+pub async fn fetch_workflow_definition(
     client: &Client,
     repo: &Repo,
     workflow_path: &str,
-) -> Result<Vec<String>, ClientError> {
+) -> Result<WorkflowDefinition, ClientError> {
     let path = format!(
         "/repos/{}/{}/contents/{workflow_path}?ref={}",
         repo.owner, repo.name, repo.default_branch
     );
-    let (crons, _) = client
+    let (definition, _) = client
         .get_cached(&path, |response: ContentResponse| {
             if response.encoding == "base64" {
-                parse_crons(&decode_base64(&response.content))
+                let yaml = decode_base64(&response.content);
+                WorkflowDefinition {
+                    crons: parse_crons(&yaml),
+                    triggers: parse_triggers(&yaml),
+                }
             } else {
-                Vec::new()
+                WorkflowDefinition::default()
             }
         })
         .await?;
-    Ok(crons)
+    Ok(definition)
+}
+
+/// What a workflow file currently declares.
+///
+/// `triggers` exists because run history outlives a trigger change. `frext`
+/// and `bike-fitter-1000` both had failing `push` runs from a period when
+/// their `ci.yml` ran on push; the file now declares only `pull_request`, but
+/// GitHub keeps the old runs forever. Reporting them describes a configuration
+/// that no longer exists.
+///
+/// An empty `triggers` set means the file could not be parsed, and is treated
+/// as "accept any event" so a parse failure degrades to the previous
+/// behaviour rather than blanking a repository's CI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowDefinition {
+    pub crons: Vec<String>,
+    pub triggers: Vec<String>,
 }
 
 /// Decodes GitHub's line-wrapped base64 content payloads.
@@ -409,6 +475,47 @@ fn decode_base64(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the event names from a workflow's `on:` block.
+///
+/// Handles all three forms GitHub accepts:
+///
+/// ```yaml
+/// on: push                      # scalar
+/// on: [push, pull_request]       # sequence
+/// on:                           # mapping
+///   push:
+///     branches: [main]
+/// ```
+fn parse_triggers(yaml: &str) -> Vec<String> {
+    let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) else {
+        return Vec::new();
+    };
+    // `on` is a YAML 1.1 boolean, so some parsers surface this key as `true`.
+    let Some(triggers) = document
+        .get("on")
+        .or_else(|| document.get(serde_yaml_ng::Value::Bool(true)))
+    else {
+        return Vec::new();
+    };
+
+    if let Some(one) = triggers.as_str() {
+        return vec![one.to_owned()];
+    }
+    if let Some(seq) = triggers.as_sequence() {
+        return seq
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+    }
+    if let Some(map) = triggers.as_mapping() {
+        return map
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_owned))
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Extracts cron expressions from a workflow's `on.schedule` block.
@@ -487,6 +594,8 @@ mod tests {
                 name: (*n).to_owned(),
                 path: format!(".github/workflows/{n}.yml"),
                 state: WorkflowState::Active,
+                // Empty = accept any event, so existing tests are unaffected.
+                triggers: Vec::new(),
             })
             .collect()
     }
@@ -750,11 +859,13 @@ mod tests {
                 name: "Deploy".to_owned(),
                 path: ".github/workflows/deploy.yml".to_owned(),
                 state: WorkflowState::Active,
+                triggers: Vec::new(),
             },
             Workflow {
                 name: "Lint".to_owned(),
                 path: ".github/workflows/lint.yaml".to_owned(),
                 state: WorkflowState::Active,
+                triggers: Vec::new(),
             },
         ];
         let runs = vec![
@@ -790,6 +901,7 @@ mod tests {
             name: "update-flakes".to_owned(),
             path: ".github/workflows/update-flakes.yaml".to_owned(),
             state: WorkflowState::DisabledInactivity,
+            triggers: Vec::new(),
         }];
         let runs = vec![run_at(
             "update-flakes",
@@ -897,16 +1009,52 @@ mod tests {
             name: "CI".to_owned(),
             path: ".github/workflows/ci.yml".to_owned(),
             state: WorkflowState::Active,
+            triggers: Vec::new(),
         }];
         let after = vec![Workflow {
             name: "Build".to_owned(),
             path: ".github/workflows/ci.yml".to_owned(),
             state: WorkflowState::Active,
+            triggers: Vec::new(),
         }];
         assert_ne!(
             fingerprint_workflows(&before),
             fingerprint_workflows(&after),
             "a rename changes the output labels and must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_only_triggers_change() {
+        // Regression guard: reduce_runs filters on triggers, so they are part
+        // of the reduction's input. A trigger-only edit leaves the runs
+        // listing unchanged, so the request answers 304; without triggers in
+        // the key the stale reduction would be replayed and runs from the old
+        // trigger set would reappear.
+        let before = wf("CI", &["push", "pull_request"]);
+        let after = wf("CI", &["pull_request"]);
+        assert_ne!(
+            fingerprint_workflows(&before),
+            fingerprint_workflows(&after)
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_trigger_ordering() {
+        // The `on:` mapping order is incidental; reordering it must not force
+        // an uncached refetch of every repository.
+        let a = wf("CI", &["push", "pull_request", "merge_group"]);
+        let b = wf("CI", &["merge_group", "push", "pull_request"]);
+        assert_eq!(fingerprint_workflows(&a), fingerprint_workflows(&b));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_empty_from_populated_triggers() {
+        // Empty means "unknown, accept anything", which is a materially
+        // different reduction from an explicit single trigger.
+        assert_ne!(
+            fingerprint_workflows(&wf("CI", &[])),
+            fingerprint_workflows(&wf("CI", &["push"]))
         );
     }
 
@@ -931,6 +1079,105 @@ mod tests {
         );
         orphan.path = None;
         assert!(reduce_runs(vec![orphan], &live(&["CI"])).latest.is_empty());
+    }
+
+    fn wf(name: &str, triggers: &[&str]) -> Vec<Workflow> {
+        vec![Workflow {
+            name: name.to_owned(),
+            path: format!(".github/workflows/{name}.yml"),
+            state: WorkflowState::Active,
+            triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
+        }]
+    }
+
+    #[test]
+    fn discards_runs_from_a_superseded_trigger() {
+        // Regression guard: frext and bike-fitter-1000 both showed failing
+        // `push` runs for a ci.yml that declares only `pull_request`. The
+        // workflow used to run on push; GitHub keeps those runs forever, so
+        // reporting them describes a configuration that no longer exists.
+        let runs = vec![run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-06-29T18:23:03Z",
+        )];
+        let reduced = reduce_runs(runs, &wf("CI", &["pull_request", "merge_group"]));
+        assert!(
+            reduced.latest.is_empty(),
+            "a push run must be dropped when the workflow no longer runs on push"
+        );
+    }
+
+    #[test]
+    fn keeps_runs_whose_event_is_still_declared() {
+        let runs = vec![run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-08-09T00:00:00Z",
+        )];
+        let reduced = reduce_runs(runs, &wf("CI", &["push", "pull_request"]));
+        assert_eq!(reduced.latest.len(), 1);
+    }
+
+    #[test]
+    fn unknown_triggers_accept_any_event() {
+        // An empty trigger list means the file could not be fetched or parsed.
+        // That must degrade to the previous behaviour, not blank the repo.
+        let runs = vec![run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-08-09T00:00:00Z",
+        )];
+        let reduced = reduce_runs(runs, &wf("CI", &[]));
+        assert_eq!(reduced.latest.len(), 1);
+    }
+
+    #[test]
+    fn parses_triggers_from_all_three_yaml_forms() {
+        assert_eq!(parse_triggers("on: push\njobs: {}\n"), ["push"]);
+        assert_eq!(
+            parse_triggers("on: [push, pull_request]\njobs: {}\n"),
+            ["push", "pull_request"]
+        );
+        let mapping = r"
+on:
+  pull_request:
+  merge_group:
+jobs: {}
+";
+        assert_eq!(parse_triggers(mapping), ["pull_request", "merge_group"]);
+    }
+
+    #[test]
+    fn parses_triggers_from_a_real_frext_style_workflow() {
+        // The exact shape that caused the false positive.
+        let yaml = r"
+name: CI
+on:
+  pull_request:
+
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+";
+        let triggers = parse_triggers(yaml);
+        assert_eq!(triggers, ["pull_request"]);
+        assert!(!triggers.iter().any(|t| t == "push"));
+    }
+
+    #[test]
+    fn malformed_yaml_yields_no_triggers() {
+        // Which means "accept anything", the safe direction.
+        assert!(parse_triggers("this: is: not: valid: yaml:").is_empty());
+        assert!(parse_triggers("").is_empty());
     }
 
     #[test]

@@ -87,7 +87,9 @@ flag alone.
 | `github_repo_issues_open`                          | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_open`                           | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_repo_pulls_draft`                          | gauge   | `org`, `repo`, `author_kind`                        |
-| `github_pull_created_timestamp_seconds`            | gauge   | `org`, `repo`, `number`, `author`, `author_kind`, `draft` |
+| `github_pull_created_timestamp_seconds`            | gauge   | `org`, `repo`, `number`, `author`, `author_kind`, `draft`, `checks`, `mergeable`, `auto_merge` |
+| `github_pull_needs_attention`                      | gauge   | same as above                                       |
+| `github_pull_ready_to_merge`                       | gauge   | same as above                                       |
 | `github_workflow_run_status`                       | gauge   | `org`, `repo`, `workflow`, `event`, `conclusion`    |
 | `github_workflow_run_stale`                        | gauge   | `org`, `repo`, `workflow`                           |
 | `github_workflow_enabled`                          | gauge   | `org`, `repo`, `workflow`, `state`                  |
@@ -127,7 +129,27 @@ per workflow produced 38 "failures", of which fewer than half were real:
 | Identity is the file path     | Runs predating a workflow's `name:` report the path instead, splitting one workflow into two series.                                                                                                   |
 | Branch-state events only      | The API's `branch=` filter matches a pull request's *head* branch, so PR runs leak in. A merged PR's last pre-merge failure would otherwise be the branch's CI state forever.                          |
 | Runs age out after 90 days    | Some workflows only fire on `pull_request`, leaving a branch-state run many months old. Those report `conclusion="stale"` and set `github_workflow_run_stale`, rather than an unclearable failure.      |
+| Event must still be declared  | Run history outlives a trigger change. `frext` and `bike-fitter-1000` both showed failing `push` runs for a `ci.yml` that now declares only `pull_request`. Each run's event is checked against the workflow file's current `on:` block. |
 | Disabled workflows are kept   | A workflow auto-disabled by GitHub after 60 days of inactivity has stopped running silently. That is the fault worth alerting on, so it is reported rather than filtered out.                          |
+
+## Pull requests that need action
+
+Default-branch health says nothing about whether an open PR is stuck. Two
+states are worth acting on, and both are exported:
+
+| State | Meaning |
+| --- | --- |
+| `github_pull_needs_attention` | Non-draft PR that is failing checks, conflicting with the base branch, or green and awaiting a manual merge. |
+| `github_pull_ready_to_merge` | Checks pass, mergeable, and **no auto-merge armed** — sitting there waiting for someone to press the button. |
+
+The `checks` label carries the head commit's `statusCheckRollup`. Unlike on a
+default-branch commit, that rollup is reliable here: PR-triggered workflows
+attach to the head commit by construction.
+
+`mergeable="unknown"` is deliberately not treated as mergeable. GitHub computes
+mergeability lazily, so a first query often returns `UNKNOWN` for a PR that is
+in fact conflicting — observed on two PRs that both resolved to `CONFLICTING`
+on re-query.
 
 ## Configuration
 
