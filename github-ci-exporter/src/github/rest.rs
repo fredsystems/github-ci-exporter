@@ -23,6 +23,15 @@ use crate::model::{Repo, RunConclusion};
 /// the most recent run of every workflow for these repositories.
 const RUNS_PER_PAGE: usize = 100;
 
+/// Age beyond which a run no longer describes the current code.
+///
+/// Some workflows only fire on `pull_request`, so their newest branch-state
+/// run can be many months old while the workflow itself is healthy. Reporting
+/// that ancient conclusion produces an alert nobody can clear without an
+/// artificial push. Past this age the run is marked stale and stops
+/// contributing a conclusion.
+pub const STALE_RUN_AGE: chrono::TimeDelta = chrono::TimeDelta::days(90);
+
 #[derive(Debug, Deserialize)]
 struct WorkflowsResponse {
     workflows: Vec<WorkflowEntry>,
@@ -35,6 +44,40 @@ struct WorkflowEntry {
     state: String,
 }
 
+/// Whether GitHub will currently run a workflow.
+///
+/// The distinction between the two disabled states is the point: GitHub
+/// automatically disables scheduled workflows in a repository with no activity
+/// for 60 days, which silently stops CI. That is a fault worth alerting on,
+/// whereas a manually disabled workflow is a deliberate choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkflowState {
+    Active,
+    /// Auto-disabled by GitHub after 60 days of repository inactivity.
+    DisabledInactivity,
+    /// Switched off by a human, or disabled because the repo is a fork.
+    DisabledManually,
+}
+
+impl WorkflowState {
+    fn from_api(state: &str) -> Self {
+        match state {
+            "active" => Self::Active,
+            "disabled_inactivity" => Self::DisabledInactivity,
+            _ => Self::DisabledManually,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::DisabledInactivity => "disabled_inactivity",
+            Self::DisabledManually => "disabled_manually",
+        }
+    }
+}
+
 /// A workflow definition that exists in the repository.
 ///
 /// Serialisable because this is what gets stored in the `ETag` cache, rather
@@ -43,9 +86,15 @@ struct WorkflowEntry {
 pub struct Workflow {
     pub name: String,
     pub path: String,
+    pub state: WorkflowState,
 }
 
-/// Lists active workflows defined by files in `.github/workflows`.
+/// Lists workflows defined by files in `.github/workflows`.
+///
+/// Disabled workflows are **included**, with their state, because a workflow
+/// auto-disabled for inactivity still has meaningful run history and its
+/// disablement is itself worth reporting. Filtering them out here caused a
+/// failing `update-flakes` to disappear from the metrics entirely.
 ///
 /// GitHub also reports "dynamic" workflows (Dependabot updates, Copilot
 /// reviewers) that have no file in the repository. Those are excluded: they
@@ -64,9 +113,10 @@ pub async fn list_workflows(client: &Client, repo: &Repo) -> Result<Vec<Workflow
             response
                 .workflows
                 .into_iter()
-                .filter(|w| w.state == "active" && w.path.starts_with(".github/workflows"))
+                .filter(|w| w.path.starts_with(".github/workflows"))
                 .map(|w| Workflow {
                     name: w.name,
+                    state: WorkflowState::from_api(&w.state),
                     path: w.path,
                 })
                 .collect::<Vec<_>>()
@@ -83,7 +133,9 @@ struct RunsResponse {
 
 #[derive(Debug, Deserialize)]
 struct RunEntry {
-    name: Option<String>,
+    // The display name is deliberately not read: it is unreliable (older runs
+    // report the file path instead) and the authoritative name comes from the
+    // live workflow list, keyed by `path`.
     #[serde(default)]
     path: Option<String>,
     status: String,
@@ -103,6 +155,14 @@ pub struct LatestRun {
     pub html_url: String,
 }
 
+impl LatestRun {
+    /// Whether this run is too old to describe the current code.
+    #[must_use]
+    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+        now - self.created_at > STALE_RUN_AGE
+    }
+}
+
 /// Most recent run per workflow, plus the most recent *successful* run.
 ///
 /// This reduced form is what the `ETag` cache stores. The raw runs listing is
@@ -118,47 +178,89 @@ pub struct RepoRuns {
 /// Fetches recent runs on the default branch and reduces them to the latest
 /// run per workflow.
 ///
+/// `live` is the current workflow set from [`list_workflows`]; runs belonging
+/// to workflows absent from it are discarded as orphaned history.
+///
 /// # Errors
 /// Returns [`ClientError`] if the request fails.
-pub async fn fetch_runs(client: &Client, repo: &Repo) -> Result<RepoRuns, ClientError> {
+pub async fn fetch_runs(
+    client: &Client,
+    repo: &Repo,
+    live: &[Workflow],
+) -> Result<RepoRuns, ClientError> {
     let path = format!(
         "/repos/{}/{}/actions/runs?per_page={RUNS_PER_PAGE}&branch={}",
         repo.owner, repo.name, repo.default_branch
     );
     let (runs, outcome) = client
         .get_cached(&path, |response: RunsResponse| {
-            reduce_runs(response.workflow_runs)
+            reduce_runs(response.workflow_runs, live)
         })
         .await?;
     debug!(repo = %repo, ?outcome, workflows = runs.latest.len(), "fetched runs");
     Ok(runs)
 }
 
-/// Reduces a run list to the newest run per workflow.
+/// Whether a run's trigger reflects the state of the default branch.
 ///
-/// Dependabot's security-update runs are excluded: each one has a unique
-/// generated name (`npm_and_yarn in /. for ...`), so keeping them would
-/// produce unbounded metric cardinality.
-fn reduce_runs(runs: Vec<RunEntry>) -> RepoRuns {
+/// Only these events describe "is the branch healthy right now":
+///
+/// * `push` -- code landed on the branch.
+/// * `schedule` / `workflow_dispatch` -- ran against the branch as it stands.
+///
+/// `pull_request` runs are excluded even when the API's `branch=` filter
+/// matches them, because that filter matches the PR's *head* branch. A merged
+/// PR's last pre-merge failure would otherwise be reported as the branch's
+/// current CI state forever, which was observed on both
+/// `fredsystems/pre-commit-checks` and `sdr-enthusiasts/docker-planefence`.
+/// Post-merge health is covered by the `push` run that merging produces.
+///
+/// `dynamic` is Dependabot's generated security-update runs, each with a
+/// unique name; keeping them would make cardinality unbounded.
+fn is_branch_state_event(event: &str) -> bool {
+    matches!(event, "push" | "schedule" | "workflow_dispatch")
+}
+
+/// Reduces a run list to the newest run per workflow, keeping only workflows
+/// that still exist in the repository.
+///
+/// Two classes of stale data must be discarded, both observed in the wild:
+///
+/// * **Orphaned runs.** Run history outlives the workflow file. A deleted
+///   `Update pre-commit hooks` workflow kept reporting its final failure
+///   indefinitely -- 18 of 38 observed failures were this. Runs are therefore
+///   intersected with the live workflow list.
+/// * **Path-named runs.** Runs created before a workflow gained a `name:`
+///   field report the file path where the name should be, so `CI` and
+///   `.github/workflows/ci.yml` appear as two distinct workflows. Keying on
+///   `path` and resolving the display name from the live workflow list
+///   collapses them.
+///
+/// Dependabot's security-update runs are excluded: each has a unique generated
+/// name, which would make cardinality unbounded.
+fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
+    // Workflow identity is the file path, not the display name: a run created
+    // before the workflow gained a `name:` reports the path in the name field,
+    // and a renamed workflow would otherwise split into two series.
+    let live_by_path: HashMap<&str, &Workflow> =
+        live.iter().map(|w| (w.path.as_str(), w)).collect();
+
     let mut latest: HashMap<String, LatestRun> = HashMap::new();
     let mut last_success: HashMap<String, DateTime<Utc>> = HashMap::new();
 
     for run in runs {
-        if run.event == "dynamic" {
+        if !is_branch_state_event(&run.event) {
             continue;
         }
-        // A run whose workflow file was deleted still appears in history;
-        // without a path there is no stable identity to key on.
-        let Some(name) = run.name.filter(|n| !n.is_empty()) else {
+        // Runs of a since-deleted workflow linger in history forever. Only
+        // workflows still present in the repository are reported.
+        let Some(path) = run.path.as_deref() else {
             continue;
         };
-        if run
-            .path
-            .as_ref()
-            .is_some_and(|p| !p.starts_with(".github/workflows"))
-        {
+        let Some(workflow) = live_by_path.get(path) else {
             continue;
-        }
+        };
+        let name = workflow.name.clone();
 
         let conclusion = RunConclusion::from_api(&run.status, run.conclusion.as_deref());
 
@@ -305,6 +407,7 @@ fn parse_crons(yaml: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A run of a workflow whose file is `.github/workflows/<name>.yml`.
     fn run(
         name: &str,
         status: &str,
@@ -312,15 +415,44 @@ mod tests {
         event: &str,
         created: &str,
     ) -> RunEntry {
+        run_at(
+            name,
+            &format!(".github/workflows/{name}.yml"),
+            status,
+            conclusion,
+            event,
+            created,
+        )
+    }
+
+    fn run_at(
+        name: &str,
+        path: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        event: &str,
+        created: &str,
+    ) -> RunEntry {
         RunEntry {
-            name: Some(name.to_owned()),
-            path: Some(".github/workflows/x.yaml".to_owned()),
+            path: Some(path.to_owned()),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             event: event.to_owned(),
             created_at: created.parse().expect("valid timestamp"),
             html_url: format!("https://github.com/o/r/actions/runs/{name}"),
         }
+    }
+
+    /// Declares workflows as currently present in the repository.
+    fn live(names: &[&str]) -> Vec<Workflow> {
+        names
+            .iter()
+            .map(|n| Workflow {
+                name: (*n).to_owned(),
+                path: format!(".github/workflows/{n}.yml"),
+                state: WorkflowState::Active,
+            })
+            .collect()
     }
 
     #[test]
@@ -348,7 +480,7 @@ mod tests {
                 "2026-08-05T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs);
+        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest.len(), 2);
         let ci = reduced
@@ -382,7 +514,7 @@ mod tests {
                 "2026-08-01T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs);
+        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
     }
 
@@ -404,7 +536,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs);
+        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Failure);
         assert_eq!(
@@ -412,6 +544,63 @@ mod tests {
             Some("2026-08-01T00:00:00+00:00".to_owned()),
             "a later failure must not erase the last known success"
         );
+    }
+
+    #[test]
+    fn excludes_pull_request_runs() {
+        // Regression guard: the API's `branch=` filter matches a PR's HEAD
+        // branch, so PR runs leak through. A merged PR's failing pre-merge run
+        // was being reported as the default branch's current CI state.
+        let runs = vec![
+            run(
+                "Lint",
+                "completed",
+                Some("failure"),
+                "pull_request",
+                "2026-08-03T16:51:03Z",
+            ),
+            run(
+                "Lint",
+                "completed",
+                Some("success"),
+                "push",
+                "2026-08-01T00:00:00Z",
+            ),
+        ];
+        let reduced = reduce_runs(runs, &live(&["Lint"]));
+
+        assert_eq!(reduced.latest.len(), 1);
+        assert_eq!(
+            reduced.latest[0].conclusion,
+            RunConclusion::Success,
+            "a newer pull_request run must not override the branch's push state"
+        );
+    }
+
+    #[test]
+    fn keeps_schedule_and_dispatch_runs() {
+        for event in ["push", "schedule", "workflow_dispatch"] {
+            let runs = vec![run(
+                "CI",
+                "completed",
+                Some("failure"),
+                event,
+                "2026-08-09T00:00:00Z",
+            )];
+            let reduced = reduce_runs(runs, &live(&["CI"]));
+            assert_eq!(reduced.latest.len(), 1, "{event} must be kept");
+        }
+        for event in ["pull_request", "dynamic", "pull_request_target"] {
+            let runs = vec![run(
+                "CI",
+                "completed",
+                Some("failure"),
+                event,
+                "2026-08-09T00:00:00Z",
+            )];
+            let reduced = reduce_runs(runs, &live(&["CI"]));
+            assert!(reduced.latest.is_empty(), "{event} must be excluded");
+        }
     }
 
     #[test]
@@ -433,7 +622,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs);
+        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest.len(), 1);
         assert_eq!(reduced.latest[0].workflow, "CI");
@@ -448,9 +637,221 @@ mod tests {
             "push",
             "2026-08-09T00:00:00Z",
         )];
-        let reduced = reduce_runs(runs);
+        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Running);
         assert!(!reduced.latest[0].conclusion.is_failure());
+    }
+
+    #[test]
+    fn discards_runs_of_deleted_workflows() {
+        // Regression guard: GitHub keeps run history after a workflow file is
+        // removed. Observed in the wild as a long-deleted "Update pre-commit
+        // hooks" reporting a permanent failure -- 18 of 38 failures were this.
+        let runs = vec![
+            run(
+                "CI",
+                "completed",
+                Some("success"),
+                "push",
+                "2026-08-09T00:00:00Z",
+            ),
+            run(
+                "Update pre-commit hooks",
+                "completed",
+                Some("failure"),
+                "schedule",
+                "2025-12-14T00:54:24Z",
+            ),
+        ];
+        let reduced = reduce_runs(runs, &live(&["CI"]));
+
+        assert_eq!(reduced.latest.len(), 1);
+        assert_eq!(reduced.latest[0].workflow, "CI");
+        assert!(
+            !reduced.latest.iter().any(|r| r.conclusion.is_failure()),
+            "a deleted workflow must not report a failure"
+        );
+    }
+
+    #[test]
+    fn collapses_path_named_runs_onto_the_workflow_name() {
+        // Runs created before a workflow gained a `name:` report the file path
+        // in the name field. Keying on path prevents "CI" and
+        // ".github/workflows/ci.yml" becoming two series for one workflow.
+        let runs = vec![
+            run_at(
+                ".github/workflows/CI.yml",
+                ".github/workflows/CI.yml",
+                "completed",
+                Some("failure"),
+                "push",
+                "2026-07-08T03:36:04Z",
+            ),
+            run(
+                "CI",
+                "completed",
+                Some("success"),
+                "push",
+                "2026-08-09T00:00:00Z",
+            ),
+        ];
+        let reduced = reduce_runs(runs, &live(&["CI"]));
+
+        assert_eq!(reduced.latest.len(), 1, "one workflow, one series");
+        assert_eq!(reduced.latest[0].workflow, "CI");
+        assert_eq!(
+            reduced.latest[0].conclusion,
+            RunConclusion::Success,
+            "newest run wins after collapsing"
+        );
+    }
+
+    #[test]
+    fn keeps_workflows_regardless_of_yml_or_yaml_extension() {
+        // Both spellings are in active use across the fleet.
+        let workflows = vec![
+            Workflow {
+                name: "Deploy".to_owned(),
+                path: ".github/workflows/deploy.yml".to_owned(),
+                state: WorkflowState::Active,
+            },
+            Workflow {
+                name: "Lint".to_owned(),
+                path: ".github/workflows/lint.yaml".to_owned(),
+                state: WorkflowState::Active,
+            },
+        ];
+        let runs = vec![
+            run_at(
+                "Deploy",
+                ".github/workflows/deploy.yml",
+                "completed",
+                Some("success"),
+                "push",
+                "2026-08-09T00:00:00Z",
+            ),
+            run_at(
+                "Lint",
+                ".github/workflows/lint.yaml",
+                "completed",
+                Some("failure"),
+                "push",
+                "2026-08-09T00:00:00Z",
+            ),
+        ];
+        let reduced = reduce_runs(runs, &workflows);
+
+        assert_eq!(reduced.latest.len(), 2, "both extensions must be kept");
+    }
+
+    #[test]
+    fn disabled_workflows_still_report_their_runs() {
+        // Regression guard: filtering to state=="active" made a failing
+        // `update-flakes` vanish from the metrics after GitHub auto-disabled
+        // it for repository inactivity -- the exact condition worth alerting
+        // on was the one being hidden.
+        let workflows = vec![Workflow {
+            name: "update-flakes".to_owned(),
+            path: ".github/workflows/update-flakes.yaml".to_owned(),
+            state: WorkflowState::DisabledInactivity,
+        }];
+        let runs = vec![run_at(
+            "update-flakes",
+            ".github/workflows/update-flakes.yaml",
+            "completed",
+            Some("failure"),
+            "schedule",
+            "2026-08-01T00:47:26Z",
+        )];
+        let reduced = reduce_runs(runs, &workflows);
+
+        assert_eq!(reduced.latest.len(), 1);
+        assert!(reduced.latest[0].conclusion.is_failure());
+    }
+
+    #[test]
+    fn workflow_state_maps_the_two_disabled_kinds_apart() {
+        assert_eq!(WorkflowState::from_api("active"), WorkflowState::Active);
+        assert_eq!(
+            WorkflowState::from_api("disabled_inactivity"),
+            WorkflowState::DisabledInactivity
+        );
+        assert_eq!(
+            WorkflowState::from_api("disabled_manually"),
+            WorkflowState::DisabledManually
+        );
+        // Unknown future states are treated as a deliberate disable rather
+        // than as an inactivity fault, so they cannot cause a false page.
+        assert_eq!(
+            WorkflowState::from_api("something_new"),
+            WorkflowState::DisabledManually
+        );
+    }
+
+    #[test]
+    fn ancient_runs_are_marked_stale() {
+        // Regression guard: `pre-commit-checks` Lint last ran on a push to
+        // main in Dec 2025 and failed; every run since has been a passing
+        // pull_request. Reporting that failure forever is not actionable.
+        let run = run(
+            "Lint",
+            "completed",
+            Some("failure"),
+            "push",
+            "2025-12-13T13:42:49Z",
+        );
+        let reduced = reduce_runs(vec![run], &live(&["Lint"]));
+        let latest = reduced.latest.first().expect("run retained");
+
+        let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
+        assert!(latest.is_stale(now), "an 8-month-old run must be stale");
+    }
+
+    #[test]
+    fn recent_runs_are_not_stale() {
+        let run = run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-08-01T00:00:00Z",
+        );
+        let reduced = reduce_runs(vec![run], &live(&["CI"]));
+        let latest = reduced.latest.first().expect("run retained");
+
+        let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
+        assert!(!latest.is_stale(now), "a 9-day-old failure is actionable");
+    }
+
+    #[test]
+    fn staleness_boundary_is_exclusive() {
+        let run = run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-05-12T00:00:00Z",
+        );
+        let reduced = reduce_runs(vec![run], &live(&["CI"]));
+        let latest = reduced.latest.first().expect("run retained");
+
+        // Exactly 90 days is not yet stale; a second past it is.
+        let at_horizon = latest.created_at + STALE_RUN_AGE;
+        assert!(!latest.is_stale(at_horizon));
+        assert!(latest.is_stale(at_horizon + chrono::TimeDelta::seconds(1)));
+    }
+
+    #[test]
+    fn run_without_a_path_is_discarded() {
+        let mut orphan = run(
+            "CI",
+            "completed",
+            Some("failure"),
+            "push",
+            "2026-08-09T00:00:00Z",
+        );
+        orphan.path = None;
+        assert!(reduce_runs(vec![orphan], &live(&["CI"])).latest.is_empty());
     }
 
     #[test]

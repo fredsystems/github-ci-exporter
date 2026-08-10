@@ -89,6 +89,8 @@ flag alone.
 | `github_repo_pulls_draft`                          | gauge   | `org`, `repo`, `author_kind`                        |
 | `github_pull_created_timestamp_seconds`            | gauge   | `org`, `repo`, `number`, `author`, `author_kind`, `draft` |
 | `github_workflow_run_status`                       | gauge   | `org`, `repo`, `workflow`, `event`, `conclusion`    |
+| `github_workflow_run_stale`                        | gauge   | `org`, `repo`, `workflow`                           |
+| `github_workflow_enabled`                          | gauge   | `org`, `repo`, `workflow`, `state`                  |
 | `github_workflow_run_timestamp_seconds`            | gauge   | `org`, `repo`, `workflow`                           |
 | `github_workflow_last_success_timestamp_seconds`   | gauge   | `org`, `repo`, `workflow`                           |
 | `github_workflow_expected_interval_seconds`        | gauge   | `org`, `repo`, `workflow`                           |
@@ -113,6 +115,19 @@ activity for visibility while alert rules select only `author_kind="human"`.
 `github_workflow_run_status` is `1` for the current conclusion of each
 workflow. An in-flight run reports `conclusion="running"` and does not clear a
 previous failure.
+
+## What counts as the current CI state
+
+Getting this right matters more than it sounds. Naively taking the newest run
+per workflow produced 38 "failures", of which fewer than half were real:
+
+| Filter                        | Why                                                                                                                                                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Workflow must still exist     | GitHub keeps run history after a workflow file is deleted. A removed `Update pre-commit hooks` reported a permanent failure across 10 repositories.                                                    |
+| Identity is the file path     | Runs predating a workflow's `name:` report the path instead, splitting one workflow into two series.                                                                                                   |
+| Branch-state events only      | The API's `branch=` filter matches a pull request's *head* branch, so PR runs leak in. A merged PR's last pre-merge failure would otherwise be the branch's CI state forever.                          |
+| Runs age out after 90 days    | Some workflows only fire on `pull_request`, leaving a branch-state run many months old. Those report `conclusion="stale"` and set `github_workflow_run_stale`, rather than an unclearable failure.      |
+| Disabled workflows are kept   | A workflow auto-disabled by GitHub after 60 days of inactivity has stopped running silently. That is the fault worth alerting on, so it is reported rather than filtered out.                          |
 
 ## Configuration
 
