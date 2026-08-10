@@ -289,7 +289,7 @@ async fn resolve_monitored(
 
     for repo in candidates {
         let key = repo.full_name();
-        let workflows = match rest::list_workflows(client, &repo).await {
+        let mut workflows = match rest::list_workflows(client, &repo).await {
             Ok(workflows) => workflows,
             Err(error) => {
                 // A listing failure is not evidence of absent CI, so the
@@ -305,12 +305,11 @@ async fn resolve_monitored(
             skipped.push((repo, SkipReason::NoWorkflows));
             continue;
         }
-        cache.workflows.insert(key.clone(), workflows.clone());
-
-        // Cron schedules change rarely, so they are resolved once per set.
-        if let std::collections::hash_map::Entry::Vacant(entry) = cache.intervals.entry(key) {
-            entry.insert(resolve_cron_intervals(client, &repo, &workflows).await);
-        }
+        // Trigger lists must be resolved before the workflow set is cached,
+        // because the run reducer reads them from the cache.
+        let intervals = resolve_definitions(client, &repo, &mut workflows).await;
+        cache.workflows.insert(key.clone(), workflows);
+        cache.intervals.insert(key, intervals);
 
         monitored.push(repo);
     }
@@ -337,22 +336,31 @@ fn record_workflow_states(metrics: &Metrics, repo: &Repo, workflows: &[rest::Wor
     }
 }
 
-/// Resolves each workflow's expected run interval from its cron schedule.
-async fn resolve_cron_intervals(
+/// Reads each workflow file to recover its cron schedule and its trigger list.
+///
+/// Both come from the same fetch, which is `ETag`-revalidated and therefore
+/// nearly free after the first sweep. `workflows` is updated in place with the
+/// triggers, because the run reducer needs them to discard runs from a
+/// superseded trigger configuration.
+async fn resolve_definitions(
     client: &Client,
     repo: &Repo,
-    workflows: &[rest::Workflow],
+    workflows: &mut [rest::Workflow],
 ) -> HashMap<String, i64> {
     let mut intervals = HashMap::new();
-    for workflow in workflows {
-        match rest::fetch_workflow_crons(client, repo, &workflow.path).await {
-            Ok(crons) => {
-                if let Some(interval) = shortest_cron_interval(&crons) {
+    for workflow in workflows.iter_mut() {
+        match rest::fetch_workflow_definition(client, repo, &workflow.path).await {
+            Ok(definition) => {
+                if let Some(interval) = shortest_cron_interval(&definition.crons) {
                     intervals.insert(workflow.name.clone(), interval);
                 }
+                workflow.triggers = definition.triggers;
             }
             Err(error) => {
-                debug!(repo = %repo, path = workflow.path, %error, "cron lookup failed");
+                // Leaving `triggers` empty means "accept any event", so a
+                // failed lookup degrades to the previous behaviour rather than
+                // hiding the repository's CI.
+                debug!(repo = %repo, path = workflow.path, %error, "workflow definition lookup failed");
             }
         }
     }
@@ -401,17 +409,29 @@ fn record_activity(
         }
 
         for pull in &entry.open_pulls {
+            let labels = PullLabels {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+                number: pull.number.to_string(),
+                author: pull.author.clone(),
+                author_kind: author_label(pull.author_kind),
+                draft: pull.is_draft.to_string(),
+                checks: pull.checks.as_str().to_owned(),
+                mergeable: pull.mergeable.as_str().to_owned(),
+                auto_merge: pull.auto_merge.to_string(),
+            };
             metrics
                 .pull_created_timestamp
-                .get_or_create(&PullLabels {
-                    org: repo.owner.clone(),
-                    repo: repo.name.clone(),
-                    number: pull.number.to_string(),
-                    author: pull.author.clone(),
-                    author_kind: author_label(pull.author_kind),
-                    draft: pull.is_draft.to_string(),
-                })
+                .get_or_create(&labels)
                 .set(pull.created_at.timestamp());
+            metrics
+                .pull_needs_attention
+                .get_or_create(&labels)
+                .set(i64::from(pull.needs_attention()));
+            metrics
+                .pull_ready_to_merge
+                .get_or_create(&labels)
+                .set(i64::from(pull.is_ready_to_merge()));
         }
     }
 }
