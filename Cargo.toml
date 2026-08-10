@@ -1,0 +1,101 @@
+[workspace]
+resolver = "3"
+members = ["github-ci-exporter", "xtask"]
+default-members = ["github-ci-exporter"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Prometheus exporter for GitHub issues, pull requests, and Actions CI state"
+documentation = "https://github.com/fredsystems/github-ci-exporter/README.md"
+readme = "README.md"
+homepage = "https://github.com/fredsystems/github-ci-exporter"
+repository = "https://github.com/fredsystems/github-ci-exporter"
+license = "MIT"
+keywords = ["prometheus", "exporter", "github", "monitoring", "metrics"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = { version = "0.8.7", default-features = false, features = [
+  "http1",
+  "tokio",
+] }
+chrono = { version = "0.4.42", default-features = false, features = [
+  "clock",
+  "serde",
+  "std",
+] }
+clap = { version = "4.5.51", features = ["derive", "env"] }
+cron = "0.15.0"
+figment = { version = "0.10.19", features = ["env", "toml"] }
+humantime = "2.3.0"
+humantime-serde = "1.1.1"
+prometheus-client = "0.24.0"
+reqwest = { version = "0.12.24", default-features = false, features = [
+  "gzip",
+  "json",
+  "rustls-tls",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+
+# dev-dependencies
+tempfile = "3.24.0"
+tower = { version = "0.5.3", features = ["util"] }
+wiremock = "0.6.5"
+
+# xtask
+color-eyre = "0.6.5"
+duct = "1.1.0"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# A long-running service must never take the process down on bad input.
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
+
+# Numeric-cast tripwires. Named explicitly so they survive a pedantic reorg;
+# any local `as` cast needs a justified #[allow(...)].
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+
+# Metadata is inherited from the workspace; transitive dep duplication is not
+# something this crate can fix.
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

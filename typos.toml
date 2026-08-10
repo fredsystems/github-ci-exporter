@@ -1,0 +1,9 @@
+[files]
+extend-exclude = [
+  ".git/",
+  "Cargo.lock",
+]
+ignore-hidden = false
+
+[default]
+locale = "en"

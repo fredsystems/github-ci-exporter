@@ -1,0 +1,46 @@
+[package]
+name = "github-ci-exporter"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# Referenced only through `#[serde(with = "humantime_serde")]`, which is a
+# string literal that cargo-machete cannot see.
+ignored = ["humantime-serde"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+cron.workspace = true
+figment.workspace = true
+humantime.workspace = true
+humantime-serde.workspace = true
+prometheus-client.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
+wiremock.workspace = true

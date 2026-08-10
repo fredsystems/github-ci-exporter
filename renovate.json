@@ -1,0 +1,90 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "config:best-practices",
+    "default:pinDigestsDisabled"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["* 0 1 * *"]
+  },
+  "timezone": "Etc/UTC",
+  "schedule": ["* 0 1 * *"],
+  "enabledManagers": ["nix", "github-actions", "cargo"],
+  "prConcurrentLimit": 0,
+  "prHourlyLimit": 0,
+  "prCreation": "immediate",
+  "automerge": false,
+  "platformAutomerge": true,
+  "nix": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions", "nix"],
+      "matchUpdateTypes": ["major", "minor", "patch", "pin"],
+      "automerge": true
+    },
+    {
+      "groupName": "tokio stack",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["tokio", "tokio-util", "tokio-stream"]
+    },
+    {
+      "groupName": "http stack",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "axum",
+        "hyper",
+        "hyper-util",
+        "reqwest",
+        "tower",
+        "tower-http"
+      ]
+    },
+    {
+      "groupName": "tracing",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "tracing",
+        "tracing-log",
+        "tracing-subscriber",
+        "tracing-core"
+      ]
+    },
+    {
+      "groupName": "serde",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "serde",
+        "serde_derive",
+        "serde_json",
+        "serde_with",
+        "serde_yaml_ng"
+      ]
+    },
+    {
+      "groupName": "clap",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["clap", "clap-cargo", "clap-verbosity-flag"]
+    },
+    {
+      "groupName": "error handling",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["anyhow", "thiserror", "color-eyre"]
+    },
+    {
+      "groupName": "rust test tooling",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "insta",
+        "tempfile",
+        "wiremock",
+        "assert_cmd",
+        "predicates"
+      ]
+    }
+  ]
+}
