@@ -416,17 +416,23 @@ impl Publisher {
         }
     }
 
-    /// Handles for the currently-served set, for in-place annotation.
+    /// Annotates the currently-served set in place, under the lock.
     ///
     /// Used only by the paths that must *not* replace the data: a failed cycle
     /// and a budget-bypassed cycle both report their own state while leaving
     /// the previous cycle's samples intact.
-    #[must_use]
-    pub fn current(&self) -> Option<Arc<Metrics>> {
-        self.0.lock().ok().map(|published| {
-            let metrics = &published.metrics;
-            Arc::clone(metrics)
-        })
+    ///
+    /// `update` runs while the mutex is held, so a multi-field annotation is
+    /// as indivisible as a swap. Handing the handles back to the caller and
+    /// releasing the lock first would reintroduce this module's original bug in
+    /// miniature: the bypass path sets several metrics in sequence, and a
+    /// scrape landing between them would see `budget_exhausted` still 0 with
+    /// the rest applied -- enough to reset the `for:` timer on the very alert
+    /// that is supposed to report the skip.
+    pub fn annotate(&self, update: impl FnOnce(&Metrics)) {
+        if let Ok(published) = self.0.lock() {
+            update(&published.metrics);
+        }
     }
 
     /// Renders the served registry in the Prometheus text exposition format.
@@ -588,17 +594,34 @@ mod tests {
         // How a failed cycle reports itself: last-known-good data stays, and
         // only scrape_success changes.
         let publisher = publisher_monitoring("kept");
-        publisher
-            .current()
-            .expect("a set is published")
-            .scrape_success
-            .set(0);
+        publisher.annotate(|published| {
+            published.scrape_success.set(0);
+        });
 
         let rendered = publisher.render();
         assert!(rendered.contains("github_exporter_scrape_success 0"));
         assert!(
             rendered.contains(r#"repo="kept""#),
             "a failed cycle must not discard the previous data:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn annotation_holds_the_lock_for_its_whole_closure() {
+        // A multi-field annotation must be as indivisible as a swap. Returning
+        // the handles and releasing the lock first let a scrape land between
+        // two updates, which is this module's original bug in miniature.
+        //
+        // Asserted by observing the lock directly rather than by racing a
+        // thread, so there is nothing timing-dependent to go flaky.
+        let publisher = publisher_monitoring("kept");
+        let mut held = false;
+        publisher.annotate(|_| {
+            held = publisher.0.try_lock().is_err();
+        });
+        assert!(
+            held,
+            "the publisher mutex must be held for the duration of the closure"
         );
     }
 

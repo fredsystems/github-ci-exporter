@@ -147,12 +147,13 @@ pub async fn collect(
         client.record_skipped(estimated_core);
         // Annotates the published set rather than replacing it: the point of
         // skipping is to keep the previous cycle's data, so the fresh registry
-        // built above is discarded unused.
-        if let Some(published) = publisher.current() {
-            record_budget_metrics(client, &published);
+        // built above is discarded unused. One `annotate` call, so the three
+        // updates land together.
+        publisher.annotate(|published| {
+            record_budget_metrics(client, published);
             published.cycles_bypassed.inc();
             published.budget_exhausted.set(1);
-        }
+        });
         return Ok(CycleOutcome::BypassedLowBudget);
     }
     metrics.budget_exhausted.set(0);
@@ -705,10 +706,18 @@ pub fn shortest_cron_interval(crons: &[String]) -> Option<i64> {
 /// not resolve a genuine CI-failure alert; `scrape_success` going to 0 is what
 /// signals the staleness. Annotates the published set in place, because
 /// publishing anything new is exactly what must not happen here.
+///
+/// `budget_exhausted` is cleared as well. This path is reached only for errors
+/// that are *not* budget exhaustion -- a bypassed cycle returns
+/// [`CycleOutcome::BypassedLowBudget`] rather than an error -- so reaching here
+/// proves the pre-flight check passed and the budget was affordable. Left set
+/// from an earlier bypass it would survive indefinitely, reporting a budget
+/// skip for every subsequent unrelated failure.
 pub fn record_failure(publisher: &Publisher) {
-    if let Some(published) = publisher.current() {
+    publisher.annotate(|published| {
         published.scrape_success.set(0);
-    }
+        published.budget_exhausted.set(0);
+    });
 }
 
 #[cfg(test)]
@@ -1069,5 +1078,25 @@ mod tests {
             rendered.contains(r#"repo="r""#),
             "last-known-good data must survive a failed cycle"
         );
+    }
+
+    #[test]
+    fn a_failure_clears_a_stale_budget_bypass_flag() {
+        // Only non-budget errors reach record_failure -- a bypassed cycle
+        // returns BypassedLowBudget rather than erroring -- so the budget was
+        // affordable. Left set from an earlier bypass, the flag would survive
+        // indefinitely and report a budget skip for every later failure.
+        let (metrics, registry) = Metrics::new();
+        metrics.budget_exhausted.set(1);
+        let publisher = Publisher::new(metrics, registry);
+
+        record_failure(&publisher);
+
+        let rendered = publisher.render();
+        assert!(
+            rendered.contains("github_exporter_budget_exhausted 0"),
+            "a non-budget failure must not claim the budget was exhausted:\n{rendered}"
+        );
+        assert!(rendered.contains("github_exporter_scrape_success 0"));
     }
 }
