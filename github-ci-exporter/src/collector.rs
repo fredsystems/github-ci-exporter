@@ -9,7 +9,7 @@ use crate::{
     config::Config,
     github::{Client, client::RateLimitResource, graphql, rest},
     metrics::{
-        AuthorLabels, Metrics, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
+        AuthorLabels, Metrics, Publisher, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
         WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
     },
     model::{PullRef, Repo, SkipReason},
@@ -96,7 +96,13 @@ pub enum CycleOutcome {
     BypassedLowBudget,
 }
 
-/// Runs a single collection cycle, updating `metrics` in place.
+/// Runs a single collection cycle and publishes its results atomically.
+///
+/// The cycle builds an entirely fresh [`Metrics`] and only hands it to
+/// `publisher` once every stage has run. Nothing it does is observable through
+/// `/metrics` until that point, which is what keeps a scrape from catching a
+/// half-rebuilt registry — see the [`crate::metrics`] module documentation for
+/// what that cost when the live families were cleared and refilled instead.
 ///
 /// A failure for one repository is logged and skipped rather than aborting the
 /// cycle: one broken repository must not blind the operator to the other
@@ -108,11 +114,17 @@ pub enum CycleOutcome {
 pub async fn collect(
     client: &Client,
     config: &Config,
-    metrics: &Metrics,
+    publisher: &Publisher,
     cache: &mut WorkflowCache,
 ) -> anyhow::Result<CycleOutcome> {
     let started = std::time::Instant::now();
     let now = Utc::now();
+
+    // Built off to the side and published at the end. A fresh registry starts
+    // empty, so repositories, pull requests, and workflows that no longer
+    // exist are absent by construction rather than by an explicit clear.
+    let (cycle_metrics, registry) = Metrics::new();
+    let metrics = &cycle_metrics;
 
     // Pre-flight budget check. A cycle that runs out of quota halfway leaves
     // a partially-rebuilt registry: some repositories updated, others cleared
@@ -133,9 +145,14 @@ pub async fn collect(
             "skipping collection cycle: insufficient API budget"
         );
         client.record_skipped(estimated_core);
-        record_budget_metrics(client, metrics);
-        metrics.cycles_bypassed.inc();
-        metrics.budget_exhausted.set(1);
+        // Annotates the published set rather than replacing it: the point of
+        // skipping is to keep the previous cycle's data, so the fresh registry
+        // built above is discarded unused.
+        if let Some(published) = publisher.current() {
+            record_budget_metrics(client, &published);
+            published.cycles_bypassed.inc();
+            published.budget_exhausted.set(1);
+        }
         return Ok(CycleOutcome::BypassedLowBudget);
     }
     metrics.budget_exhausted.set(0);
@@ -172,9 +189,6 @@ pub async fn collect(
         skipped = skipped.len(),
         "resolved repository set"
     );
-
-    // Rebuild all per-repository series from scratch.
-    metrics.clear_repo_series();
 
     record_repo_inventory(metrics, &monitored, &skipped);
 
@@ -217,6 +231,9 @@ pub async fn collect(
     metrics.scrape_duration.set(started.elapsed().as_secs_f64());
     metrics.scrape_success.set(1);
     metrics.last_success_timestamp.set(now.timestamp());
+
+    // The single point at which any of this becomes visible to a scrape.
+    publisher.publish(cycle_metrics, registry);
 
     if let Err(error) = client.persist_cache() {
         warn!(%error, "failed to persist etag cache");
@@ -663,9 +680,12 @@ pub fn shortest_cron_interval(crons: &[String]) -> Option<i64> {
 ///
 /// Retaining the last-known-good samples means a transient GitHub outage does
 /// not resolve a genuine CI-failure alert; `scrape_success` going to 0 is what
-/// signals the staleness.
-pub fn record_failure(metrics: &Metrics) {
-    metrics.scrape_success.set(0);
+/// signals the staleness. Annotates the published set in place, because
+/// publishing anything new is exactly what must not happen here.
+pub fn record_failure(publisher: &Publisher) {
+    if let Some(published) = publisher.current() {
+        published.scrape_success.set(0);
+    }
 }
 
 #[cfg(test)]
@@ -905,7 +925,7 @@ mod tests {
             &ignored,
         );
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
         assert!(
             !rendered.contains("github_pull_needs_attention"),
             "an ignored PR must not be able to fire an alert:\n{rendered}"
@@ -931,7 +951,7 @@ mod tests {
             &ignored,
         );
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
         assert!(
             rendered.contains(r#"github_repo_pulls_open{org="sdr-enthusiasts",repo="docker-vesselalert",author_kind="human"} 1"#),
             "the aggregate count must be unchanged:\n{rendered}"
@@ -957,7 +977,7 @@ mod tests {
             &ignored,
         );
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
         assert!(
             rendered.contains(r#"number="33""#),
             "ignoring #32 must not suppress #33:\n{rendered}"
@@ -980,7 +1000,7 @@ mod tests {
             &ignored,
         );
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
         assert!(
             rendered.contains(r#"number="32""#),
             "the ignore list must be scoped per repository:\n{rendered}"
@@ -999,7 +1019,7 @@ mod tests {
             &HashSet::new(),
         );
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
         assert!(rendered.contains(
             r#"github_repo_pulls_ignored{org="sdr-enthusiasts",repo="docker-vesselalert"} 0"#
         ));
@@ -1016,10 +1036,11 @@ mod tests {
             })
             .set(1);
         metrics.scrape_success.set(1);
+        let publisher = Publisher::new(metrics, registry);
 
-        record_failure(&metrics);
+        record_failure(&publisher);
 
-        let rendered = crate::metrics::SharedRegistry::new(registry).render();
+        let rendered = publisher.render();
         assert!(rendered.contains("github_exporter_scrape_success 0"));
         assert!(
             rendered.contains(r#"repo="r""#),

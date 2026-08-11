@@ -3,24 +3,24 @@
 use axum::{Router, extract::State, http::header, response::IntoResponse, routing::get};
 use tracing::info;
 
-use crate::metrics::SharedRegistry;
+use crate::metrics::Publisher;
 
 /// Builds the exporter's HTTP router.
-pub fn router(registry: SharedRegistry) -> Router {
+pub fn router(publisher: Publisher) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/", get(index_handler))
-        .with_state(registry)
+        .with_state(publisher)
 }
 
-async fn metrics_handler(State(registry): State<SharedRegistry>) -> impl IntoResponse {
+async fn metrics_handler(State(publisher): State<Publisher>) -> impl IntoResponse {
     (
         [(
             header::CONTENT_TYPE,
             "application/openmetrics-text; version=1.0.0; charset=utf-8",
         )],
-        registry.render(),
+        publisher.render(),
     )
 }
 
@@ -45,12 +45,12 @@ async fn index_handler() -> impl IntoResponse {
 /// Returns an error if the listener cannot bind or the server fails.
 pub async fn serve(
     listen: std::net::SocketAddr,
-    registry: SharedRegistry,
+    publisher: Publisher,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(%listen, "serving metrics");
-    axum::serve(listener, router(registry))
+    axum::serve(listener, router(publisher))
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
@@ -77,7 +77,7 @@ mod tests {
     async fn metrics_endpoint_serves_openmetrics() {
         let (metrics, registry) = Metrics::new();
         metrics.scrape_success.set(1);
-        let app = router(SharedRegistry::new(registry));
+        let app = router(Publisher::new(metrics, registry));
 
         let response = app
             .oneshot(
@@ -109,8 +109,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_responds() {
-        let (_, registry) = Metrics::new();
-        let app = router(SharedRegistry::new(registry));
+        let (metrics, registry) = Metrics::new();
+        let app = router(Publisher::new(metrics, registry));
 
         let response = app
             .oneshot(

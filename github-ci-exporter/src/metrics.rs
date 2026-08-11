@@ -1,10 +1,29 @@
 //! Prometheus metric definitions and rendering.
 //!
-//! The registry is rebuilt from scratch on every successful poll rather than
-//! mutated in place. A repository that disappears, or a workflow that is
-//! deleted, must stop producing samples immediately; incrementally updating a
-//! long-lived registry would leave those series exposed forever and keep a
-//! resolved alert firing.
+//! A repository that disappears, or a workflow that is deleted, must stop
+//! producing samples immediately; incrementally updating a long-lived registry
+//! would leave those series exposed forever and keep a resolved alert firing.
+//!
+//! So each cycle builds a **new** [`Metrics`] and [`Registry`] and hands them
+//! to [`Publisher::publish`], which swaps them in under one lock. A scrape
+//! therefore sees either the previous cycle in full or the new one in full,
+//! never a mixture.
+//!
+//! That atomicity is the whole point, and it is not a refinement. Clearing the
+//! live families and refilling them in place — which is what this did
+//! originally — publishes a partially-rebuilt registry for as long as the
+//! cycle takes to run. Measured against `sdr-enthusiasts`, that was an 81
+//! second window in which `workflow_run_status` climbed from 0 to 93 series
+//! while `/metrics` served every intermediate state. With a 15s scrape
+//! interval, roughly six scrapes per cycle landed in the gap, and any absent
+//! sample resets an alert's `for:` timer. A `for: 15m` rule covering a
+//! repository late in the rebuild order could never fire at all: the gap
+//! recurred every cycle, well inside the 15 minutes it needed to accumulate.
+//! A genuinely failing workflow went unalerted for its entire lifetime.
+//!
+//! The per-repository families are consequently never cleared. A fresh
+//! registry starts empty, which makes "stop reporting what no longer exists"
+//! and "never expose a half-built scrape" the same mechanism.
 
 use std::sync::{Arc, Mutex};
 
@@ -344,52 +363,79 @@ impl Metrics {
         )
     }
 
-    /// Clears every per-repository family.
+    /// Counters that must survive a registry swap.
     ///
-    /// Called at the start of each cycle so deleted repositories, closed pull
-    /// requests, and removed workflows stop being reported.
-    pub fn clear_repo_series(&self) {
-        self.issues_open.clear();
-        self.pulls_open.clear();
-        self.pulls_draft.clear();
-        self.pulls_ignored.clear();
-        self.pull_created_timestamp.clear();
-        self.pull_needs_attention.clear();
-        self.pull_ready_to_merge.clear();
-        self.workflow_run_status.clear();
-        self.workflow_run_timestamp.clear();
-        self.workflow_last_success_timestamp.clear();
-        self.workflow_expected_interval.clear();
-        self.workflow_enabled.clear();
-        self.workflow_run_stale.clear();
-        self.repo_monitored.clear();
-        self.repos_skipped.clear();
+    /// Everything else is either recomputed from the client each cycle or
+    /// describes only the cycle that just ran. A monotonic counter is neither:
+    /// restarting it at zero on every swap would read as a process restart and
+    /// destroy `increase()` over any window spanning one.
+    fn carry_forward_from(&self, previous: &Self) {
+        self.cycles_bypassed.inc_by(previous.cycles_bypassed.get());
     }
 }
 
-/// Shared registry guarded for the HTTP handler.
+/// The metric set currently being served.
+///
+/// Holds the [`Metrics`] handles alongside their [`Registry`] so a cycle can
+/// replace both together. Keeping the handles is what allows the failure and
+/// budget-bypass paths to annotate the *published* set in place instead of
+/// swapping in a fresh one, which is how last-known-good data survives a cycle
+/// that produced none.
 #[derive(Clone)]
-pub struct SharedRegistry(Arc<Mutex<Registry>>);
+pub struct Publisher(Arc<Mutex<Published>>);
 
-impl std::fmt::Debug for SharedRegistry {
+struct Published {
+    metrics: Arc<Metrics>,
+    registry: Registry,
+}
+
+impl std::fmt::Debug for Publisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SharedRegistry")
+        f.write_str("Publisher")
     }
 }
 
-impl SharedRegistry {
+impl Publisher {
     #[must_use]
-    pub fn new(registry: Registry) -> Self {
-        Self(Arc::new(Mutex::new(registry)))
+    pub fn new(metrics: Metrics, registry: Registry) -> Self {
+        Self(Arc::new(Mutex::new(Published {
+            metrics: Arc::new(metrics),
+            registry,
+        })))
     }
 
-    /// Renders the registry in the Prometheus text exposition format.
+    /// Replaces the served metric set with `metrics`/`registry`.
+    ///
+    /// Monotonic counters are carried across so the swap is invisible to
+    /// `rate()` and `increase()`.
+    pub fn publish(&self, metrics: Metrics, registry: Registry) {
+        if let Ok(mut published) = self.0.lock() {
+            metrics.carry_forward_from(&published.metrics);
+            published.metrics = Arc::new(metrics);
+            published.registry = registry;
+        }
+    }
+
+    /// Handles for the currently-served set, for in-place annotation.
+    ///
+    /// Used only by the paths that must *not* replace the data: a failed cycle
+    /// and a budget-bypassed cycle both report their own state while leaving
+    /// the previous cycle's samples intact.
+    #[must_use]
+    pub fn current(&self) -> Option<Arc<Metrics>> {
+        self.0.lock().ok().map(|published| {
+            let metrics = &published.metrics;
+            Arc::clone(metrics)
+        })
+    }
+
+    /// Renders the served registry in the Prometheus text exposition format.
     #[must_use]
     pub fn render(&self) -> String {
         let mut buffer = String::new();
-        if let Ok(registry) = self.0.lock() {
+        if let Ok(published) = self.0.lock() {
             // Writing into a String is infallible for these metric types.
-            let _: Result<(), std::fmt::Error> = encode(&mut buffer, &registry);
+            let _: Result<(), std::fmt::Error> = encode(&mut buffer, &published.registry);
         }
         buffer
     }
@@ -423,8 +469,8 @@ mod tests {
             })
             .set(4);
 
-        let shared = SharedRegistry::new(registry);
-        let rendered = shared.render();
+        let published = Publisher::new(metrics, registry);
+        let rendered = published.render();
 
         assert!(
             rendered.contains("github_repo_issues_open"),
@@ -434,37 +480,126 @@ mod tests {
         assert!(rendered.contains(r#"repo="nixos""#));
     }
 
-    #[test]
-    fn clearing_removes_stale_repo_series() {
+    /// A publisher serving one monitored repository named `name`.
+    fn publisher_monitoring(name: &str) -> Publisher {
         let (metrics, registry) = Metrics::new();
         metrics
             .repo_monitored
             .get_or_create(&RepoLabels {
                 org: "o".into(),
-                repo: "gone".into(),
+                repo: name.into(),
             })
             .set(1);
+        Publisher::new(metrics, registry)
+    }
 
-        let shared = SharedRegistry::new(registry);
-        assert!(shared.render().contains(r#"repo="gone""#));
+    #[test]
+    fn publishing_replaces_stale_repo_series() {
+        // A repository that disappears upstream must stop producing samples.
+        // A fresh registry starts empty, so this falls out of the swap rather
+        // than needing an explicit clear.
+        let publisher = publisher_monitoring("gone");
+        assert!(publisher.render().contains(r#"repo="gone""#));
 
-        metrics.clear_repo_series();
+        let (next, next_registry) = Metrics::new();
+        next.repo_monitored
+            .get_or_create(&RepoLabels {
+                org: "o".into(),
+                repo: "still-here".into(),
+            })
+            .set(1);
+        publisher.publish(next, next_registry);
+
+        let rendered = publisher.render();
         assert!(
-            !shared.render().contains(r#"repo="gone""#),
-            "a deleted repository must stop producing samples"
+            !rendered.contains(r#"repo="gone""#),
+            "a deleted repository must stop producing samples:\n{rendered}"
+        );
+        assert!(rendered.contains(r#"repo="still-here""#));
+    }
+
+    #[test]
+    fn a_cycle_in_progress_is_never_observable() {
+        // THE regression guard for this module's reason to exist.
+        //
+        // The original design cleared the live families and refilled them as
+        // the cycle walked its repositories, so `/metrics` served every
+        // intermediate state for as long as a cycle took -- measured at 81
+        // seconds. Prometheus scraped the gaps, absent samples reset alert
+        // `for:` timers, and a `for: 15m` rule could never fire.
+        //
+        // Building into a detached set must leave the served output byte-identical
+        // until the swap.
+        let publisher = publisher_monitoring("previous");
+        let before = publisher.render();
+
+        // A cycle starts and populates its own set, one repository at a time.
+        let (in_flight, in_flight_registry) = Metrics::new();
+        for repo in ["first", "second", "third"] {
+            in_flight
+                .repo_monitored
+                .get_or_create(&RepoLabels {
+                    org: "o".into(),
+                    repo: repo.into(),
+                })
+                .set(1);
+            assert_eq!(
+                publisher.render(),
+                before,
+                "a partially-built cycle must not reach a scrape"
+            );
+        }
+
+        publisher.publish(in_flight, in_flight_registry);
+
+        let after = publisher.render();
+        assert!(!after.contains(r#"repo="previous""#));
+        for repo in ["first", "second", "third"] {
+            assert!(
+                after.contains(&format!(r#"repo="{repo}""#)),
+                "the whole cycle must appear at once:\n{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn monotonic_counters_survive_a_swap() {
+        // Restarting a counter at zero on every swap reads as a process
+        // restart and destroys increase() over any window spanning one.
+        let (metrics, registry) = Metrics::new();
+        metrics.cycles_bypassed.inc();
+        metrics.cycles_bypassed.inc();
+        let publisher = Publisher::new(metrics, registry);
+
+        let (next, next_registry) = Metrics::new();
+        publisher.publish(next, next_registry);
+
+        assert!(
+            publisher
+                .render()
+                .contains("github_exporter_cycles_bypassed_total 2"),
+            "counter must carry forward:\n{}",
+            publisher.render()
         );
     }
 
     #[test]
-    fn self_monitoring_metrics_survive_repo_clear() {
-        // Clearing repo series must not wipe exporter health, or a failing
-        // scrape would look like a healthy empty one.
-        let (metrics, registry) = Metrics::new();
-        metrics.scrape_success.set(1);
-        metrics.clear_repo_series();
+    fn the_published_set_can_be_annotated_in_place() {
+        // How a failed cycle reports itself: last-known-good data stays, and
+        // only scrape_success changes.
+        let publisher = publisher_monitoring("kept");
+        publisher
+            .current()
+            .expect("a set is published")
+            .scrape_success
+            .set(0);
 
-        let shared = SharedRegistry::new(registry);
-        assert!(shared.render().contains("github_exporter_scrape_success 1"));
+        let rendered = publisher.render();
+        assert!(rendered.contains("github_exporter_scrape_success 0"));
+        assert!(
+            rendered.contains(r#"repo="kept""#),
+            "a failed cycle must not discard the previous data:\n{rendered}"
+        );
     }
 
     #[test]
@@ -481,7 +616,7 @@ mod tests {
             })
             .set(1);
 
-        let rendered = SharedRegistry::new(registry).render();
+        let rendered = Publisher::new(metrics, registry).render();
         assert!(rendered.contains(r#"conclusion="failure""#));
         assert!(rendered.contains(r#"workflow="Deploy""#));
     }
