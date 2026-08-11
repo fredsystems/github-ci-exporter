@@ -1,7 +1,7 @@
 # github-ci-exporter
 
 > Prometheus exporter for GitHub issues, pull requests, and Actions CI state
-> across whole organisations.
+> across whole organisations and personal accounts.
 
 [![CI](https://github.com/fredsystems/github-ci-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/fredsystems/github-ci-exporter/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -10,8 +10,8 @@
 
 ## What it does
 
-Point it at one or more GitHub organisations. It discovers the repositories,
-filters out the ones with nothing to say, and exports:
+Point it at one or more GitHub repository owners. It discovers the
+repositories, filters out the ones with nothing to say, and exports:
 
 - open issues and pull requests, split by **human vs bot** author
 - the latest Actions run per workflow on each default branch
@@ -80,6 +80,41 @@ Two mechanisms close it, and the redundancy is deliberate:
 
 Bump `CACHE_FORMAT_VERSION` in `github-ci-exporter/src/github/client.rs`
 whenever a cached projection's serialised shape changes.
+
+## Owners: organisations and personal accounts
+
+An entry in `orgs` may be either. Discovery resolves it through GraphQL's
+`repositoryOwner(login:)`, the `RepositoryOwner` interface that both `User` and
+`Organization` implement, so one query covers both with no branching. The
+org-only `organization(login:)` root field resolves to `null` for a personal
+account, which made a user entry fail discovery every cycle.
+
+The field keeps the name `orgs`, and the `org` metric label is unchanged, because
+that label appears in every dashboard panel and alert rule. Read both as
+"owner".
+
+Discovery passes `ownerAffiliations: [OWNER]`, which matters more than it
+looks. A `User`'s `repositories` connection includes `COLLABORATOR` by default,
+so it returns repositories belonging to *other* accounts — measured on one
+personal account, roughly 40% of the default result was unowned, and included
+repositories already monitored under their own owner. Each node's owner is also
+read back from the response rather than assumed to be the login that was
+queried, because `nodes.name` is bare: pairing it with the queried login
+reported `fredsystems/nixos` as `fredclausen/nixos` — a duplicate series, under
+an `org` label that does not exist, for a repository that already had one.
+
+The invariant to check a discovery change against is that the result matches
+`gh repo list <owner>` in both directions.
+
+Two further things follow from pointing this at a personal account:
+
+- **Private repositories need a token that can see them.** A `public_repo`
+  classic PAT — or a fine-grained token without private access — silently
+  discovers only the public ones.
+- **Forks are far more common than in an org.** Most self-filter, because a
+  fork usually has no enabled workflows and is dropped as `no_workflows`. A
+  fork you once ran CI on does not, and its scheduled workflows will read as
+  stale. Those are `denylist` entries.
 
 ## Repository selection
 
@@ -201,7 +236,8 @@ alert keeps firing.
 TOML file, with `GHCI_`-prefixed environment overrides:
 
 ```toml
-orgs = ["sdr-enthusiasts", "fredsystems"]
+# Organisations, personal accounts, or a mix of both.
+orgs = ["sdr-enthusiasts", "fredsystems", "fredclausen"]
 interval = "5m"
 listen = "127.0.0.1:9418"
 state_dir = "/var/lib/github-ci-exporter"
@@ -237,7 +273,7 @@ The flake exports a NixOS module:
 
   services.github-ci-exporter = {
     enable = true;
-    orgs = [ "sdr-enthusiasts" "fredsystems" ];
+    orgs = [ "sdr-enthusiasts" "fredsystems" "fredclausen" ];
     tokenFile = config.sops.secrets."monitoring/github_exporter_token".path;
   };
 }

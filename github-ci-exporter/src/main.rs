@@ -7,7 +7,7 @@ use github_ci_exporter::{
     collector::{self, CycleOutcome, WorkflowCache},
     config::Config,
     github::Client,
-    metrics::{Metrics, SharedRegistry},
+    metrics::{Metrics, Publisher},
     server,
 };
 use tokio::signal;
@@ -60,8 +60,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Seeds the served set so `/metrics` answers before the first cycle
+    // completes. Each cycle publishes a wholly new set in its place.
     let (metrics, prom_registry) = Metrics::new();
-    let shared = SharedRegistry::new(prom_registry);
+    let publisher = Publisher::new(metrics, prom_registry);
 
     let shutdown = async {
         let ctrl_c = async {
@@ -86,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     // The poll loop and the HTTP server are peers: the server owns the
     // shutdown signal, and the loop exits when the server does. This keeps
     // metrics being served while a slow collection cycle is in flight.
-    let mut server = tokio::spawn(server::serve(config.listen, shared, shutdown));
+    let mut server = tokio::spawn(server::serve(config.listen, publisher.clone(), shutdown));
 
     let mut cache = WorkflowCache::default();
     let mut ticker = tokio::time::interval(config.interval);
@@ -97,14 +99,14 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                match collector::collect(&client, &config, &metrics, &mut cache).await {
+                match collector::collect(&client, &config, &publisher, &mut cache).await {
                     Ok(CycleOutcome::Complete) => info!("collection cycle complete"),
                     Ok(CycleOutcome::BypassedLowBudget) => {
                         warn!("collection cycle bypassed to protect the API budget");
                     }
                     Err(error) => {
                         error!(%error, "collection cycle failed");
-                        collector::record_failure(&metrics);
+                        collector::record_failure(&publisher);
                     }
                 }
             }

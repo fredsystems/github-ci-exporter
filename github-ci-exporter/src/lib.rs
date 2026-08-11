@@ -1,5 +1,5 @@
 //! A Prometheus exporter for GitHub issues, pull requests, and Actions CI
-//! state across whole organisations.
+//! state across whole repository owners — organisations or personal accounts.
 //!
 //! # Design constraints
 //!

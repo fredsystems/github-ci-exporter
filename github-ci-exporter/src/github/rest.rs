@@ -109,6 +109,86 @@ impl Workflow {
         }
         self.triggers.iter().any(|t| t == event)
     }
+
+    /// What this workflow's runs can say about the default branch.
+    ///
+    /// Derived from the `on:` block, because the three cases need different
+    /// treatment and nothing else distinguishes them. See
+    /// [`DefaultBranchSignal`].
+    ///
+    /// An empty trigger list means the definition lookup failed. That is
+    /// reported as [`DefaultBranchSignal::Cadenced`] -- the most permissive
+    /// answer -- for the same reason [`Self::declares`] returns true: a
+    /// transient contents error must not blank a repository's CI.
+    #[must_use]
+    pub fn default_branch_signal(&self) -> DefaultBranchSignal {
+        if self.triggers.is_empty() {
+            return DefaultBranchSignal::Cadenced;
+        }
+        let has = |event: &str| self.triggers.iter().any(|t| t == event);
+
+        // Checked first: a workflow with `push` or `schedule` has a real
+        // cadence regardless of what else it declares.
+        if has("push") || has("schedule") {
+            return DefaultBranchSignal::Cadenced;
+        }
+        // Checked before the dispatch events, and that order is the crux. A
+        // workflow declaring both `pull_request` and `workflow_dispatch` does
+        // its real work on pull requests; a dispatch against the default
+        // branch is an operator action that nothing repeats. Treating it as
+        // on-demand would keep the fossil.
+        if has("pull_request") || has("pull_request_target") || has("merge_group") {
+            return DefaultBranchSignal::None;
+        }
+        if has("workflow_dispatch") || has("repository_dispatch") {
+            return DefaultBranchSignal::OnDemand;
+        }
+        // `workflow_call` and anything unrecognised. Permissive, as above.
+        DefaultBranchSignal::Cadenced
+    }
+}
+
+/// What a workflow's runs can say about the state of the default branch.
+///
+/// Collapsing these three into one was the cause of two long-standing false
+/// positives, in opposite directions, and they cannot be told apart from run
+/// history alone -- only from the `on:` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultBranchSignal {
+    /// GitHub runs it against the default branch unprompted, via `push` or
+    /// `schedule`. Both its conclusion and the gap since its last run are
+    /// meaningful, so the staleness horizon applies.
+    Cadenced,
+
+    /// It runs against the default branch, but only when asked --
+    /// `workflow_dispatch` or `repository_dispatch`. Its conclusion is
+    /// meaningful; the time since the last run is not, because there is no
+    /// cadence to be late against.
+    ///
+    /// This is how the fleet actually deploys: 36 workflows in
+    /// `sdr-enthusiasts`, including every `Deploy`, are dispatched by another
+    /// repository through the API. Reporting one as stale because nobody has
+    /// released in three months is a category error.
+    OnDemand,
+
+    /// It never runs against the default branch: `pull_request` and
+    /// `pull_request_target` run on the PR's head, `merge_group` on a
+    /// `gh-readonly-queue/...` branch. It has no default-branch state at all,
+    /// and its health is already covered by the pull-request series.
+    ///
+    /// Such a workflow acquires default-branch history only if someone
+    /// dispatches it once, and nothing ever supersedes that run. Observed on
+    /// `sdr-enthusiasts/sdr-e-base-repo-setup`'s `Lint`: one dispatch against
+    /// `main` in December, 37 minutes after the file was created and five
+    /// edits ago, reported ever since as that workflow's CI state even though
+    /// it runs and passes on every pull request. It could not have passed
+    /// either -- it runs `pre-commit run --all-files`, whose
+    /// `no-commit-to-branch` hook fails by construction on a protected branch.
+    ///
+    /// 89 workflows in `sdr-enthusiasts` are in this bucket and 86 of them
+    /// declare `workflow_dispatch`, so this is a latent trap rather than one
+    /// repository's accident.
+    None,
 }
 
 /// Lists workflows defined by files in `.github/workflows`.
@@ -339,6 +419,11 @@ fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
         // months-old push failures for a ci.yml that declares only
         // pull_request.
         if !workflow.declares(&run.event) {
+            continue;
+        }
+        // A workflow GitHub never runs against the default branch has no
+        // default-branch state, so a one-off dispatch must not become one.
+        if workflow.default_branch_signal() == DefaultBranchSignal::None {
             continue;
         }
         let name = workflow.name.clone();
@@ -598,6 +683,119 @@ mod tests {
                 triggers: Vec::new(),
             })
             .collect()
+    }
+
+    /// One workflow with an explicit trigger list.
+    fn live_with_triggers(name: &str, triggers: &[&str]) -> Vec<Workflow> {
+        vec![Workflow {
+            name: name.to_owned(),
+            path: format!(".github/workflows/{name}.yml"),
+            state: WorkflowState::Active,
+            triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
+        }]
+    }
+
+    fn signal_of(triggers: &[&str]) -> DefaultBranchSignal {
+        live_with_triggers("W", triggers)[0].default_branch_signal()
+    }
+
+    #[test]
+    fn cadence_bearing_triggers_are_classified_cadenced() {
+        for t in [
+            vec!["push"],
+            vec!["schedule"],
+            vec!["push", "pull_request"],
+            vec!["schedule", "workflow_dispatch"],
+        ] {
+            assert_eq!(
+                signal_of(&t),
+                DefaultBranchSignal::Cadenced,
+                "{t:?} has a real cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_only_triggers_are_classified_on_demand() {
+        // The fleet's deployment mechanism: dispatched through the API by
+        // another repository, so the conclusion matters but the gap does not.
+        for t in [
+            vec!["workflow_dispatch"],
+            vec!["repository_dispatch"],
+            vec!["workflow_dispatch", "repository_dispatch"],
+        ] {
+            assert_eq!(signal_of(&t), DefaultBranchSignal::OnDemand, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn pull_request_triggers_beat_dispatch_and_yield_no_signal() {
+        // The ordering is the crux. `Lint` declares merge_group,
+        // pull_request, and workflow_dispatch; classifying it as on-demand
+        // because of the dispatch would keep its fossil run alive.
+        for t in [
+            vec!["pull_request"],
+            vec!["merge_group"],
+            vec!["merge_group", "pull_request", "workflow_dispatch"],
+            vec!["pull_request", "workflow_dispatch"],
+        ] {
+            assert_eq!(signal_of(&t), DefaultBranchSignal::None, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_trigger_list_is_permissive() {
+        // Empty means the definition lookup failed. Anything other than the
+        // most permissive answer would let a transient error blank a repo.
+        assert_eq!(signal_of(&[]), DefaultBranchSignal::Cadenced);
+        assert_eq!(signal_of(&["workflow_call"]), DefaultBranchSignal::Cadenced);
+    }
+
+    #[test]
+    fn a_workflow_that_never_runs_on_the_default_branch_reports_nothing() {
+        // Regression guard, from sdr-e-base-repo-setup's `Lint`: it runs and
+        // passes on every pull request, but one dispatch against main in
+        // December failed and was reported as its CI state for 241 days.
+        let runs = vec![run(
+            "Lint",
+            "completed",
+            Some("failure"),
+            "workflow_dispatch",
+            "2025-12-13T15:55:22Z",
+        )];
+
+        let reduced = reduce_runs(
+            runs,
+            &live_with_triggers(
+                "Lint",
+                &["merge_group", "pull_request", "workflow_dispatch"],
+            ),
+        );
+
+        assert!(
+            reduced.latest.is_empty(),
+            "a PR-only workflow has no default-branch state: {:?}",
+            reduced.latest
+        );
+    }
+
+    #[test]
+    fn a_dispatch_driven_workflow_keeps_its_runs() {
+        // The other direction, and the one that must not regress: every
+        // `Deploy` in the fleet is dispatch-only, and dropping these would
+        // blind 36 workflows.
+        let runs = vec![run(
+            "Deploy",
+            "completed",
+            Some("success"),
+            "workflow_dispatch",
+            "2026-05-04T20:10:34Z",
+        )];
+
+        let reduced = reduce_runs(runs, &live_with_triggers("Deploy", &["workflow_dispatch"]));
+
+        assert_eq!(reduced.latest.len(), 1, "dispatch-driven CI is still CI");
+        assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
     }
 
     #[test]
