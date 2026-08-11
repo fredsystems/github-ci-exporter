@@ -46,8 +46,23 @@ in
       example = [
         "sdr-enthusiasts"
         "fredsystems"
+        "fredclausen"
       ];
-      description = "GitHub organisations to monitor.";
+      description = ''
+        GitHub repository owners to monitor. Each entry may be an
+        organisation *or* a personal account; discovery resolves both
+        through GraphQL's `RepositoryOwner` interface.
+
+        The option keeps the name `orgs` because it is also the `org`
+        metric label, which appears in every dashboard panel and alert
+        rule. Read it as "owners".
+
+        Note that a personal account's private repositories are only
+        discovered if the token can see them, and that forks are more
+        common on a personal account than in an organisation. Most forks
+        self-filter as `no_workflows`; one with workflows still enabled
+        needs a `denylist` entry.
+      '';
     };
 
     denylist = mkOption {
@@ -148,7 +163,7 @@ in
     assertions = [
       {
         assertion = cfg.orgs != [ ];
-        message = "services.github-ci-exporter.orgs must list at least one organisation.";
+        message = "services.github-ci-exporter.orgs must list at least one owner.";
       }
     ];
 

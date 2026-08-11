@@ -22,13 +22,43 @@ const DISCOVERY_PAGE_SIZE: usize = 100;
 /// requests.
 const BATCH_SIZE: usize = 50;
 
+/// Repository discovery, resolved through the `RepositoryOwner` interface.
+///
+/// `repositoryOwner` rather than `organization` because a personal account is
+/// a `User`, and `organization(login:)` resolves to null for one — an owner
+/// like `fredclausen` would fail discovery every cycle with "not found". Both
+/// `User` and `Organization` implement `RepositoryOwner`, and the interface
+/// exposes the same `repositories` connection, so one query covers both with
+/// no branching.
+///
+/// `ownerAffiliations: [OWNER]` is **not** redundant. On a `User` the default
+/// affiliations include `COLLABORATOR`, so the connection returns repositories
+/// in *other* accounts that the user can push to. Measured on `fredclausen`,
+/// roughly 40% of the default result was unowned, including `fredsystems/nixos`
+/// and `sdr-enthusiasts/docker-acarshub` — repositories already monitored under
+/// their own owner. With `[OWNER]` the result matches `gh repo list <owner>`
+/// exactly, in both directions, which is the invariant to re-check against
+/// rather than any particular count.
+///
+/// `owner { login }` is selected rather than trusting the queried login,
+/// because `nodes.name` is bare. Pairing it with the login that was asked for
+/// is what produced `fredclausen/nixos` from `fredsystems/nixos`: a duplicate
+/// series under a fabricated `org` label, for a repository that already had
+/// one. Reading the owner back from the response makes that unrepresentable
+/// regardless of what the connection decides to include.
 const DISCOVERY_QUERY: &str = r"
-query($org: String!, $cursor: String) {
-  organization(login: $org) {
-    repositories(first: 100, after: $cursor, orderBy: {field: NAME, direction: ASC}) {
+query($owner: String!, $cursor: String) {
+  repositoryOwner(login: $owner) {
+    repositories(
+      first: 100
+      after: $cursor
+      ownerAffiliations: [OWNER]
+      orderBy: {field: NAME, direction: ASC}
+    ) {
       pageInfo { hasNextPage endCursor }
       nodes {
         name
+        owner { login }
         isArchived
         pushedAt
         defaultBranchRef { name }
@@ -40,11 +70,12 @@ query($org: String!, $cursor: String) {
 
 #[derive(Debug, Deserialize)]
 struct DiscoveryResponse {
-    organization: Option<DiscoveryOrg>,
+    #[serde(rename = "repositoryOwner")]
+    repository_owner: Option<DiscoveryOwner>,
 }
 
 #[derive(Debug, Deserialize)]
-struct DiscoveryOrg {
+struct DiscoveryOwner {
     repositories: DiscoveryConnection,
 }
 
@@ -66,12 +97,18 @@ struct PageInfo {
 #[derive(Debug, Deserialize)]
 struct DiscoveryNode {
     name: String,
+    owner: NodeOwner,
     #[serde(rename = "isArchived")]
     is_archived: bool,
     #[serde(rename = "pushedAt")]
     pushed_at: Option<DateTime<Utc>>,
     #[serde(rename = "defaultBranchRef")]
     default_branch_ref: Option<BranchRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeOwner {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +124,10 @@ pub struct DiscoveredRepo {
     pub pushed_at: Option<DateTime<Utc>>,
 }
 
-/// Enumerates every repository in an organisation, following pagination.
+/// Enumerates every repository owned by `owner`, following pagination.
+///
+/// `owner` may be an organisation or a personal account; the two are
+/// interchangeable here (see [`DISCOVERY_QUERY`]).
 ///
 /// Archived repositories are returned rather than dropped, so the caller can
 /// account for *why* each repository was skipped. Note that archived repos
@@ -96,20 +136,23 @@ pub struct DiscoveredRepo {
 ///
 /// # Errors
 /// Returns [`ClientError`] if any page fails.
-pub async fn discover_org(client: &Client, org: &str) -> Result<Vec<DiscoveredRepo>, ClientError> {
+pub async fn discover_owner(
+    client: &Client,
+    owner: &str,
+) -> Result<Vec<DiscoveredRepo>, ClientError> {
     let mut cursor: Option<String> = None;
     let mut found = Vec::with_capacity(DISCOVERY_PAGE_SIZE);
 
     loop {
-        let variables = serde_json::json!({ "org": org, "cursor": cursor });
+        let variables = serde_json::json!({ "owner": owner, "cursor": cursor });
         let response: DiscoveryResponse = client.graphql(DISCOVERY_QUERY, variables).await?;
-        let Some(organization) = response.organization else {
+        let Some(repository_owner) = response.repository_owner else {
             return Err(ClientError::GraphQl(format!(
-                "organization `{org}` not found or not visible to this token"
+                "owner `{owner}` not found or not visible to this token"
             )));
         };
 
-        for node in organization.repositories.nodes {
+        for node in repository_owner.repositories.nodes {
             // A repository with no default branch ref is empty (never had a
             // commit); there is nothing to report CI for.
             let Some(branch) = node.default_branch_ref else {
@@ -117,7 +160,8 @@ pub async fn discover_org(client: &Client, org: &str) -> Result<Vec<DiscoveredRe
             };
             found.push(DiscoveredRepo {
                 repo: Repo {
-                    owner: org.to_owned(),
+                    // The response's own owner, never the queried login.
+                    owner: node.owner.login,
                     name: node.name,
                     default_branch: branch.name,
                 },
@@ -126,10 +170,10 @@ pub async fn discover_org(client: &Client, org: &str) -> Result<Vec<DiscoveredRe
             });
         }
 
-        if !organization.repositories.page_info.has_next_page {
+        if !repository_owner.repositories.page_info.has_next_page {
             break;
         }
-        cursor = organization.repositories.page_info.end_cursor;
+        cursor = repository_owner.repositories.page_info.end_cursor;
         if cursor.is_none() {
             break;
         }
@@ -427,7 +471,168 @@ pub fn partition_repos(
     reason = "panicking is how a test reports failure"
 )]
 mod tests {
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
     use super::*;
+
+    fn client_for(server: &MockServer) -> Client {
+        Client::new(
+            "test-token",
+            &server.uri(),
+            &format!("{}/graphql", server.uri()),
+        )
+        .expect("client should build")
+    }
+
+    /// A discovery page as GitHub returns it, under the `repositoryOwner` key.
+    ///
+    /// `owner` is the login the *node* reports, which is not necessarily the
+    /// login that was queried — see
+    /// `a_collaborator_repository_keeps_its_real_owner`.
+    fn discovery_page(owner: &str, name: &str) -> serde_json::Value {
+        json!({
+            "data": {
+                "repositoryOwner": {
+                    "repositories": {
+                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                        "nodes": [{
+                            "name": name,
+                            "owner": { "login": owner },
+                            "isArchived": false,
+                            "pushedAt": "2026-01-01T00:00:00Z",
+                            "defaultBranchRef": { "name": "main" }
+                        }]
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn discovery_resolves_through_the_repository_owner_interface() {
+        // Regression guard: `organization(login:)` resolves to null for a
+        // personal account, so an owner like `fredclausen` failed discovery
+        // every cycle with "not found". `repositoryOwner` is the interface
+        // both User and Organization implement.
+        assert!(
+            DISCOVERY_QUERY.contains("repositoryOwner(login: $owner)"),
+            "discovery must not be scoped to organisations"
+        );
+        assert!(
+            !DISCOVERY_QUERY.contains("organization("),
+            "an org-only root field excludes personal accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_repositories_of_a_personal_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_page("fredclausen", "freminal")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let found = discover_owner(&client_for(&server), "fredclausen")
+            .await
+            .expect("a user must be discoverable");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].repo.owner, "fredclausen");
+        assert_eq!(found[0].repo.name, "freminal");
+        assert_eq!(found[0].repo.default_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn discovers_repositories_of_an_organisation() {
+        // The same code path must keep working for orgs; the interface change
+        // is not allowed to regress the original use case.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(discovery_page("sdr-enthusiasts", "docker-tar1090")),
+            )
+            .mount(&server)
+            .await;
+
+        let found = discover_owner(&client_for(&server), "sdr-enthusiasts")
+            .await
+            .expect("an org must still be discoverable");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].repo.owner, "sdr-enthusiasts");
+    }
+
+    #[test]
+    fn discovery_requests_owned_repositories_only() {
+        // A `User`'s repositories connection includes COLLABORATOR by default,
+        // which pulls in repositories belonging to other accounts.
+        assert!(
+            DISCOVERY_QUERY.contains("ownerAffiliations: [OWNER]"),
+            "collaborator repositories belong to their own owner, not this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collaborator_repository_keeps_its_real_owner() {
+        // Regression guard for the bug that shipped alongside the user
+        // support: pairing the bare `nodes.name` with the *queried* login
+        // turned `fredsystems/nixos`, reachable through fredclausen's
+        // collaborator affiliation, into `fredclausen/nixos` -- a second
+        // series for an already-monitored repository, under an `org` label
+        // that does not exist. `ownerAffiliations` should keep such a node
+        // out; if one ever arrives anyway, it must not be misattributed.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_page("fredsystems", "nixos")),
+            )
+            .mount(&server)
+            .await;
+
+        let found = discover_owner(&client_for(&server), "fredclausen")
+            .await
+            .expect("discovery succeeds");
+
+        assert_eq!(
+            found[0].repo.owner, "fredsystems",
+            "the owner must come from the response, not the query"
+        );
+        assert_eq!(found[0].repo.full_name(), "fredsystems/nixos");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_owner_is_an_error_not_an_empty_set() {
+        // A typo'd owner must be loud. Reporting zero repositories would read
+        // as "this owner has no CI", which is indistinguishable from success.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": {"repositoryOwner": null}})),
+            )
+            .mount(&server)
+            .await;
+
+        let error = discover_owner(&client_for(&server), "nope")
+            .await
+            .expect_err("a missing owner must fail");
+        assert!(
+            error.to_string().contains("nope"),
+            "the error must name the owner: {error}"
+        );
+    }
 
     fn repo(owner: &str, name: &str) -> Repo {
         Repo {

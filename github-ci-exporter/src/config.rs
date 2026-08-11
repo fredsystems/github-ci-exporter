@@ -37,7 +37,12 @@ pub struct Config {
     /// Address the `/metrics` endpoint binds to.
     pub listen: SocketAddr,
 
-    /// Organisations to enumerate.
+    /// Repository owners to enumerate.
+    ///
+    /// Each entry may be an organisation *or* a personal account: discovery
+    /// resolves them through GraphQL's `RepositoryOwner` interface, which both
+    /// implement. The field keeps its `orgs` name because it is also the `org`
+    /// metric label, which appears in every dashboard panel and alert rule.
     pub orgs: Vec<String>,
 
     /// How often to refresh from the GitHub API.
@@ -108,7 +113,7 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
     Load(#[from] Box<figment::Error>),
-    #[error("no organisations configured; set `orgs` or GHCI_ORGS")]
+    #[error("no owners configured; set `orgs` or GHCI_ORGS")]
     NoOrgs,
     #[error("poll interval must be at least 60s to stay within API rate limits, got {0:?}")]
     IntervalTooShort(Duration),

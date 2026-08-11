@@ -103,8 +103,8 @@ pub enum CycleOutcome {
 /// sixty.
 ///
 /// # Errors
-/// Returns an error only when discovery fails for every configured
-/// organisation, which means the cycle produced no usable data at all.
+/// Returns an error only when discovery fails for every configured owner,
+/// which means the cycle produced no usable data at all.
 pub async fn collect(
     client: &Client,
     config: &Config,
@@ -144,19 +144,19 @@ pub async fn collect(
     let mut discovered = Vec::new();
     let mut discovery_failures = 0;
     for org in &config.orgs {
-        match graphql::discover_org(client, org).await {
+        match graphql::discover_owner(client, org).await {
             Ok(repos) => {
-                debug!(org, count = repos.len(), "discovered repositories");
+                debug!(owner = org, count = repos.len(), "discovered repositories");
                 discovered.extend(repos);
             }
             Err(error) => {
                 discovery_failures += 1;
-                error!(org, %error, "failed to discover organisation");
+                error!(owner = org, %error, "failed to discover owner");
             }
         }
     }
     if discovery_failures == config.orgs.len() {
-        anyhow::bail!("discovery failed for every configured organisation");
+        anyhow::bail!("discovery failed for every configured owner");
     }
 
     let max_age = config
