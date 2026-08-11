@@ -591,11 +591,18 @@ fn record_runs(
         })
         .unwrap_or_default();
 
-    for run in &runs.latest {
-        let signal = signal_for_name
-            .get(run.workflow.as_str())
+    // Unknown workflows default to cadenced, matching how an unresolved
+    // trigger list is treated everywhere else: permissive, so a failed
+    // definition lookup cannot blank a repository.
+    let signal_of = |workflow: &str| {
+        signal_for_name
+            .get(workflow)
             .copied()
-            .unwrap_or(rest::DefaultBranchSignal::Cadenced);
+            .unwrap_or(rest::DefaultBranchSignal::Cadenced)
+    };
+
+    for run in &runs.latest {
+        let signal = signal_of(&run.workflow);
 
         // `reduce_runs` already drops these, so reaching here means the
         // reduction did not come from the current code -- in practice, a
@@ -675,6 +682,13 @@ fn record_runs(
     }
 
     for (workflow, at) in &runs.last_success {
+        // Same gate as above, and for the same reason: a replayed pre-filter
+        // reduction carries `last_success` entries too, and publishing "this
+        // workflow last passed on the default branch" for one that never runs
+        // against the default branch is exactly the claim being retracted.
+        if signal_of(workflow) == rest::DefaultBranchSignal::None {
+            continue;
+        }
         metrics
             .workflow_last_success_timestamp
             .get_or_create(&WorkflowLabels {
@@ -1099,6 +1113,9 @@ mod tests {
     /// A cache entry from before `reduce_runs` learned to drop PR-only
     /// workflows: the run is present in the reduction even though the current
     /// reducer would never emit it.
+    ///
+    /// Carries a `last_success` entry as well, because that map is published
+    /// by a separate loop and a replayed reduction populates both.
     fn replayed_reduction_containing(workflow: &str) -> rest::RepoRuns {
         rest::RepoRuns {
             latest: vec![rest::LatestRun {
@@ -1108,8 +1125,22 @@ mod tests {
                 created_at: "2025-12-13T15:55:22Z".parse().expect("timestamp"),
                 html_url: "https://github.com/o/r/actions/runs/1".to_owned(),
             }],
-            last_success: HashMap::new(),
+            last_success: HashMap::from([(
+                workflow.to_owned(),
+                "2025-12-01T00:00:00Z".parse().expect("timestamp"),
+            )]),
         }
+    }
+
+    /// Whether any rendered sample mentions `workflow`.
+    ///
+    /// Line-wise rather than a substring search over the whole document, so an
+    /// unrelated series carrying the same conclusion cannot make an assertion
+    /// pass or fail by accident.
+    fn mentions_workflow(rendered: &str, workflow: &str) -> bool {
+        rendered
+            .lines()
+            .any(|line| line.contains(&format!(r#"workflow="{workflow}""#)))
     }
 
     fn cache_with_workflow(repo: &Repo, name: &str, triggers: &[&str]) -> WorkflowCache {
@@ -1158,11 +1189,15 @@ mod tests {
 
         let rendered = Publisher::new(metrics, registry).render();
         assert!(
-            !rendered.contains(r#"workflow="Lint""#),
-            "a PR-only workflow must publish nothing even from a stale cache:\n{rendered}"
+            !mentions_workflow(&rendered, "Lint"),
+            "a PR-only workflow must publish nothing from a stale cache -- not a \
+             run status, not a stale flag, and not a last-success timestamp:\n{rendered}"
         );
+        // Named explicitly, because this is the series that paged.
         assert!(
-            !rendered.contains(r#"conclusion="failure""#),
+            !rendered
+                .lines()
+                .any(|l| l.contains(r#"workflow="Lint""#) && l.contains(r#"conclusion="failure""#)),
             "and must certainly not publish a pageable failure:\n{rendered}"
         );
     }
@@ -1188,10 +1223,16 @@ mod tests {
         );
 
         let rendered = Publisher::new(metrics, registry).render();
-        assert!(rendered.contains(r#"workflow="Deploy""#));
+        assert!(mentions_workflow(&rendered, "Deploy"));
         assert!(
-            rendered.contains(r#"conclusion="stale""#),
+            rendered
+                .lines()
+                .any(|l| l.contains(r#"workflow="Deploy""#) && l.contains(r#"conclusion="stale""#)),
             "an ancient cadenced failure is masked, not dropped:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("github_workflow_last_success_timestamp_seconds"),
+            "and its last-success timestamp is still published:\n{rendered}"
         );
     }
 

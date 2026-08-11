@@ -158,18 +158,18 @@ struct CacheEntry {
 /// the current code would never have produced.
 ///
 /// That is also not hypothetical. Version 1 held run reductions computed
-/// before `reduce_runs` learned to discard workflows with no default-branch
-/// trigger. The shape was byte-identical, so the file was accepted and the
-/// filtered-out runs came straight back -- resurrecting the exact fossil run
-/// the filter existed to remove, and, because such a workflow is no longer
-/// masked as stale, publishing it as an outright `failure` that would page.
-/// Worse than before the filter was added.
+/// before `reduce_runs` learned to discard workflows classified
+/// `DefaultBranchSignal::None`. The shape was byte-identical, so the file was
+/// accepted and the filtered-out runs came straight back -- resurrecting the
+/// exact fossil run the filter existed to remove, and, because such a workflow
+/// is no longer masked as stale, publishing it as an outright `failure` that
+/// would page. Worse than before the filter was added.
 ///
 /// Version history:
 ///
 /// * 1 -- initial versioned format.
-/// * 2 -- `reduce_runs` drops workflows whose triggers give them no
-///   default-branch state. Same shape, different contents.
+/// * 2 -- `reduce_runs` drops workflows whose declared triggers make them
+///   `DefaultBranchSignal::None`. Same shape, different contents.
 const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Versioned envelope for the persisted cache, as read from disk.
