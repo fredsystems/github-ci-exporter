@@ -578,13 +578,36 @@ fn record_runs(
         })
         .unwrap_or_default();
 
+    // Whether a gap since the last run means anything depends on how the
+    // workflow is triggered, which only the workflow set knows.
+    let signal_for_name: HashMap<&str, rest::DefaultBranchSignal> = cache
+        .workflows
+        .get(&full_name)
+        .map(|ws| {
+            ws.iter()
+                .map(|w| (w.name.as_str(), w.default_branch_signal()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for run in &runs.latest {
         // A run older than the staleness horizon says nothing about the
         // current code. Reporting `stale` instead of its original conclusion
         // keeps an ancient failure from producing an alert that cannot be
         // cleared without an artificial push. `workflow_run_stale` carries the
         // fact separately so it stays visible on the dashboard.
-        let stale = run.is_stale(now);
+        //
+        // Only for a cadenced workflow, though. An on-demand one has no
+        // cadence to be late against, so the age of its last run is not a
+        // fault and must not mask what that run actually concluded -- that is
+        // what reported every `Deploy` the fleet had not released in three
+        // months as though its CI had gone quiet.
+        let cadenced = signal_for_name
+            .get(run.workflow.as_str())
+            .copied()
+            .unwrap_or(rest::DefaultBranchSignal::Cadenced)
+            == rest::DefaultBranchSignal::Cadenced;
+        let stale = cadenced && run.is_stale(now);
         metrics
             .workflow_run_stale
             .get_or_create(&WorkflowLabels {
