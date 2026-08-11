@@ -592,6 +592,27 @@ fn record_runs(
         .unwrap_or_default();
 
     for run in &runs.latest {
+        let signal = signal_for_name
+            .get(run.workflow.as_str())
+            .copied()
+            .unwrap_or(rest::DefaultBranchSignal::Cadenced);
+
+        // `reduce_runs` already drops these, so reaching here means the
+        // reduction did not come from the current code -- in practice, a
+        // cached projection replayed on a `304`. Enforcing the rule at the
+        // point of publication as well makes it hold regardless of a
+        // reduction's provenance, which is the difference between a stale
+        // cache costing one sweep of accuracy and it publishing a fossil
+        // failure that pages.
+        if signal == rest::DefaultBranchSignal::None {
+            debug!(
+                repo = %repo,
+                workflow = run.workflow,
+                "discarding a run for a workflow with no default-branch state"
+            );
+            continue;
+        }
+
         // A run older than the staleness horizon says nothing about the
         // current code. Reporting `stale` instead of its original conclusion
         // keeps an ancient failure from producing an alert that cannot be
@@ -603,12 +624,7 @@ fn record_runs(
         // fault and must not mask what that run actually concluded -- that is
         // what reported every `Deploy` the fleet had not released in three
         // months as though its CI had gone quiet.
-        let cadenced = signal_for_name
-            .get(run.workflow.as_str())
-            .copied()
-            .unwrap_or(rest::DefaultBranchSignal::Cadenced)
-            == rest::DefaultBranchSignal::Cadenced;
-        let stale = cadenced && run.is_stale(now);
+        let stale = signal == rest::DefaultBranchSignal::Cadenced && run.is_stale(now);
         metrics
             .workflow_run_stale
             .get_or_create(&WorkflowLabels {
@@ -1077,6 +1093,105 @@ mod tests {
         assert!(
             rendered.contains(r#"repo="r""#),
             "last-known-good data must survive a failed cycle"
+        );
+    }
+
+    /// A cache entry from before `reduce_runs` learned to drop PR-only
+    /// workflows: the run is present in the reduction even though the current
+    /// reducer would never emit it.
+    fn replayed_reduction_containing(workflow: &str) -> rest::RepoRuns {
+        rest::RepoRuns {
+            latest: vec![rest::LatestRun {
+                workflow: workflow.to_owned(),
+                conclusion: crate::model::RunConclusion::Failure,
+                event: "workflow_dispatch".to_owned(),
+                created_at: "2025-12-13T15:55:22Z".parse().expect("timestamp"),
+                html_url: "https://github.com/o/r/actions/runs/1".to_owned(),
+            }],
+            last_success: HashMap::new(),
+        }
+    }
+
+    fn cache_with_workflow(repo: &Repo, name: &str, triggers: &[&str]) -> WorkflowCache {
+        let mut cache = WorkflowCache::default();
+        cache.workflows.insert(
+            repo.full_name(),
+            vec![rest::Workflow {
+                name: name.to_owned(),
+                path: format!(".github/workflows/{name}.yml"),
+                state: rest::WorkflowState::Active,
+                triggers: triggers.iter().map(|t| (*t).to_owned()).collect(),
+            }],
+        );
+        cache
+    }
+
+    #[test]
+    fn a_replayed_reduction_cannot_resurrect_a_pr_only_workflow() {
+        // The regression that reached production. The runs cache stores a
+        // *reduction*, keyed by a fingerprint of path, name, and triggers --
+        // none of which changed when the reducer learned to drop workflows
+        // with no default-branch state. So `304` replayed a pre-filter
+        // reduction, the fossil run came back, and because such a workflow is
+        // no longer masked as stale it published as an outright `failure`.
+        // Bumping the cache version fixes the cause; this asserts the rule
+        // holds at publication regardless of a reduction's provenance.
+        let (metrics, registry) = Metrics::new();
+        let repo = Repo {
+            owner: "sdr-enthusiasts".to_owned(),
+            name: "sdr-e-base-repo-setup".to_owned(),
+            default_branch: "main".to_owned(),
+        };
+        let cache = cache_with_workflow(
+            &repo,
+            "Lint",
+            &["merge_group", "pull_request", "workflow_dispatch"],
+        );
+
+        record_runs(
+            &metrics,
+            &repo,
+            &replayed_reduction_containing("Lint"),
+            &cache,
+            Utc::now(),
+        );
+
+        let rendered = Publisher::new(metrics, registry).render();
+        assert!(
+            !rendered.contains(r#"workflow="Lint""#),
+            "a PR-only workflow must publish nothing even from a stale cache:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"conclusion="failure""#),
+            "and must certainly not publish a pageable failure:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_reduction_still_publishes_a_cadenced_workflow() {
+        // The guard must be surgical: a cadenced workflow's old failure is
+        // real history and still belongs in the output, masked as stale.
+        let (metrics, registry) = Metrics::new();
+        let repo = Repo {
+            owner: "sdr-enthusiasts".to_owned(),
+            name: "docker-jaero".to_owned(),
+            default_branch: "main".to_owned(),
+        };
+        let cache = cache_with_workflow(&repo, "Deploy", &["push"]);
+
+        record_runs(
+            &metrics,
+            &repo,
+            &replayed_reduction_containing("Deploy"),
+            &cache,
+            Utc::now(),
+        );
+
+        let rendered = Publisher::new(metrics, registry).render();
+        assert!(rendered.contains(r#"workflow="Deploy""#));
+        assert!(
+            rendered.contains(r#"conclusion="stale""#),
+            "an ancient cadenced failure is masked, not dropped:\n{rendered}"
         );
     }
 
