@@ -150,7 +150,27 @@ struct CacheEntry {
 /// Bump this whenever any cached projection's serialised shape changes. The
 /// per-entry decode fallback in [`Client::get_cached_as`] recovers from a
 /// missed bump, at the cost of one uncached fetch per affected entry.
-const CACHE_FORMAT_VERSION: u32 = 1;
+///
+/// **Bump it when the projection's _meaning_ changes too, not only its
+/// shape.** Both existing safeguards key on decodability, so a reduction that
+/// still deserialises cleanly but is now computed differently sails through
+/// them: the version matches, every entry decodes, and `304` replays a value
+/// the current code would never have produced.
+///
+/// That is also not hypothetical. Version 1 held run reductions computed
+/// before `reduce_runs` learned to discard workflows classified
+/// `DefaultBranchSignal::None`. The shape was byte-identical, so the file was
+/// accepted and the filtered-out runs came straight back -- resurrecting the
+/// exact fossil run the filter existed to remove, and, because such a workflow
+/// is no longer masked as stale, publishing it as an outright `failure` that
+/// would page. Worse than before the filter was added.
+///
+/// Version history:
+///
+/// * 1 -- initial versioned format.
+/// * 2 -- `reduce_runs` drops workflows whose declared triggers make them
+///   `DefaultBranchSignal::None`. Same shape, different contents.
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Versioned envelope for the persisted cache, as read from disk.
 ///
