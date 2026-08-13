@@ -135,7 +135,7 @@
             pkgs.markdownlint-cli2
             pkgs.typos
           ]
-          ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.cargo-llvm-cov ];
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.cargo-llvm-cov ];
           # `promtool` and `jq` are here because the alert rules and dashboards
           # consumed by the nixos repo are authored/validated against this
           # exporter's metric names.
