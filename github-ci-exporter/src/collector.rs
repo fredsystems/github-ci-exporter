@@ -705,15 +705,28 @@ fn record_runs(
 /// Four years so the window always contains a February, a leap February, and a
 /// 31-day month, which is what makes a monthly expression resolve to its true
 /// worst case rather than to whichever month the walk happened to start in.
-const GAP_SCAN_DAYS: i64 = 4 * 366;
+const GAP_SCAN_HORIZON_DAYS: i64 = 4 * 366;
 
-/// Ceiling on occurrences examined per expression.
+/// Span the walk must cover before [`GAP_SCAN_SOFT_SAMPLES`] may stop it.
 ///
-/// A five-minute cron would otherwise produce ~420k occurrences across the
-/// scan window. Frequent schedules have uniform gaps, so a few hundred samples
-/// settle the answer; the cap only ever truncates schedules whose gaps do not
-/// vary.
-const GAP_SCAN_MAX_SAMPLES: usize = 2_000;
+/// A dense schedule confined to a calendar window hides its longest gap behind
+/// a large number of short ones: `*/5 * * 1 *` fires 8,928 times inside
+/// January before the eleven-month wait, so a sample cap alone reports 300
+/// seconds and the staleness alert then fires for the rest of the year. The
+/// walk therefore may not stop on sample count until it has seen a full year.
+const GAP_SCAN_SETTLED_DAYS: i64 = 366;
+
+/// Occurrences after which the walk may stop, once it has also covered
+/// [`GAP_SCAN_SETTLED_DAYS`].
+const GAP_SCAN_SOFT_SAMPLES: usize = 2_000;
+
+/// Occurrences after which the walk stops unconditionally.
+///
+/// Bounds the cost of a sub-hourly schedule, which would otherwise enumerate
+/// ~420k occurrences before reaching the settled span. Any schedule dense
+/// enough to hit this ceiling has already shown its gap pattern many times
+/// over.
+const GAP_SCAN_HARD_SAMPLES: usize = 50_000;
 
 /// Derives the longest interval that may legitimately pass between two runs of
 /// a workflow, in seconds.
@@ -746,19 +759,29 @@ pub fn expected_interval_seconds(crons: &[String]) -> Option<i64> {
 /// in the scan window; a caller with several expressions still resolves from
 /// the others.
 fn longest_gap_seconds(expression: &str) -> Option<i64> {
-    use std::str::FromStr as _;
-
-    // GitHub uses 5-field POSIX cron; the `cron` crate expects a seconds
-    // field, so one is prepended.
-    let normalised = format!("0 {}", normalise_day_of_week(expression)?);
-    let schedule = cron::Schedule::from_str(&normalised).ok()?;
+    let schedules = posix_schedules(&normalise_day_of_week(expression)?)?;
 
     let anchor = DateTime::<Utc>::from_timestamp(0, 0)?;
-    let horizon = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_DAYS))?;
+    let horizon = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_HORIZON_DAYS))?;
+    let settled = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_SETTLED_DAYS))?;
+
+    let mut streams: Vec<_> = schedules
+        .iter()
+        .map(|schedule| schedule.after(&anchor).peekable())
+        .collect();
 
     let mut previous: Option<DateTime<Utc>> = None;
     let mut longest = 0_i64;
-    for occurrence in schedule.after(&anchor).take(GAP_SCAN_MAX_SAMPLES) {
+    let mut samples = 0_usize;
+
+    while let Some(occurrence) = streams.iter_mut().filter_map(|s| s.peek().copied()).min() {
+        // Advance every stream sitting on this instant, so a moment produced by
+        // both halves of a day-of-month/day-of-week union counts once.
+        for stream in &mut streams {
+            if stream.peek() == Some(&occurrence) {
+                stream.next();
+            }
+        }
         if occurrence > horizon {
             break;
         }
@@ -766,9 +789,50 @@ fn longest_gap_seconds(expression: &str) -> Option<i64> {
             longest = longest.max((occurrence - previous).num_seconds());
         }
         previous = Some(occurrence);
+
+        samples += 1;
+        if samples >= GAP_SCAN_HARD_SAMPLES
+            || (samples >= GAP_SCAN_SOFT_SAMPLES && occurrence > settled)
+        {
+            break;
+        }
     }
 
     (longest > 0).then_some(longest)
+}
+
+/// Builds the schedules whose union reproduces POSIX day semantics.
+///
+/// When a cron expression restricts *both* day-of-month and day-of-week, POSIX
+/// fires if either matches. The `cron` crate intersects them instead, so
+/// `0 0 1 * 1` means "the 1st, and every Monday" to GitHub but "the 1st, but
+/// only when it falls on a Monday" to the crate — 273 days between fires
+/// rather than 7, which is long enough to suppress a genuinely dead workflow.
+///
+/// Splitting into one schedule per day field and walking them as a union
+/// restores the POSIX reading. When either field is `*` the crate's
+/// intersection already agrees, and a single schedule is used.
+fn posix_schedules(expression: &str) -> Option<Vec<cron::Schedule>> {
+    use std::str::FromStr as _;
+
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
+        return None;
+    };
+
+    // GitHub uses 5-field POSIX cron; the `cron` crate expects a leading
+    // seconds field, so one is prepended.
+    let build = |day_of_month: &str, day_of_week: &str| {
+        cron::Schedule::from_str(&format!(
+            "0 {minute} {hour} {day_of_month} {month} {day_of_week}"
+        ))
+        .ok()
+    };
+
+    if *day_of_month == "*" || *day_of_week == "*" {
+        return build(day_of_month, day_of_week).map(|schedule| vec![schedule]);
+    }
+    Some(vec![build(day_of_month, "*")?, build("*", day_of_week)?])
 }
 
 /// Rewrites a cron expression's day-of-week field from GitHub's numbering into
@@ -795,45 +859,79 @@ fn normalise_day_of_week(expression: &str) -> Option<String> {
     ))
 }
 
-/// Applies [`remap_day_of_week`] to every numeric term in a day-of-week field.
+/// Remaps every numeric term in a day-of-week field.
 ///
-/// Handles the list / range / step forms cron allows. Named days (`SUN`) and
-/// wildcards are passed through untouched — the parser understands those, and
-/// a `*/n` step enumerates the same days under either numbering because both
-/// start counting at their own Sunday.
+/// Named days (`SUN`) and wildcards pass through untouched: the parser
+/// understands those, and a bare `*/n` selects the same days under either
+/// numbering because both start counting at their own Sunday.
 fn remap_day_of_week_field(field: &str) -> String {
     field
         .split(',')
-        .map(|term| {
-            let (range, step) = match term.split_once('/') {
-                Some((range, step)) => (range, Some(step)),
-                None => (term, None),
-            };
-            let remapped = match range.split_once('-') {
-                Some((start, end)) => match (remap_day_of_week(start), remap_day_of_week(end)) {
-                    (Some(start), Some(end)) => format!("{start}-{end}"),
-                    _ => range.to_owned(),
-                },
-                None => {
-                    remap_day_of_week(range).map_or_else(|| range.to_owned(), |day| day.to_string())
-                }
-            };
-            match step {
-                Some(step) => format!("{remapped}/{step}"),
-                None => remapped,
-            }
-        })
+        .map(remap_day_of_week_term)
         .collect::<Vec<_>>()
         .join(",")
 }
 
-/// Maps one POSIX day-of-week number onto the `cron` crate's numbering.
+/// Remaps one term of a day-of-week field, expanding ranges to an explicit
+/// list.
 ///
-/// `0`/`7` (Sunday) both become `1`; `1`..=`6` (Monday..Saturday) become
-/// `2`..=`7`. Non-numeric terms return `None` and are left alone.
-fn remap_day_of_week(term: &str) -> Option<u8> {
-    let value: u8 = term.parse().ok()?;
-    (value <= 7).then_some(value % 7 + 1)
+/// A range cannot simply have both endpoints remapped, because the two
+/// numberings disagree about where the week starts and any range spanning
+/// Sunday comes out inverted or collapsed. `0-7` (every day) would become
+/// `1-1`, Sunday alone, and `1-7` would become the empty range `2-1`.
+/// Enumerating the days first and emitting a list sidesteps the ordering.
+fn remap_day_of_week_term(term: &str) -> String {
+    let (range, step) = match term.split_once('/') {
+        Some((range, step)) => match step.parse::<u8>() {
+            Ok(step) if step > 0 => (range, step),
+            _ => return term.to_owned(),
+        },
+        None => (term, 1),
+    };
+
+    let Some(days) = posix_days_of_week(range, step) else {
+        return term.to_owned();
+    };
+
+    let mut remapped: Vec<u8> = days.iter().map(|day| day % 7 + 1).collect();
+    remapped.sort_unstable();
+    remapped.dedup();
+
+    remapped
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Enumerates the POSIX day-of-week numbers a single numeric term selects.
+///
+/// Returns `None` for wildcards and named days, which are left for the parser.
+/// Ranges may wrap through Sunday (`5-1` for Friday..Monday), which a plain
+/// endpoint comparison would read as empty.
+fn posix_days_of_week(range: &str, step: u8) -> Option<Vec<u8>> {
+    let (start, end) = if let Some((start, end)) = range.split_once('-') {
+        (start.parse::<u8>().ok()?, end.parse::<u8>().ok()?)
+    } else {
+        let single = range.parse::<u8>().ok()?;
+        (single, single)
+    };
+    if start > 7 || end > 7 {
+        return None;
+    }
+
+    // Both 0 and 7 mean Sunday, so the span is measured modulo the week.
+    let span = if start <= end {
+        end - start
+    } else {
+        7 - start + end
+    };
+    Some(
+        (0..=span)
+            .step_by(usize::from(step))
+            .map(|offset| (start + offset) % 7)
+            .collect(),
+    )
 }
 
 /// Marks a cycle as failed without clearing the previous values.
@@ -903,9 +1001,9 @@ mod tests {
 
     // GitHub uses POSIX day-of-week numbering, where 0 and 7 both mean Sunday.
     // The `cron` crate uses 1..=7 with 1 = Sunday, so an unnormalised
-    // `* * 0` expression fails to parse and the schedule is silently dropped.
-    // Observed live: fredsystems/nixos declares `0 5 * * 0` and the exporter
-    // reported no weekly cadence for it at all.
+    // `0 5 * * 0` expression fails to parse and the schedule is silently
+    // dropped. Observed live: fredsystems/nixos declares `0 5 * * 0` and the
+    // exporter reported no weekly cadence for it at all.
     #[test]
     fn sunday_as_zero_is_a_valid_weekly_cron() {
         let interval = expected_interval_seconds(&["0 5 * * 0".to_owned()])
@@ -969,6 +1067,87 @@ mod tests {
     fn weekday_only_cron_uses_the_weekend_gap() {
         let interval = expected_interval_seconds(&["0 5 * * 1-5".to_owned()]).expect("interval");
         assert_eq!(interval, 3 * 86_400);
+    }
+
+    // A day-of-week range cannot be remapped endpoint-wise: the numberings
+    // disagree about where the week starts, so anything spanning Sunday came
+    // out inverted (`1-7` -> `2-1`, an empty range that failed to parse) or
+    // collapsed (`0-7` -> `1-1`, Sunday alone rather than every day).
+    #[test]
+    fn day_of_week_ranges_spanning_sunday_keep_their_coverage() {
+        for range in ["0-6", "0-7", "1-7"] {
+            let interval = expected_interval_seconds(&[format!("0 5 * * {range}")])
+                .unwrap_or_else(|| panic!("range {range} must resolve"));
+            assert_eq!(interval, 86_400, "range {range} covers every day");
+        }
+    }
+
+    #[test]
+    fn a_weekend_range_wraps_through_sunday() {
+        // Saturday and Sunday only: Sunday -> Saturday is six days.
+        let interval = expected_interval_seconds(&["0 5 * * 6-7".to_owned()]).expect("interval");
+        assert_eq!(interval, 6 * 86_400);
+    }
+
+    #[test]
+    fn a_day_of_week_range_may_wrap_past_the_end_of_the_week() {
+        // Friday..Monday. The longest gap is Monday -> Friday.
+        let interval = expected_interval_seconds(&["0 5 * * 5-1".to_owned()]).expect("interval");
+        assert_eq!(interval, 4 * 86_400);
+    }
+
+    #[test]
+    fn a_stepped_day_of_week_range_is_remapped() {
+        // Mon, Wed, Fri. The longest gap is Friday -> Monday.
+        let interval = expected_interval_seconds(&["0 5 * * 1-5/2".to_owned()]).expect("interval");
+        assert_eq!(interval, 3 * 86_400);
+    }
+
+    #[test]
+    fn named_days_and_bare_steps_are_left_alone() {
+        // `*/2` selects Sun/Tue/Thu/Sat under either numbering, since both
+        // start counting at their own Sunday.
+        let stepped = expected_interval_seconds(&["0 5 * * */2".to_owned()]).expect("interval");
+        assert_eq!(stepped, 2 * 86_400);
+        assert!(expected_interval_seconds(&["0 5 * * MON".to_owned()]).is_some());
+    }
+
+    // POSIX fires when EITHER day field matches, whenever both are restricted.
+    // The `cron` crate intersects them, which read `0 0 1 * 1` as "the 1st,
+    // but only when it is a Monday" -- 273 days between fires instead of 7,
+    // long enough to hide a genuinely dead workflow.
+    #[test]
+    fn a_restricted_day_of_month_and_day_of_week_are_unioned() {
+        let interval = expected_interval_seconds(&["0 0 1 * 1".to_owned()]).expect("interval");
+        assert_eq!(interval, 7 * 86_400);
+    }
+
+    #[test]
+    fn a_wildcard_day_field_still_resolves_from_a_single_schedule() {
+        let by_month_day = expected_interval_seconds(&["0 0 1 * *".to_owned()]).expect("interval");
+        assert_eq!(by_month_day, 31 * 86_400);
+        let by_week_day = expected_interval_seconds(&["0 0 * * 1".to_owned()]).expect("interval");
+        assert_eq!(by_week_day, 7 * 86_400);
+    }
+
+    // A dense schedule confined to a calendar window hides its longest gap
+    // behind thousands of short ones. `*/5 * * 1 *` fires 8,928 times inside
+    // January; a plain sample cap stopped the walk after about seven days and
+    // reported 300 seconds, which would fire the staleness alert for the
+    // remaining eleven months.
+    #[test]
+    fn a_dense_but_windowed_schedule_still_finds_its_long_gap() {
+        let interval = expected_interval_seconds(&["*/5 * * 1 *".to_owned()]).expect("interval");
+        assert!(
+            interval > 300 * 86_400,
+            "expected the eleven-month gap, got {interval}s"
+        );
+    }
+
+    #[test]
+    fn a_dense_unbounded_schedule_terminates_with_a_uniform_gap() {
+        let interval = expected_interval_seconds(&["*/5 * * * *".to_owned()]).expect("interval");
+        assert_eq!(interval, 300);
     }
 
     fn wf(name: &str, triggers: &[&str]) -> rest::Workflow {
