@@ -442,7 +442,7 @@ async fn resolve_definitions(
     for workflow in workflows.iter_mut() {
         match rest::fetch_workflow_definition(client, repo, &workflow.path).await {
             Ok(definition) => {
-                if let Some(interval) = shortest_cron_interval(&definition.crons) {
+                if let Some(interval) = expected_interval_seconds(&definition.crons) {
                     intervals.insert(workflow.path.clone(), interval);
                 }
                 workflow.triggers = definition.triggers;
@@ -700,34 +700,140 @@ fn record_runs(
     }
 }
 
-/// Derives the shortest interval between fires across a set of cron
-/// expressions, in seconds.
+/// Days of schedule to walk when measuring a cron expression's longest gap.
+///
+/// Four years so the window always contains a February, a leap February, and a
+/// 31-day month, which is what makes a monthly expression resolve to its true
+/// worst case rather than to whichever month the walk happened to start in.
+const GAP_SCAN_DAYS: i64 = 4 * 366;
+
+/// Ceiling on occurrences examined per expression.
+///
+/// A five-minute cron would otherwise produce ~420k occurrences across the
+/// scan window. Frequent schedules have uniform gaps, so a few hundred samples
+/// settle the answer; the cap only ever truncates schedules whose gaps do not
+/// vary.
+const GAP_SCAN_MAX_SAMPLES: usize = 2_000;
+
+/// Derives the longest interval that may legitimately pass between two runs of
+/// a workflow, in seconds.
 ///
 /// Used to detect scheduled workflows that have silently stopped running —
 /// GitHub disables cron triggers on repositories with no activity for 60 days.
+/// The staleness alert downstream compares elapsed time against this value, so
+/// it has to be the worst legitimate gap: anything smaller reports a healthy
+/// workflow as late.
+///
+/// Two subtleties, both of which produced wrong values in the field:
+///
+/// - A single expression does not necessarily have a constant period. Monthly
+///   fires are 28..=31 days apart and a weekday-only schedule skips the
+///   weekend, so each expression contributes its *longest* gap rather than its
+///   first.
+/// - Across several expressions a workflow runs whenever any of them fires, so
+///   the most frequent schedule bounds the gap and the *minimum* wins.
 #[must_use]
-pub fn shortest_cron_interval(crons: &[String]) -> Option<i64> {
+pub fn expected_interval_seconds(crons: &[String]) -> Option<i64> {
+    crons
+        .iter()
+        .filter_map(|expression| longest_gap_seconds(expression))
+        .min()
+}
+
+/// Walks a single cron expression and returns its longest gap, in seconds.
+///
+/// Returns `None` if the expression does not parse or fires fewer than twice
+/// in the scan window; a caller with several expressions still resolves from
+/// the others.
+fn longest_gap_seconds(expression: &str) -> Option<i64> {
     use std::str::FromStr as _;
 
-    let mut shortest: Option<i64> = None;
-    for expression in crons {
-        // GitHub uses 5-field POSIX cron; the `cron` crate expects a seconds
-        // field, so one is prepended.
-        let normalised = format!("0 {expression}");
-        let Ok(schedule) = cron::Schedule::from_str(&normalised) else {
-            continue;
-        };
-        let base = DateTime::<Utc>::from_timestamp(0, 0)?;
-        let mut upcoming = schedule.after(&base);
-        let (Some(first), Some(second)) = (upcoming.next(), upcoming.next()) else {
-            continue;
-        };
-        let delta = (second - first).num_seconds();
-        if delta > 0 {
-            shortest = Some(shortest.map_or(delta, |current: i64| current.min(delta)));
+    // GitHub uses 5-field POSIX cron; the `cron` crate expects a seconds
+    // field, so one is prepended.
+    let normalised = format!("0 {}", normalise_day_of_week(expression)?);
+    let schedule = cron::Schedule::from_str(&normalised).ok()?;
+
+    let anchor = DateTime::<Utc>::from_timestamp(0, 0)?;
+    let horizon = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_DAYS))?;
+
+    let mut previous: Option<DateTime<Utc>> = None;
+    let mut longest = 0_i64;
+    for occurrence in schedule.after(&anchor).take(GAP_SCAN_MAX_SAMPLES) {
+        if occurrence > horizon {
+            break;
         }
+        if let Some(previous) = previous {
+            longest = longest.max((occurrence - previous).num_seconds());
+        }
+        previous = Some(occurrence);
     }
-    shortest
+
+    (longest > 0).then_some(longest)
+}
+
+/// Rewrites a cron expression's day-of-week field from GitHub's numbering into
+/// the numbering the `cron` crate accepts.
+///
+/// GitHub follows POSIX: `0..=6` for Sunday..Saturday, with `7` also accepted
+/// for Sunday. The `cron` crate uses `1..=7` for Sunday..Saturday and rejects
+/// `0` outright. Left unnormalised, an ordinary Sunday schedule written
+/// `0 5 * * 0` fails to parse and is discarded silently, leaving the workflow
+/// with no cadence at all — or, when it shares a workflow with a second
+/// expression, with the wrong one. Observed live on fredsystems/nixos, whose
+/// weekly `0 5 * * 0` vanished and left a monthly baseline behind.
+///
+/// Returns `None` for anything that is not a 5-field expression, so malformed
+/// input is rejected here rather than reaching the parser.
+fn normalise_day_of_week(expression: &str) -> Option<String> {
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
+        return None;
+    };
+    let day_of_week = remap_day_of_week_field(day_of_week);
+    Some(format!(
+        "{minute} {hour} {day_of_month} {month} {day_of_week}"
+    ))
+}
+
+/// Applies [`remap_day_of_week`] to every numeric term in a day-of-week field.
+///
+/// Handles the list / range / step forms cron allows. Named days (`SUN`) and
+/// wildcards are passed through untouched — the parser understands those, and
+/// a `*/n` step enumerates the same days under either numbering because both
+/// start counting at their own Sunday.
+fn remap_day_of_week_field(field: &str) -> String {
+    field
+        .split(',')
+        .map(|term| {
+            let (range, step) = match term.split_once('/') {
+                Some((range, step)) => (range, Some(step)),
+                None => (term, None),
+            };
+            let remapped = match range.split_once('-') {
+                Some((start, end)) => match (remap_day_of_week(start), remap_day_of_week(end)) {
+                    (Some(start), Some(end)) => format!("{start}-{end}"),
+                    _ => range.to_owned(),
+                },
+                None => {
+                    remap_day_of_week(range).map_or_else(|| range.to_owned(), |day| day.to_string())
+                }
+            };
+            match step {
+                Some(step) => format!("{remapped}/{step}"),
+                None => remapped,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Maps one POSIX day-of-week number onto the `cron` crate's numbering.
+///
+/// `0`/`7` (Sunday) both become `1`; `1`..=`6` (Monday..Saturday) become
+/// `2`..=`7`. Non-numeric terms return `None` and are left alone.
+fn remap_day_of_week(term: &str) -> Option<u8> {
+    let value: u8 = term.parse().ok()?;
+    (value <= 7).then_some(value % 7 + 1)
 }
 
 /// Marks a cycle as failed without clearing the previous values.
@@ -762,19 +868,19 @@ mod tests {
 
     #[test]
     fn daily_cron_yields_86400_seconds() {
-        let interval = shortest_cron_interval(&["0 12 * * *".to_owned()]).expect("interval");
+        let interval = expected_interval_seconds(&["0 12 * * *".to_owned()]).expect("interval");
         assert_eq!(interval, 86_400);
     }
 
     #[test]
     fn weekly_cron_yields_seven_days() {
-        let interval = shortest_cron_interval(&["0 0 * * 1".to_owned()]).expect("interval");
+        let interval = expected_interval_seconds(&["0 0 * * 1".to_owned()]).expect("interval");
         assert_eq!(interval, 604_800);
     }
 
     #[test]
     fn shortest_wins_across_multiple_crons() {
-        let interval = shortest_cron_interval(&[
+        let interval = expected_interval_seconds(&[
             "0 0 * * 1".to_owned(),  // weekly
             "0 12 * * *".to_owned(), // daily
         ])
@@ -784,15 +890,85 @@ mod tests {
 
     #[test]
     fn invalid_cron_is_ignored_not_fatal() {
-        assert!(shortest_cron_interval(&["not a cron".to_owned()]).is_none());
-        assert!(shortest_cron_interval(&[]).is_none());
+        assert!(expected_interval_seconds(&["not a cron".to_owned()]).is_none());
+        assert!(expected_interval_seconds(&[]).is_none());
     }
 
     #[test]
     fn invalid_cron_does_not_hide_a_valid_one() {
-        let interval = shortest_cron_interval(&["nonsense".to_owned(), "0 12 * * *".to_owned()])
+        let interval = expected_interval_seconds(&["nonsense".to_owned(), "0 12 * * *".to_owned()])
             .expect("valid expression should still resolve");
         assert_eq!(interval, 86_400);
+    }
+
+    // GitHub uses POSIX day-of-week numbering, where 0 and 7 both mean Sunday.
+    // The `cron` crate uses 1..=7 with 1 = Sunday, so an unnormalised
+    // `* * 0` expression fails to parse and the schedule is silently dropped.
+    // Observed live: fredsystems/nixos declares `0 5 * * 0` and the exporter
+    // reported no weekly cadence for it at all.
+    #[test]
+    fn sunday_as_zero_is_a_valid_weekly_cron() {
+        let interval = expected_interval_seconds(&["0 5 * * 0".to_owned()])
+            .expect("Sunday-as-zero must parse");
+        assert_eq!(interval, 604_800);
+    }
+
+    #[test]
+    fn sunday_as_seven_is_a_valid_weekly_cron() {
+        let interval = expected_interval_seconds(&["0 5 * * 7".to_owned()])
+            .expect("Sunday-as-seven must parse");
+        assert_eq!(interval, 604_800);
+    }
+
+    // Every POSIX day-of-week number must round-trip to a weekly cadence.
+    #[test]
+    fn every_posix_weekday_yields_seven_days() {
+        for dow in 0..=7 {
+            let interval = expected_interval_seconds(&[format!("0 5 * * {dow}")])
+                .unwrap_or_else(|| panic!("day-of-week {dow} must parse"));
+            assert_eq!(interval, 604_800, "day-of-week {dow}");
+        }
+    }
+
+    // A monthly cron has no single interval: consecutive fires are 28..=31
+    // days apart. The staleness alert downstream compares elapsed time against
+    // this value, so it must be the LONGEST legitimate gap. Anchoring on the
+    // Unix epoch previously returned the length of whichever 1970 month the
+    // first two fires landed in -- 28 days for `0 0 1 * *`, which made every
+    // monthly workflow look permanently three days late.
+    #[test]
+    fn monthly_cron_uses_the_longest_calendar_month() {
+        let interval = expected_interval_seconds(&["0 0 1 * *".to_owned()])
+            .expect("monthly cron must resolve");
+        assert_eq!(interval, 31 * 86_400);
+    }
+
+    #[test]
+    fn monthly_cron_interval_is_independent_of_the_hour_field() {
+        let midnight = expected_interval_seconds(&["0 0 1 * *".to_owned()])
+            .expect("monthly cron must resolve");
+        let morning = expected_interval_seconds(&["0 6 1 * *".to_owned()])
+            .expect("monthly cron must resolve");
+        assert_eq!(midnight, morning);
+    }
+
+    // The combination that broke fredsystems/nixos: a weekly Sunday cron and a
+    // monthly cron on the same workflow. The weekly one failed to parse, so
+    // the workflow was monitored against a ~monthly baseline despite running
+    // every week.
+    #[test]
+    fn weekly_sunday_cron_wins_over_a_monthly_cron() {
+        let interval = expected_interval_seconds(&["0 6 1 * *".to_owned(), "0 5 * * 0".to_owned()])
+            .expect("interval");
+        assert_eq!(interval, 604_800);
+    }
+
+    // Mon-Fri fires five times a week, but the gap that matters for staleness
+    // is Friday -> Monday.
+    #[test]
+    fn weekday_only_cron_uses_the_weekend_gap() {
+        let interval = expected_interval_seconds(&["0 5 * * 1-5".to_owned()]).expect("interval");
+        assert_eq!(interval, 3 * 86_400);
     }
 
     fn wf(name: &str, triggers: &[&str]) -> rest::Workflow {
