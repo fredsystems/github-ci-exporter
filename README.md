@@ -36,15 +36,73 @@ per repository, reduced to the newest run per workflow client-side.
 GraphQL's `author.__typename`, which reports `Bot` for GitHub Apps. New
 automation is classified correctly without a configuration change.
 
+## The runs listing is only eventually consistent
+
+Every query parameter that *filters* `/actions/runs` — `branch=`, `event=` — is
+answered from an index that lags the run history. It intermittently returns a
+**partial, stale, or empty** result set, as a well-formed `200` with a matching
+`total_count`, so nothing in the response distinguishes it from a complete one.
+
+Measured against `fredsystems/freminal`'s `nightly.yml`, whose true newest run
+was known independently, 20 samples per query shape:
+
+| Query shape                        | Correct | Wrong answers           |
+| ---------------------------------- | ------- | ----------------------- |
+| `?branch=main`                     | 16/20   | runs up to 6 days stale |
+| `?event=schedule`                  | 13/20   | stale runs, and 3 empty |
+| `?per_page=100` (no filter)        | 20/20   | —                       |
+| `/workflows/{id}/runs` (no filter) | 20/20   | —                       |
+
+On `sdr-enthusiasts/docker-beast-splitter`, whose `?branch=main` `total_count`
+is truly 264, fifty samples returned 0, 23, 30, 92, 111, 133, 135, 190, 192,
+206 and 264 — roughly one in ten empty. The unfiltered listing returned the
+same complete answer on every sample of every repository tried.
+
+This was not academic. A truncated page that drops a workflow's recent runs but
+keeps an older failing one makes that failure the newest run the reducer can
+see. `update-flakes` on `docker-beast-splitter` ran green on main on 07-26,
+08-02, 08-09 and 08-16; a truncated page kept only the 07-12 failure, and at 38
+days that is inside the 90-day staleness horizon, so it was not even masked as
+`stale`. It published `conclusion="failure"` for a green workflow and paged. The
+same truncation regresses `workflow_run_timestamp_seconds`, which fires the
+staleness alert, and a page that omits a workflow entirely makes its series
+vanish for a cycle — the "workflows appear for a round or two and then
+disappear" shape.
+
+Three mechanisms address it:
+
+- **No server-side filters.** The runs listing is fetched unfiltered and the
+  branch and event are selected client-side, against data the API reports
+  consistently.
+- **A per-workflow top-up.** Without `branch=`, the shared page is diluted by
+  pull-request runs and no longer reaches back far enough on a busy repository —
+  one page of `fredsystems/nixos` spans about a day and speaks for 5 of its 14
+  workflows. Any workflow the shared page did not cover is fetched from
+  `/actions/workflows/{id}/runs`, whose history is not diluted by its siblings.
+  Workflows GitHub never runs against the default branch are excluded, which is
+  what keeps this affordable.
+- **Reconciliation across cycles.** Run history is append-only: a workflow's
+  newest run can move forward or stay put, but it cannot move backwards, and it
+  cannot vanish while the workflow file exists. A response violating either is
+  not news, it is evidence of truncation, so the previous observation is kept.
+  This turns every truncation into one cycle of staleness instead of a
+  fabricated regression that pages. Ties go to the fresh observation, because a
+  re-run keeps its original `created_at` while its conclusion changes.
+
 ## Rate-limit behaviour
 
 Every request carries an `If-None-Match`. A `304 Not Modified` is not charged
-against the rate limit, so a steady-state cycle is nearly free:
+against the rate limit, which is what makes a steady-state cycle nearly free
+regardless of how many requests it issues.
 
-| Cycle       | Requests | 304s | Core budget spent |
-| ----------- | -------- | ---- | ----------------- |
-| Cold start  | 378      | 0    | 305               |
-| Steady state| 378      | 371  | 5                 |
+A cycle's REST cost is, per repository, the workflow list plus one shared runs
+page; and per workflow, the definition lookup plus at most one top-up runs
+request. For the current fleet — 61 repositories, 239 workflows — that is a
+worst case of a few hundred requests against a 5000/hour allowance, of which
+only the ones whose content actually changed are charged. The pre-flight
+estimate in `collector.rs` prices exactly these terms; it deliberately
+overestimates, since the cost of guessing high is an early skip rather than a
+wrong answer.
 
 The `core` (REST) and `graphql` pools are tracked separately, since each has
 its own independent 5000/hour allowance.
@@ -182,7 +240,9 @@ per workflow produced 38 "failures", of which fewer than half were real:
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Workflow must still exist     | GitHub keeps run history after a workflow file is deleted. A removed `Update pre-commit hooks` reported a permanent failure across 10 repositories.                                                    |
 | Identity is the file path     | Runs predating a workflow's `name:` report the path instead, splitting one workflow into two series.                                                                                                   |
-| Branch-state events only      | The API's `branch=` filter matches a pull request's *head* branch, so PR runs leak in. A merged PR's last pre-merge failure would otherwise be the branch's CI state forever.                          |
+| Default branch only           | Selected client-side, because `?branch=` is answered from an eventually-consistent index (see above). A run's `head_branch` must equal the repository's default branch.                                 |
+| Branch-state events only      | A pull request's `head_branch` equals the default branch whenever it is opened from a fork's own default branch, so branch matching alone lets PR runs in. A merged PR's last pre-merge failure would otherwise be the branch's CI state forever. |
+| Runs cannot move backwards    | Run history is append-only, so a newest run older than one already observed proves the response was truncated. The earlier observation is kept, costing one cycle of freshness instead of a false alert. |
 | Runs age out after 90 days    | Some workflows only fire on `pull_request`, leaving a branch-state run many months old. Those report `conclusion="stale"` and set `github_workflow_run_stale`, rather than an unclearable failure.      |
 | Event must still be declared  | Run history outlives a trigger change. `frext` and `bike-fitter-1000` both showed failing `push` runs for a `ci.yml` that now declares only `pull_request`. Each run's event is checked against the workflow file's current `on:` block. |
 | Disabled workflows are kept   | A workflow auto-disabled by GitHub after 60 days of inactivity has stopped running silently. That is the fault worth alerting on, so it is reported rather than filtered out.                          |

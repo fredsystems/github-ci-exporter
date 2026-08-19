@@ -24,17 +24,38 @@ const ESTIMATED_GRAPHQL_REQUESTS: u64 = 8;
 /// known, i.e. the very first cycle after start.
 const ASSUMED_FIRST_CYCLE_REPOS: u64 = 80;
 
+/// Workflow files assumed present before the first cycle has counted them.
+///
+/// The fleet runs about four per repository; rounding up keeps the first
+/// cycle's estimate pessimistic, which is the safe direction.
+const ASSUMED_WORKFLOWS_PER_REPO: u64 = 5;
+
 /// Estimates the REST budget a cycle will consume.
 ///
-/// Two requests per repository (workflow list + runs list), plus headroom for
-/// the cron-schedule lookups performed for newly-seen repositories.
-const fn estimate_core_requests(monitored: u64) -> u64 {
+/// Per repository: the workflow list, plus the shared runs page. Per workflow:
+/// the definition lookup, plus at most one top-up runs request for a workflow
+/// the shared page did not cover.
+///
+/// The per-workflow terms used to be folded into a flat `+50` of headroom,
+/// which understated a cold sweep of the current fleet by roughly a factor of
+/// four -- 239 workflows cost 239 definition lookups whatever the repository
+/// count says. In practice almost all of them answer `304`, which GitHub does
+/// not charge, so this is a cold-cache worst case rather than the steady state.
+const fn estimate_core_requests(monitored: u64, workflows: u64) -> u64 {
     let repos = if monitored == 0 {
         ASSUMED_FIRST_CYCLE_REPOS
     } else {
         monitored
     };
-    repos.saturating_mul(2).saturating_add(50)
+    let workflows = if workflows == 0 {
+        repos.saturating_mul(ASSUMED_WORKFLOWS_PER_REPO)
+    } else {
+        workflows
+    };
+    repos
+        .saturating_mul(2)
+        .saturating_add(workflows.saturating_mul(2))
+        .saturating_add(50)
 }
 
 /// Cached per-repository workflow metadata.
@@ -56,9 +77,36 @@ pub struct WorkflowCache {
     /// runs of deleted workflows forever, and reporting them shows failures
     /// for CI that no longer exists.
     workflows: HashMap<String, Vec<rest::Workflow>>,
+    /// Last-known-good run reduction per `owner/name`, with the inputs that
+    /// produced it.
+    ///
+    /// Retained because GitHub's runs listing is only eventually consistent, so
+    /// a single response can be silently incomplete. Reconciling each cycle
+    /// against the previous one is the only way to tell an incomplete page from
+    /// a real change -- see [`rest::RepoRuns::reconciled_with`].
+    ///
+    /// The [`rest::ReductionInputs`] are stored alongside and checked before the
+    /// reduction is reused, for exactly the reason the `ETag` cache keys on them
+    /// too: a retained reduction that outlives its inputs is a fossil. Without
+    /// the check, renaming the default branch would keep publishing runs
+    /// selected against the old one, and dropping a workflow's `push` trigger
+    /// would keep publishing its last `push` run -- resurrecting the two classes
+    /// of stale data that `reduce_runs`'s filters exist to remove.
+    ///
+    /// Deliberately not persisted with the `ETag` cache. A restart therefore
+    /// starts with no high-water mark and trusts its first response, which is
+    /// the correct trade: the alternative is carrying a possibly-wrong retained
+    /// value across a deploy with no way to ever revise it downwards.
+    runs: HashMap<String, (rest::ReductionInputs, rest::RepoRuns)>,
     /// Repositories monitored by the previous cycle, used to size the
     /// budget pre-flight check.
     monitored_count: u64,
+    /// Workflow files seen across all monitored repositories last cycle.
+    ///
+    /// The per-workflow requests -- the definition lookup, and the top-up in
+    /// [`fetch_repo_runs`] -- scale with this rather than with the repository
+    /// count, so the budget estimate needs it to be anything but a guess.
+    workflow_count: u64,
     /// Pull requests the operator has declared unactionable, parsed once.
     ///
     /// The raw strings are validated at startup, so re-parsing them every
@@ -72,6 +120,12 @@ impl WorkflowCache {
     #[must_use]
     pub const fn monitored_count(&self) -> u64 {
         self.monitored_count
+    }
+
+    /// Workflow files seen last cycle; 0 before the first completes.
+    #[must_use]
+    pub const fn workflow_count(&self) -> u64 {
+        self.workflow_count
     }
 
     /// The parsed ignore list, resolved on first use.
@@ -130,7 +184,7 @@ pub async fn collect(
     // a partially-rebuilt registry: some repositories updated, others cleared
     // and never refilled, which reads as "CI vanished" on the dashboard. It is
     // strictly better to skip the cycle whole and keep the previous values.
-    let estimated_core = estimate_core_requests(cache.monitored_count());
+    let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count());
     if !client.can_afford(RateLimitResource::Core, estimated_core)
         || !client.can_afford(RateLimitResource::GraphQl, ESTIMATED_GRAPHQL_REQUESTS)
     {
@@ -201,7 +255,14 @@ pub async fn collect(
         Err(error) => error!(%error, "failed to fetch issue/PR activity"),
     }
 
-    // Actions runs, one request per repository.
+    // Actions runs.
+    //
+    // Counted as `usize` and converted once below. Accumulating in `u64` would
+    // need a fallible conversion per repository, and neither fallback is right:
+    // saturating low understates the budget estimate the count exists to raise,
+    // and saturating high poisons the running total so the pre-flight check
+    // bypasses every subsequent cycle.
+    let mut workflow_count = 0usize;
     for repo in &monitored {
         let live = cache
             .workflows
@@ -219,15 +280,18 @@ pub async fn collect(
             );
             continue;
         }
+        workflow_count = workflow_count.saturating_add(live.len());
         record_workflow_states(metrics, repo, &live);
-        match rest::fetch_runs(client, repo, &live).await {
-            Ok(runs) => record_runs(metrics, repo, &runs, cache, now),
-            Err(error) => warn!(repo = %repo, %error, "failed to fetch workflow runs"),
+        if let Some(runs) = fetch_repo_runs(client, repo, &live, cache).await {
+            record_runs(metrics, repo, &runs, cache, now);
         }
     }
 
     // Self-monitoring.
     cache.monitored_count = u64::try_from(monitored.len()).unwrap_or(u64::MAX);
+    // Saturating high, matching `monitored_count`: overestimating the budget
+    // costs an early skip, underestimating it costs a half-applied cycle.
+    cache.workflow_count = u64::try_from(workflow_count).unwrap_or(u64::MAX);
     record_budget_metrics(client, metrics);
     metrics.scrape_duration.set(started.elapsed().as_secs_f64());
     metrics.scrape_success.set(1);
@@ -241,6 +305,93 @@ pub async fn collect(
     }
 
     Ok(CycleOutcome::Complete)
+}
+
+/// Collects one repository's default-branch run state.
+///
+/// Three stages, each closing a hole the previous one leaves:
+///
+/// 1. **One shared page** of the repository's run history
+///    ([`rest::fetch_runs`]). Unfiltered, because every filter GitHub offers on
+///    that endpoint is answered from an eventually-consistent index -- see the
+///    [`rest`] module's "Why no server-side filters".
+/// 2. **A top-up per uncovered workflow** ([`rest::fetch_workflow_runs`]).
+///    Dropping the `branch=` filter means that shared page is diluted by pull
+///    request runs, so on a busy repository it no longer reaches back far
+///    enough to cover an infrequent scheduled workflow: one page of
+///    `fredsystems/nixos` spans about a day and speaks for 5 of its 14
+///    workflows. A workflow's own history is not diluted, so one page of it
+///    settles the question.
+/// 3. **Reconciliation against the previous cycle**
+///    ([`rest::RepoRuns::reconciled_with`]), which is what makes an incomplete
+///    response cost one cycle of freshness instead of publishing a regression.
+///
+/// Workflows GitHub never runs against the default branch are excluded before
+/// any of this. The reduction already discards their runs, so fetching on their
+/// behalf could only ever produce nothing -- and they are the majority of
+/// PR-only workflows, which is what keeps the top-up affordable.
+///
+/// Returns `None` when the shared page could not be fetched at all, which is
+/// the one case with nothing trustworthy to publish.
+async fn fetch_repo_runs(
+    client: &Client,
+    repo: &Repo,
+    live: &[rest::Workflow],
+    cache: &mut WorkflowCache,
+) -> Option<rest::RepoRuns> {
+    let full_name = repo.full_name();
+
+    let fresh = match rest::fetch_runs(client, repo, live).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            warn!(repo = %repo, %error, "failed to fetch workflow runs");
+            // Deliberately not falling back to the retained value. A fetch
+            // failure is already reported by `scrape_success`, and republishing
+            // last cycle's numbers as though they were fresh is how a GitHub
+            // outage comes to look like a healthy fleet.
+            return None;
+        }
+    };
+
+    // Resolved against the shared page before any top-up runs, because a top-up
+    // for one workflow can only ever report on that workflow -- so re-checking
+    // coverage as they land could not change the answer for any of the others.
+    let uncovered: Vec<&rest::Workflow> = live
+        .iter()
+        .filter(|w| w.default_branch_signal() != rest::DefaultBranchSignal::None)
+        .filter(|w| !fresh.covers(&w.name))
+        .collect();
+
+    let mut runs = fresh;
+    for workflow in uncovered {
+        match rest::fetch_workflow_runs(client, repo, workflow).await {
+            Ok(topped_up) => runs = topped_up.reconciled_with(&runs, live),
+            // One workflow's top-up failing leaves that workflow reported from
+            // whatever the shared page and the retained state already say,
+            // which is strictly better than discarding the repository.
+            Err(error) => {
+                warn!(repo = %repo, workflow = workflow.path, %error, "failed to top up workflow runs");
+            }
+        }
+    }
+
+    // Reused only under the inputs that produced it. A mismatch costs one cycle
+    // of truncation protection, which is the same price the `ETag` cache pays
+    // for a fingerprint change, and is far cheaper than publishing a run
+    // selected against a branch or a trigger set that no longer applies.
+    let inputs = rest::ReductionInputs::of(repo, live);
+    match cache.runs.get(&full_name) {
+        Some((previous_inputs, previous)) if *previous_inputs == inputs => {
+            runs = runs.reconciled_with(previous, live);
+        }
+        Some(_) => debug!(
+            repo = %repo,
+            "discarding the retained reduction: the branch or workflow set changed"
+        ),
+        None => {}
+    }
+    cache.runs.insert(full_name, (inputs, runs.clone()));
+    Some(runs)
 }
 
 /// Publishes rate-limit and request-accounting metrics.
@@ -344,6 +495,10 @@ async fn resolve_monitored(
 
         if workflows.is_empty() && config.skip_repos_without_workflows {
             cache.workflows.remove(&key);
+            // Dropped together: a repository that no longer has CI must not
+            // leave a retained reduction behind for `reconciled_with` to
+            // resurrect if it later regains a workflow file.
+            cache.runs.remove(&key);
             skipped.push((repo, SkipReason::NoWorkflows));
             continue;
         }
@@ -1152,6 +1307,7 @@ mod tests {
 
     fn wf(name: &str, triggers: &[&str]) -> rest::Workflow {
         rest::Workflow {
+            id: 1,
             name: name.to_owned(),
             path: format!(".github/workflows/{name}.yml"),
             state: rest::WorkflowState::Active,
@@ -1274,23 +1430,42 @@ mod tests {
 
     #[test]
     fn first_cycle_estimate_assumes_a_full_fleet() {
-        // Before any cycle completes the repo count is unknown; the estimate
-        // must be pessimistic rather than zero.
-        assert_eq!(
-            estimate_core_requests(0),
-            ASSUMED_FIRST_CYCLE_REPOS * 2 + 50
-        );
+        // Before any cycle completes neither count is known; the estimate must
+        // be pessimistic rather than zero, on both terms.
+        let repos = ASSUMED_FIRST_CYCLE_REPOS;
+        let workflows = repos * ASSUMED_WORKFLOWS_PER_REPO;
+        assert_eq!(estimate_core_requests(0, 0), repos * 2 + workflows * 2 + 50);
     }
 
     #[test]
     fn estimate_scales_with_monitored_repositories() {
-        assert_eq!(estimate_core_requests(61), 172);
-        assert!(estimate_core_requests(61) < estimate_core_requests(100));
+        assert_eq!(estimate_core_requests(61, 239), 650);
+        assert!(estimate_core_requests(61, 239) < estimate_core_requests(100, 239));
+    }
+
+    #[test]
+    fn estimate_scales_with_workflow_count() {
+        // Regression guard: the per-workflow requests -- one definition lookup
+        // each, plus at most one top-up -- were folded into a flat `+50`, which
+        // understated a cold sweep of the fleet roughly fourfold. A repository
+        // count alone cannot price them.
+        assert!(estimate_core_requests(61, 239) > estimate_core_requests(61, 61));
+    }
+
+    #[test]
+    fn estimate_assumes_workflows_when_only_the_repo_count_is_known() {
+        // A cycle that saw repositories but counted no workflows has not
+        // completed its run stage, so the workflow term must still be assumed.
+        assert_eq!(
+            estimate_core_requests(10, 0),
+            10 * 2 + 10 * ASSUMED_WORKFLOWS_PER_REPO * 2 + 50
+        );
     }
 
     #[test]
     fn estimate_cannot_overflow() {
-        assert_eq!(estimate_core_requests(u64::MAX), u64::MAX);
+        assert_eq!(estimate_core_requests(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(estimate_core_requests(u64::MAX, 0), u64::MAX);
     }
 
     /// One repository with one open, non-draft, conflicting PR -- i.e. one that
@@ -1503,6 +1678,7 @@ mod tests {
         cache.workflows.insert(
             repo.full_name(),
             vec![rest::Workflow {
+                id: 1,
                 name: name.to_owned(),
                 path: format!(".github/workflows/{name}.yml"),
                 state: rest::WorkflowState::Active,
@@ -1609,5 +1785,493 @@ mod tests {
             "a non-budget failure must not claim the budget was exhausted:\n{rendered}"
         );
         assert!(rendered.contains("github_exporter_scrape_success 0"));
+    }
+
+    // ---- fetch_repo_runs -------------------------------------------------
+    //
+    // The three-stage collection: one shared unfiltered page, a per-workflow
+    // top-up for what it did not cover, and reconciliation against the previous
+    // cycle. Driven through a mock API because the interesting behaviour is
+    // which requests get issued, not just how a response reduces.
+
+    /// A workflow set of one scheduled workflow, addressed by id 42.
+    fn scheduled_workflow() -> Vec<rest::Workflow> {
+        vec![rest::Workflow {
+            id: 42,
+            name: "update-flakes".to_owned(),
+            path: ".github/workflows/update-flakes.yaml".to_owned(),
+            state: rest::WorkflowState::Active,
+            triggers: vec!["schedule".to_owned(), "workflow_dispatch".to_owned()],
+        }]
+    }
+
+    /// A PR-only workflow, which GitHub never runs against the default branch.
+    fn pr_only_workflow() -> rest::Workflow {
+        rest::Workflow {
+            id: 99,
+            name: "Lint".to_owned(),
+            path: ".github/workflows/lint.yaml".to_owned(),
+            state: rest::WorkflowState::Active,
+            triggers: vec!["pull_request".to_owned(), "merge_group".to_owned()],
+        }
+    }
+
+    fn test_repo() -> Repo {
+        Repo {
+            owner: "sdr-enthusiasts".to_owned(),
+            name: "docker-beast-splitter".to_owned(),
+            default_branch: "main".to_owned(),
+        }
+    }
+
+    /// A runs listing holding one `schedule` run of `update-flakes`.
+    fn runs_body(conclusion: &str, created: &str) -> serde_json::Value {
+        serde_json::json!({
+            "workflow_runs": [{
+                "path": ".github/workflows/update-flakes.yaml",
+                "head_branch": "main",
+                "status": "completed",
+                "conclusion": conclusion,
+                "event": "schedule",
+                "created_at": created,
+                "html_url": "https://github.com/o/r/actions/runs/1",
+            }]
+        })
+    }
+
+    fn client_for(server: &wiremock::MockServer) -> Client {
+        Client::new("t", &server.uri(), &format!("{}/graphql", server.uri()))
+            .expect("client builds")
+    }
+
+    #[tokio::test]
+    async fn a_workflow_the_shared_page_missed_is_topped_up() {
+        // Dropping the `branch=` filter means the shared page is diluted by
+        // pull-request runs, so on a busy repository it no longer reaches back
+        // far enough to cover an infrequent scheduled workflow -- one page of
+        // fredsystems/nixos spans about a day and speaks for 5 of its 14. The
+        // workflow's own history is not diluted, so it settles the question.
+        let server = wiremock::MockServer::start().await;
+        // The shared page: real runs, but none of them this workflow's.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cache = WorkflowCache::default();
+        let runs = fetch_repo_runs(
+            &client_for(&server),
+            &test_repo(),
+            &scheduled_workflow(),
+            &mut cache,
+        )
+        .await
+        .expect("the shared page succeeded");
+
+        assert_eq!(runs.latest.len(), 1, "the top-up must supply the workflow");
+        assert_eq!(runs.latest[0].workflow, "update-flakes");
+    }
+
+    #[tokio::test]
+    async fn no_top_up_is_issued_for_a_workflow_the_page_covered() {
+        // The top-up is per uncovered workflow; spending a request for one the
+        // shared page already spoke for would multiply the fleet's cost for
+        // nothing. `.expect(0)` on the per-workflow route is the assertion.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cache = WorkflowCache::default();
+        let runs = fetch_repo_runs(
+            &client_for(&server),
+            &test_repo(),
+            &scheduled_workflow(),
+            &mut cache,
+        )
+        .await
+        .expect("fetch succeeds");
+        assert_eq!(runs.latest.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pr_only_workflow_is_never_topped_up() {
+        // Its runs are discarded by the reduction anyway, so a top-up could
+        // only ever return something unusable. These are the majority of the
+        // fleet's uncovered workflows, so skipping them is what keeps the
+        // top-up affordable at all.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/99/runs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cache = WorkflowCache::default();
+        let runs = fetch_repo_runs(
+            &client_for(&server),
+            &test_repo(),
+            &[pr_only_workflow()],
+            &mut cache,
+        )
+        .await
+        .expect("fetch succeeds");
+        assert!(runs.latest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_later_truncated_cycle_cannot_regress_a_published_run() {
+        // The end-to-end shape of the alert that paged. Cycle one observes the
+        // 08-16 success. Cycle two gets a truncated page whose newest
+        // update-flakes run is the 07-12 failure -- 38 days old, so inside
+        // STALE_RUN_AGE and therefore published as an outright `failure` rather
+        // than masked as stale. The retained observation must win.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Cycle two: the truncated page, with the fossil failure as its newest.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-07-12T07:30:11Z")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let live = scheduled_workflow();
+        let mut cache = WorkflowCache::default();
+
+        let first = fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle one");
+        assert_eq!(
+            first.latest[0].conclusion,
+            crate::model::RunConclusion::Success
+        );
+
+        let second = fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle two");
+        assert_eq!(
+            second.latest[0].conclusion,
+            crate::model::RunConclusion::Success,
+            "a truncated page must not publish a fossil failure"
+        );
+        assert_eq!(
+            second.latest[0].created_at.to_rfc3339(),
+            "2026-08-16T05:31:31+00:00",
+            "nor regress the timestamp the staleness alert reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_shared_page_publishes_nothing_rather_than_stale_data() {
+        // `scrape_success` already reports the failure. Republishing the
+        // retained reduction as though it were fresh is how a GitHub outage
+        // comes to look like a healthy fleet.
+        //
+        // 404 rather than 500 deliberately: a 5xx is retryable, so it would
+        // spend this test in `classify_retry`'s exponential backoff -- 14
+        // seconds of real sleeping for an assertion that has nothing to do with
+        // retrying.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let mut cache = WorkflowCache::default();
+        assert!(
+            fetch_repo_runs(
+                &client_for(&server),
+                &test_repo(),
+                &scheduled_workflow(),
+                &mut cache,
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_losing_its_workflows_drops_its_retained_runs() {
+        // Otherwise a repository that goes quiet keeps a retained reduction
+        // that `reconciled_with` would resurrect if it ever regained a
+        // workflow file.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-07-12T07:30:11Z")),
+            )
+            .mount(&server)
+            .await;
+        // An empty workflow list, which is what retires the repository.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflows": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let mut cache = WorkflowCache::default();
+        fetch_repo_runs(&client, &repo, &scheduled_workflow(), &mut cache)
+            .await
+            .expect("first cycle");
+        assert!(cache.runs.contains_key(&repo.full_name()));
+
+        let config = Config::default();
+        let mut skipped = Vec::new();
+        let monitored = resolve_monitored(
+            &client,
+            &config,
+            &mut cache,
+            vec![repo.clone()],
+            &mut skipped,
+        )
+        .await;
+
+        assert!(monitored.is_empty(), "a repository with no CI is skipped");
+        assert!(
+            !cache.runs.contains_key(&repo.full_name()),
+            "and must not leave a retained reduction behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_the_default_branch_discards_the_retained_reduction() {
+        // The retained reduction is only meaningful under the inputs that
+        // produced it. Keyed by `owner/name` alone, a rename would keep
+        // publishing runs selected against the old branch indefinitely -- until
+        // a newer run on the new branch happened to arrive, or the process
+        // restarted. That is the fossil that `reduce_runs`'s branch filter
+        // exists to prevent, reintroduced through the retained state.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let live = scheduled_workflow();
+        let mut cache = WorkflowCache::default();
+
+        let on_main = fetch_repo_runs(&client, &test_repo(), &live, &mut cache)
+            .await
+            .expect("cycle on main");
+        assert_eq!(on_main.latest.len(), 1);
+
+        // Same repository, new default branch. Every run in the response is on
+        // `main`, so nothing legitimately describes `trunk` yet.
+        let mut renamed = test_repo();
+        renamed.default_branch = "trunk".to_owned();
+        let on_trunk = fetch_repo_runs(&client, &renamed, &live, &mut cache)
+            .await
+            .expect("cycle on trunk");
+
+        assert!(
+            on_trunk.latest.is_empty(),
+            "a run selected against the old branch must not be carried forward: {:?}",
+            on_trunk.latest
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_trigger_discards_the_retained_reduction() {
+        // Run history outlives a trigger change, which is why `reduce_runs`
+        // checks each run's event against the workflow's current `on:` block.
+        // The retained reduction has to honour the same rule: a workflow that
+        // no longer runs on `schedule` must stop reporting its last `schedule`
+        // run, rather than having it carried forward forever.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let mut cache = WorkflowCache::default();
+
+        let cadenced = fetch_repo_runs(&client, &repo, &scheduled_workflow(), &mut cache)
+            .await
+            .expect("cycle with a schedule trigger");
+        assert_eq!(cadenced.latest.len(), 1, "a schedule run is branch state");
+
+        // The same workflow file now declares only `workflow_dispatch`, so its
+        // old `schedule` runs describe a configuration that no longer exists.
+        let mut retriggered = scheduled_workflow();
+        retriggered[0].triggers = vec!["workflow_dispatch".to_owned()];
+        let after = fetch_repo_runs(&client, &repo, &retriggered, &mut cache)
+            .await
+            .expect("cycle after the trigger change");
+
+        assert!(
+            after.latest.is_empty(),
+            "a run from a superseded trigger must not be carried forward: {:?}",
+            after.latest
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_inputs_still_reconcile_across_cycles() {
+        // The invalidation must be narrow: if it fired on every cycle the
+        // truncation guard would never engage at all, which is the whole point
+        // of retaining the reduction.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let live = scheduled_workflow();
+        let mut cache = WorkflowCache::default();
+
+        fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle one");
+        let second = fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle two");
+
+        assert_eq!(
+            second.latest.len(),
+            1,
+            "an empty second response must be recognised as a lost update"
+        );
     }
 }
