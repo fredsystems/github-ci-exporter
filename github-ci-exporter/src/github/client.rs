@@ -170,7 +170,10 @@ struct CacheEntry {
 /// * 1 -- initial versioned format.
 /// * 2 -- `reduce_runs` drops workflows whose declared triggers make them
 ///   `DefaultBranchSignal::None`. Same shape, different contents.
-const CACHE_FORMAT_VERSION: u32 = 2;
+/// * 3 -- the runs listing is no longer filtered by `branch=` server-side, so
+///   the reduction selects the branch itself; and `Workflow` gained the numeric
+///   `id` the per-workflow top-up addresses. Both a shape and a meaning change.
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Versioned envelope for the persisted cache, as read from disk.
 ///

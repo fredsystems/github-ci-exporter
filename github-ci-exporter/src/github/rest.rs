@@ -9,6 +9,44 @@
 //! One `GET /repos/{o}/{r}/actions/runs?per_page=100` per repository, with the
 //! latest run per workflow selected client-side, costs one request per repo
 //! instead of one per workflow (61 vs 239 for the current fleet).
+//!
+//! # Why no server-side filters
+//!
+//! Every query parameter that *filters* this endpoint -- `branch=`, `event=`
+//! -- is answered from an index that is only eventually consistent with the
+//! run history. It intermittently returns a **partial, stale, or empty** result
+//! set, as a perfectly well-formed `200` with a `total_count` to match, so
+//! there is nothing in the response that distinguishes it from a complete one.
+//!
+//! Measured against `fredsystems/freminal`'s `nightly.yml`, whose true newest
+//! run was known independently, 20 samples per query shape:
+//!
+//! | Query shape                        | Correct | Wrong answers                |
+//! | ---------------------------------- | ------- | ---------------------------- |
+//! | `?branch=main`                     | 16/20   | runs up to 6 days stale      |
+//! | `?event=schedule`                  | 13/20   | stale runs, and 3 empty      |
+//! | `?per_page=100` (no filter)        | 20/20   | --                           |
+//! | `/workflows/{id}/runs` (no filter) | 20/20   | --                           |
+//!
+//! And on `sdr-enthusiasts/docker-beast-splitter`, whose `?branch=main`
+//! `total_count` is truly 264, fifty samples returned: 0, 23, 30, 92, 111,
+//! 133, 135, 190, 192, 206, 264. Roughly one in ten was empty. The unfiltered
+//! listing returned 341 on every sample of every repository tried.
+//!
+//! This was not a cosmetic problem. A truncated page that drops a workflow's
+//! recent runs but keeps an older failing one makes that failure the newest run
+//! the reducer can see, so the exporter published `conclusion="failure"` for a
+//! green workflow -- `update-flakes` on `docker-beast-splitter` really ran
+//! green on 07-26, 08-02, 08-09 and 08-16, and a truncated page kept only the
+//! 07-12 failure. At 38 days that is inside [`STALE_RUN_AGE`], so it was not
+//! even masked as `stale`; it paged. The same truncation regresses
+//! `workflow_run_timestamp_seconds`, which fires the staleness alert, and a
+//! page that omits a workflow altogether makes its series vanish for a cycle.
+//!
+//! So: **fetch unfiltered, filter here.** The branch and the event are decided
+//! by [`reduce_runs`] against data the API is willing to report consistently.
+//! [`RepoRuns::reconciled_with`] then closes the residual gap, because
+//! "unfiltered is exact in every sample" is not the same as a guarantee.
 
 use std::collections::HashMap;
 
@@ -39,6 +77,7 @@ struct WorkflowsResponse {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowEntry {
+    id: u64,
     name: String,
     path: String,
     state: String,
@@ -84,6 +123,17 @@ impl WorkflowState {
 /// than the full API response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workflow {
+    /// GitHub's numeric workflow id.
+    ///
+    /// Carried so the per-workflow runs listing can be addressed unambiguously
+    /// when [`fetch_runs`]'s single repository page does not reach far enough
+    /// back to cover this workflow. The endpoint also accepts the file's
+    /// basename, but an id needs no path handling and no URL escaping.
+    ///
+    /// Deliberately *not* `#[serde(default)]`: an entry persisted before this
+    /// field existed must fail to decode and be refetched rather than
+    /// deserialise to id 0 and 404 on every top-up.
+    pub id: u64,
     pub name: String,
     pub path: String,
     pub state: WorkflowState,
@@ -217,6 +267,7 @@ pub async fn list_workflows(client: &Client, repo: &Repo) -> Result<Vec<Workflow
                 .into_iter()
                 .filter(|w| w.path.starts_with(".github/workflows"))
                 .map(|w| Workflow {
+                    id: w.id,
                     name: w.name,
                     state: WorkflowState::from_api(&w.state),
                     path: w.path,
@@ -242,6 +293,13 @@ struct RunEntry {
     // live workflow list, keyed by `path`.
     #[serde(default)]
     path: Option<String>,
+    /// Branch the run executed against.
+    ///
+    /// Read because the branch is now selected here rather than by the API; see
+    /// this module's "Why no server-side filters". Nullable in the API, and a
+    /// run with no branch cannot be attributed to the default branch.
+    #[serde(default)]
+    head_branch: Option<String>,
     status: String,
     conclusion: Option<String>,
     event: String,
@@ -279,11 +337,106 @@ pub struct RepoRuns {
     pub last_success: HashMap<String, DateTime<Utc>>,
 }
 
-/// Fetches recent runs on the default branch and reduces them to the latest
-/// run per workflow.
+impl RepoRuns {
+    /// Whether this reduction reported anything for the workflow named `name`.
+    ///
+    /// "Nothing" is genuinely ambiguous: either the workflow has never run
+    /// against the default branch, or the page simply did not reach back far
+    /// enough. The caller resolves it with a per-workflow fetch, which cannot
+    /// be diluted by sibling workflows and so distinguishes the two.
+    #[must_use]
+    pub fn covers(&self, name: &str) -> bool {
+        self.latest.iter().any(|run| run.workflow == name)
+    }
+
+    /// Folds `self` over the previous cycle's reduction, keeping whichever
+    /// observation of each workflow is newer.
+    ///
+    /// Run history is append-only: a workflow's newest run can move forward in
+    /// time or stay put, but it cannot move backwards, and it cannot cease to
+    /// exist while the workflow file does. Nothing in a single response asserts
+    /// either of those, so a response that violates them is not news -- it is
+    /// evidence that the response is incomplete, and the previous observation is
+    /// the better one.
+    ///
+    /// That distinction is the whole point. GitHub's runs listing is only
+    /// eventually consistent (see this module's "Why no server-side filters"),
+    /// and an incomplete page is indistinguishable from a complete one on its
+    /// own terms. Comparing across cycles is the only signal available, and it
+    /// converts every truncation into a lost update -- one cycle of staleness --
+    /// rather than a fabricated regression that pages.
+    ///
+    /// Two rules, both gated on the workflow still being live so that deleting a
+    /// workflow still retires its series:
+    ///
+    /// * A workflow present in both keeps the observation with the later
+    ///   `created_at`. Ties go to `self`, because a re-run of an existing run
+    ///   keeps its original `created_at` while its conclusion changes, and that
+    ///   is a real update that must not be discarded.
+    /// * A workflow present only in `previous` is carried forward.
+    ///
+    /// `last_success` is merged the same way, per workflow, keeping the later
+    /// timestamp.
+    #[must_use]
+    pub fn reconciled_with(mut self, previous: &Self, live: &[Workflow]) -> Self {
+        let live_names: std::collections::HashSet<&str> =
+            live.iter().map(|w| w.name.as_str()).collect();
+
+        for old in &previous.latest {
+            if !live_names.contains(old.workflow.as_str()) {
+                continue;
+            }
+            match self
+                .latest
+                .iter_mut()
+                .find(|run| run.workflow == old.workflow)
+            {
+                Some(fresh) if fresh.created_at < old.created_at => {
+                    debug!(
+                        workflow = old.workflow,
+                        fresh = %fresh.created_at,
+                        retained = %old.created_at,
+                        "discarding a run older than one already observed; the response is incomplete"
+                    );
+                    *fresh = old.clone();
+                }
+                Some(_) => {}
+                None => self.latest.push(old.clone()),
+            }
+        }
+
+        for (workflow, at) in &previous.last_success {
+            if !live_names.contains(workflow.as_str()) {
+                continue;
+            }
+            self.last_success
+                .entry(workflow.clone())
+                .and_modify(|existing| {
+                    if at > existing {
+                        *existing = *at;
+                    }
+                })
+                .or_insert(*at);
+        }
+
+        self.latest.sort_by(|a, b| a.workflow.cmp(&b.workflow));
+        self
+    }
+}
+
+/// Fetches one page of the repository's run history and reduces it to the
+/// latest default-branch run per workflow.
 ///
 /// `live` is the current workflow set from [`list_workflows`]; runs belonging
 /// to workflows absent from it are discarded as orphaned history.
+///
+/// The request carries **no filters** -- see this module's "Why no server-side
+/// filters" for the measurements behind that. The consequence is that this one
+/// page is shared between the default branch and every pull request, so on a
+/// busy repository it can be dominated by PR runs and fail to reach back far
+/// enough to cover an infrequent scheduled workflow. That is what
+/// [`fetch_workflow_runs`] is for; [`RepoRuns::covers`] reports which workflows
+/// this page actually spoke for.
 ///
 /// # Errors
 /// Returns [`ClientError`] if the request fails.
@@ -293,24 +446,72 @@ pub async fn fetch_runs(
     live: &[Workflow],
 ) -> Result<RepoRuns, ClientError> {
     let path = format!(
-        "/repos/{}/{}/actions/runs?per_page={RUNS_PER_PAGE}&branch={}",
-        repo.owner, repo.name, repo.default_branch
+        "/repos/{}/{}/actions/runs?per_page={RUNS_PER_PAGE}",
+        repo.owner, repo.name
     );
-    // The cached value is a *reduction*, and the reduction depends on `live`
-    // as well as on the response. Deleting or renaming a workflow does not
-    // change the runs listing, so the request would answer 304 and replay a
-    // reduction computed against the previous workflow set -- reviving the
-    // orphaned-run bug this reduction exists to prevent. Folding a fingerprint
-    // of `live` into the cache key invalidates the entry whenever the workflow
-    // set changes, at the cost of one uncached fetch after such a change.
-    let cache_key = format!("{path}#wf={}", fingerprint_workflows(live));
-    let (runs, outcome) = client
-        .get_cached_as(&cache_key, &path, |response: RunsResponse| {
-            reduce_runs(response.workflow_runs, live)
-        })
-        .await?;
+    let (runs, outcome) = fetch_reduced(client, repo, &path, live).await?;
     debug!(repo = %repo, ?outcome, workflows = runs.latest.len(), "fetched runs");
     Ok(runs)
+}
+
+/// Fetches one workflow's own run history and reduces it the same way.
+///
+/// Addresses `/actions/workflows/{id}/runs`, again unfiltered. Used to top up
+/// the workflows [`fetch_runs`]'s shared page did not reach. Because a
+/// workflow's own history is not diluted by its siblings, one page of it always
+/// covers the workflow's newest default-branch run if one exists at all.
+///
+/// # Errors
+/// Returns [`ClientError`] if the request fails.
+pub async fn fetch_workflow_runs(
+    client: &Client,
+    repo: &Repo,
+    workflow: &Workflow,
+) -> Result<RepoRuns, ClientError> {
+    let path = format!(
+        "/repos/{}/{}/actions/workflows/{}/runs?per_page={RUNS_PER_PAGE}",
+        repo.owner, repo.name, workflow.id
+    );
+    let live = std::slice::from_ref(workflow);
+    let (runs, outcome) = fetch_reduced(client, repo, &path, live).await?;
+    debug!(
+        repo = %repo,
+        workflow = workflow.path,
+        ?outcome,
+        found = runs.latest.len(),
+        "topped up runs for a workflow the repository page did not cover"
+    );
+    Ok(runs)
+}
+
+/// Issues a runs request and reduces it, with the cache keyed by every input
+/// the reduction reads.
+///
+/// The cached value is a *reduction*, so it must be invalidated whenever
+/// anything the reduction depends on changes -- not only when the response
+/// does. Deleting or renaming a workflow does not change the runs listing, so
+/// the request would answer `304` and replay a reduction computed against the
+/// previous workflow set, reviving the orphaned-run bug the reduction exists to
+/// prevent. The default branch is in the key for the same reason: it is now a
+/// reduction input rather than a request parameter, so a repository renaming
+/// its default branch must not replay a reduction computed against the old one.
+async fn fetch_reduced(
+    client: &Client,
+    repo: &Repo,
+    path: &str,
+    live: &[Workflow],
+) -> Result<(RepoRuns, super::client::CacheOutcome), ClientError> {
+    let cache_key = format!(
+        "{path}#branch={}#wf={}",
+        repo.default_branch,
+        fingerprint_workflows(live)
+    );
+    let branch = repo.default_branch.clone();
+    client
+        .get_cached_as(&cache_key, path, move |response: RunsResponse| {
+            reduce_runs(response.workflow_runs, live, &branch)
+        })
+        .await
 }
 
 /// A stable fingerprint of the workflow set's identities and display names.
@@ -354,12 +555,20 @@ fn fingerprint_workflows(live: &[Workflow]) -> u64 {
 /// * `push` -- code landed on the branch.
 /// * `schedule` / `workflow_dispatch` -- ran against the branch as it stands.
 ///
-/// `pull_request` runs are excluded even when the API's `branch=` filter
-/// matches them, because that filter matches the PR's *head* branch. A merged
-/// PR's last pre-merge failure would otherwise be reported as the branch's
-/// current CI state forever, which was observed on both
-/// `fredsystems/pre-commit-checks` and `sdr-enthusiasts/docker-planefence`.
-/// Post-merge health is covered by the `push` run that merging produces.
+/// `pull_request` runs are excluded even though their `head_branch` can equal
+/// the default branch -- that happens whenever the pull request is opened from
+/// a fork's own default branch. A merged PR's last pre-merge failure would
+/// otherwise be reported as the branch's current CI state forever, which was
+/// observed on both `fredsystems/pre-commit-checks` and
+/// `sdr-enthusiasts/docker-planefence`. Post-merge health is covered by the
+/// `push` run that merging produces.
+///
+/// This filter is also what makes matching on `head_branch` alone safe. Of the
+/// three events kept here, none can originate from another repository: a `push`
+/// and a `schedule` are raised by the repository itself, and a
+/// `workflow_dispatch` targets a ref within it. So a surviving run whose
+/// `head_branch` is the default branch really did run against the default
+/// branch of *this* repository.
 ///
 /// `dynamic` is Dependabot's generated security-update runs, each with a
 /// unique name; keeping them would make cardinality unbounded.
@@ -390,7 +599,7 @@ fn is_branch_state_event(event: &str) -> bool {
 /// files declaring the same `name:` therefore collapse into one series. That
 /// is accepted: it does not occur in the monitored organisations, and keying
 /// metrics by file path would make every dashboard and alert harder to read.
-fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
+fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow], default_branch: &str) -> RepoRuns {
     // Workflow identity is the file path, not the display name: a run created
     // before the workflow gained a `name:` reports the path in the name field,
     // and a renamed workflow would otherwise split into two series.
@@ -401,6 +610,13 @@ fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
     let mut last_success: HashMap<String, DateTime<Utc>> = HashMap::new();
 
     for run in runs {
+        // The branch is selected here, not by the API. See this module's "Why
+        // no server-side filters": `?branch=` answers from an index that
+        // intermittently omits recent runs, which turned an old failure into
+        // "the newest run" and paged for a green workflow.
+        if run.head_branch.as_deref() != Some(default_branch) {
+            continue;
+        }
         if !is_branch_state_event(&run.event) {
             continue;
         }
@@ -663,6 +879,7 @@ mod tests {
     ) -> RunEntry {
         RunEntry {
             path: Some(path.to_owned()),
+            head_branch: Some(DEFAULT_BRANCH.to_owned()),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             event: event.to_owned(),
@@ -671,11 +888,24 @@ mod tests {
         }
     }
 
+    /// The default branch every test reduces against.
+    const DEFAULT_BRANCH: &str = "main";
+
+    /// [`reduce_runs`] against [`DEFAULT_BRANCH`].
+    ///
+    /// The branch is now a reduction input rather than a request parameter, and
+    /// threading a literal through every case would say nothing.
+    fn reduce(runs: Vec<RunEntry>, live: &[Workflow]) -> RepoRuns {
+        reduce_runs(runs, live, DEFAULT_BRANCH)
+    }
+
     /// Declares workflows as currently present in the repository.
     fn live(names: &[&str]) -> Vec<Workflow> {
         names
             .iter()
-            .map(|n| Workflow {
+            .enumerate()
+            .map(|(i, n)| Workflow {
+                id: u64::try_from(i).unwrap_or(0) + 1,
                 name: (*n).to_owned(),
                 path: format!(".github/workflows/{n}.yml"),
                 state: WorkflowState::Active,
@@ -688,6 +918,7 @@ mod tests {
     /// One workflow with an explicit trigger list.
     fn live_with_triggers(name: &str, triggers: &[&str]) -> Vec<Workflow> {
         vec![Workflow {
+            id: 1,
             name: name.to_owned(),
             path: format!(".github/workflows/{name}.yml"),
             state: WorkflowState::Active,
@@ -764,7 +995,7 @@ mod tests {
             "2025-12-13T15:55:22Z",
         )];
 
-        let reduced = reduce_runs(
+        let reduced = reduce(
             runs,
             &live_with_triggers(
                 "Lint",
@@ -792,10 +1023,71 @@ mod tests {
             "2026-05-04T20:10:34Z",
         )];
 
-        let reduced = reduce_runs(runs, &live_with_triggers("Deploy", &["workflow_dispatch"]));
+        let reduced = reduce(runs, &live_with_triggers("Deploy", &["workflow_dispatch"]));
 
         assert_eq!(reduced.latest.len(), 1, "dispatch-driven CI is still CI");
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
+    }
+
+    /// A run on a branch other than the default one.
+    fn run_on_branch(name: &str, branch: Option<&str>, created: &str) -> RunEntry {
+        let mut entry = run(name, "completed", Some("failure"), "push", created);
+        entry.head_branch = branch.map(str::to_owned);
+        entry
+    }
+
+    #[test]
+    fn discards_runs_from_other_branches() {
+        // The branch is selected here now, not by the API, because `?branch=`
+        // is answered from an index that intermittently omits recent runs.
+        // Every run the unfiltered listing returns therefore arrives, including
+        // every feature branch's.
+        let runs = vec![
+            run_on_branch("CI", Some("feature/x"), "2026-08-09T00:00:00Z"),
+            run_on_branch(
+                "CI",
+                Some("gh-readonly-queue/main/pr-1"),
+                "2026-08-08T00:00:00Z",
+            ),
+        ];
+        assert!(
+            reduce(runs, &live(&["CI"])).latest.is_empty(),
+            "only the default branch describes default-branch state"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_branch_is_discarded() {
+        // `head_branch` is nullable, and a run that cannot be attributed to a
+        // branch cannot be attributed to the default one.
+        let runs = vec![run_on_branch("CI", None, "2026-08-09T00:00:00Z")];
+        assert!(reduce(runs, &live(&["CI"])).latest.is_empty());
+    }
+
+    #[test]
+    fn a_newer_run_on_another_branch_does_not_mask_the_default_branch() {
+        // The shape that matters: the unfiltered listing is dominated by branch
+        // activity, so the newest run of a workflow is usually *not* on the
+        // default branch. Selecting per workflow before filtering by branch
+        // would report nothing at all for a healthy repository.
+        let runs = vec![
+            run_on_branch("CI", Some("feature/x"), "2026-08-19T00:00:00Z"),
+            run(
+                "CI",
+                "completed",
+                Some("success"),
+                "push",
+                "2026-08-09T00:00:00Z",
+            ),
+        ];
+        let reduced = reduce(runs, &live(&["CI"]));
+
+        assert_eq!(reduced.latest.len(), 1);
+        assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
+        assert_eq!(
+            reduced.latest[0].created_at.to_rfc3339(),
+            "2026-08-09T00:00:00+00:00"
+        );
     }
 
     #[test]
@@ -823,7 +1115,7 @@ mod tests {
                 "2026-08-05T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
+        let reduced = reduce(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest.len(), 2);
         let ci = reduced
@@ -857,7 +1149,7 @@ mod tests {
                 "2026-08-01T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
+        let reduced = reduce(runs, &live(&["CI", "Deploy"]));
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
     }
 
@@ -879,7 +1171,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
+        let reduced = reduce(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Failure);
         assert_eq!(
@@ -910,7 +1202,7 @@ mod tests {
                 "2026-08-01T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["Lint"]));
+        let reduced = reduce(runs, &live(&["Lint"]));
 
         assert_eq!(reduced.latest.len(), 1);
         assert_eq!(
@@ -930,7 +1222,7 @@ mod tests {
                 event,
                 "2026-08-09T00:00:00Z",
             )];
-            let reduced = reduce_runs(runs, &live(&["CI"]));
+            let reduced = reduce(runs, &live(&["CI"]));
             assert_eq!(reduced.latest.len(), 1, "{event} must be kept");
         }
         for event in ["pull_request", "dynamic", "pull_request_target"] {
@@ -941,7 +1233,7 @@ mod tests {
                 event,
                 "2026-08-09T00:00:00Z",
             )];
-            let reduced = reduce_runs(runs, &live(&["CI"]));
+            let reduced = reduce(runs, &live(&["CI"]));
             assert!(reduced.latest.is_empty(), "{event} must be excluded");
         }
     }
@@ -965,7 +1257,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
+        let reduced = reduce(runs, &live(&["CI", "Deploy"]));
 
         assert_eq!(reduced.latest.len(), 1);
         assert_eq!(reduced.latest[0].workflow, "CI");
@@ -980,7 +1272,7 @@ mod tests {
             "push",
             "2026-08-09T00:00:00Z",
         )];
-        let reduced = reduce_runs(runs, &live(&["CI", "Deploy"]));
+        let reduced = reduce(runs, &live(&["CI", "Deploy"]));
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Running);
         assert!(!reduced.latest[0].conclusion.is_failure());
     }
@@ -1006,7 +1298,7 @@ mod tests {
                 "2025-12-14T00:54:24Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI"]));
+        let reduced = reduce(runs, &live(&["CI"]));
 
         assert_eq!(reduced.latest.len(), 1);
         assert_eq!(reduced.latest[0].workflow, "CI");
@@ -1038,7 +1330,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &live(&["CI"]));
+        let reduced = reduce(runs, &live(&["CI"]));
 
         assert_eq!(reduced.latest.len(), 1, "one workflow, one series");
         assert_eq!(reduced.latest[0].workflow, "CI");
@@ -1054,12 +1346,14 @@ mod tests {
         // Both spellings are in active use across the fleet.
         let workflows = vec![
             Workflow {
+                id: 1,
                 name: "Deploy".to_owned(),
                 path: ".github/workflows/deploy.yml".to_owned(),
                 state: WorkflowState::Active,
                 triggers: Vec::new(),
             },
             Workflow {
+                id: 1,
                 name: "Lint".to_owned(),
                 path: ".github/workflows/lint.yaml".to_owned(),
                 state: WorkflowState::Active,
@@ -1084,7 +1378,7 @@ mod tests {
                 "2026-08-09T00:00:00Z",
             ),
         ];
-        let reduced = reduce_runs(runs, &workflows);
+        let reduced = reduce(runs, &workflows);
 
         assert_eq!(reduced.latest.len(), 2, "both extensions must be kept");
     }
@@ -1096,6 +1390,7 @@ mod tests {
         // it for repository inactivity -- the exact condition worth alerting
         // on was the one being hidden.
         let workflows = vec![Workflow {
+            id: 1,
             name: "update-flakes".to_owned(),
             path: ".github/workflows/update-flakes.yaml".to_owned(),
             state: WorkflowState::DisabledInactivity,
@@ -1109,7 +1404,7 @@ mod tests {
             "schedule",
             "2026-08-01T00:47:26Z",
         )];
-        let reduced = reduce_runs(runs, &workflows);
+        let reduced = reduce(runs, &workflows);
 
         assert_eq!(reduced.latest.len(), 1);
         assert!(reduced.latest[0].conclusion.is_failure());
@@ -1146,7 +1441,7 @@ mod tests {
             "push",
             "2025-12-13T13:42:49Z",
         );
-        let reduced = reduce_runs(vec![run], &live(&["Lint"]));
+        let reduced = reduce(vec![run], &live(&["Lint"]));
         let latest = reduced.latest.first().expect("run retained");
 
         let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
@@ -1162,7 +1457,7 @@ mod tests {
             "push",
             "2026-08-01T00:00:00Z",
         );
-        let reduced = reduce_runs(vec![run], &live(&["CI"]));
+        let reduced = reduce(vec![run], &live(&["CI"]));
         let latest = reduced.latest.first().expect("run retained");
 
         let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
@@ -1178,7 +1473,7 @@ mod tests {
             "push",
             "2026-05-12T00:00:00Z",
         );
-        let reduced = reduce_runs(vec![run], &live(&["CI"]));
+        let reduced = reduce(vec![run], &live(&["CI"]));
         let latest = reduced.latest.first().expect("run retained");
 
         // Exactly 90 days is not yet stale; a second past it is.
@@ -1204,12 +1499,14 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_a_workflow_is_renamed() {
         let before = vec![Workflow {
+            id: 1,
             name: "CI".to_owned(),
             path: ".github/workflows/ci.yml".to_owned(),
             state: WorkflowState::Active,
             triggers: Vec::new(),
         }];
         let after = vec![Workflow {
+            id: 1,
             name: "Build".to_owned(),
             path: ".github/workflows/ci.yml".to_owned(),
             state: WorkflowState::Active,
@@ -1276,11 +1573,12 @@ mod tests {
             "2026-08-09T00:00:00Z",
         );
         orphan.path = None;
-        assert!(reduce_runs(vec![orphan], &live(&["CI"])).latest.is_empty());
+        assert!(reduce(vec![orphan], &live(&["CI"])).latest.is_empty());
     }
 
     fn wf(name: &str, triggers: &[&str]) -> Vec<Workflow> {
         vec![Workflow {
+            id: 1,
             name: name.to_owned(),
             path: format!(".github/workflows/{name}.yml"),
             state: WorkflowState::Active,
@@ -1301,7 +1599,7 @@ mod tests {
             "push",
             "2026-06-29T18:23:03Z",
         )];
-        let reduced = reduce_runs(runs, &wf("CI", &["pull_request", "merge_group"]));
+        let reduced = reduce(runs, &wf("CI", &["pull_request", "merge_group"]));
         assert!(
             reduced.latest.is_empty(),
             "a push run must be dropped when the workflow no longer runs on push"
@@ -1317,7 +1615,7 @@ mod tests {
             "push",
             "2026-08-09T00:00:00Z",
         )];
-        let reduced = reduce_runs(runs, &wf("CI", &["push", "pull_request"]));
+        let reduced = reduce(runs, &wf("CI", &["push", "pull_request"]));
         assert_eq!(reduced.latest.len(), 1);
     }
 
@@ -1332,7 +1630,7 @@ mod tests {
             "push",
             "2026-08-09T00:00:00Z",
         )];
-        let reduced = reduce_runs(runs, &wf("CI", &[]));
+        let reduced = reduce(runs, &wf("CI", &[]));
         assert_eq!(reduced.latest.len(), 1);
     }
 
@@ -1433,5 +1731,373 @@ on:
     fn decodes_base64_with_embedded_newlines() {
         let decoded = decode_base64("b246CiAgc2NoZWR1\nbGU6CiAgICAtIGNyb246ICIwIDEyICogKiAqIgo=");
         assert_eq!(parse_crons(&decoded), ["0 12 * * *"]);
+    }
+
+    // ---- coverage and reconciliation -------------------------------------
+    //
+    // Guarding the defect these two exist for: GitHub's runs listing is only
+    // eventually consistent, and an incomplete page is a well-formed 200 that
+    // looks exactly like a complete one.
+
+    /// A reduction asserting `workflow`'s newest run.
+    fn reduction(workflow: &str, conclusion: RunConclusion, created: &str) -> RepoRuns {
+        let created_at: DateTime<Utc> = created.parse().expect("valid timestamp");
+        RepoRuns {
+            latest: vec![LatestRun {
+                workflow: workflow.to_owned(),
+                conclusion,
+                event: "schedule".to_owned(),
+                created_at,
+                html_url: String::new(),
+            }],
+            last_success: HashMap::new(),
+        }
+    }
+
+    fn newest_of(runs: &RepoRuns, workflow: &str) -> Option<(RunConclusion, String)> {
+        runs.latest
+            .iter()
+            .find(|r| r.workflow == workflow)
+            .map(|r| (r.conclusion, r.created_at.to_rfc3339()))
+    }
+
+    #[test]
+    fn covers_reports_whether_a_workflow_was_spoken_for() {
+        let runs = reduction(
+            "update-flakes",
+            RunConclusion::Success,
+            "2026-08-16T05:31:31Z",
+        );
+        assert!(runs.covers("update-flakes"));
+        assert!(
+            !runs.covers("Deploy"),
+            "a workflow the page never mentioned is not covered"
+        );
+    }
+
+    #[test]
+    fn a_truncated_response_cannot_resurrect_an_older_failure() {
+        // THE regression guard for this module.
+        //
+        // `update-flakes` on sdr-enthusiasts/docker-beast-splitter ran green on
+        // main on 07-26, 08-02, 08-09 and 08-16. A `?branch=main` page that
+        // dropped all four but kept the 07-12 failure made that failure the
+        // newest run the reducer could see, so the exporter published
+        // conclusion="failure" for a green workflow -- and at 38 days it was
+        // inside STALE_RUN_AGE, so it was not even masked as `stale`. It paged.
+        //
+        // Run history is append-only, so a newest run that moved *backwards* is
+        // not news; it is proof the response was incomplete.
+        let known = reduction(
+            "update-flakes",
+            RunConclusion::Success,
+            "2026-08-16T05:31:31Z",
+        );
+        let truncated = reduction(
+            "update-flakes",
+            RunConclusion::Failure,
+            "2026-07-12T07:30:11Z",
+        );
+
+        let reconciled = truncated.reconciled_with(&known, &live(&["update-flakes"]));
+
+        assert_eq!(
+            newest_of(&reconciled, "update-flakes"),
+            Some((
+                RunConclusion::Success,
+                "2026-08-16T05:31:31+00:00".to_owned()
+            )),
+            "an older observation must not overwrite a newer one"
+        );
+    }
+
+    #[test]
+    fn a_workflow_missing_from_a_truncated_response_is_carried_forward() {
+        // Observed live: a `?branch=main` page with total_count=23 that
+        // contained no update-flakes runs at all. Because each cycle publishes a
+        // fresh registry, an omitted workflow silently loses its series -- which
+        // is the "workflows appear for a round or two and then vanish" shape.
+        let known = reduction(
+            "update-flakes",
+            RunConclusion::Success,
+            "2026-08-16T05:31:31Z",
+        );
+        let empty = RepoRuns::default();
+
+        let reconciled = empty.reconciled_with(&known, &live(&["update-flakes"]));
+
+        assert_eq!(
+            newest_of(&reconciled, "update-flakes"),
+            Some((
+                RunConclusion::Success,
+                "2026-08-16T05:31:31+00:00".to_owned()
+            )),
+            "an empty response is a lost update, not a deletion"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_newer_run_still_wins() {
+        // The guard must not freeze state. This is the direction that carries
+        // every real CI transition, so getting it wrong would be worse than the
+        // bug being fixed.
+        let known = reduction("CI", RunConclusion::Success, "2026-08-09T00:00:00Z");
+        let fresh = reduction("CI", RunConclusion::Failure, "2026-08-19T00:00:00Z");
+
+        let reconciled = fresh.reconciled_with(&known, &live(&["CI"]));
+
+        assert_eq!(
+            newest_of(&reconciled, "CI"),
+            Some((
+                RunConclusion::Failure,
+                "2026-08-19T00:00:00+00:00".to_owned()
+            )),
+            "a real failure must still be published"
+        );
+    }
+
+    #[test]
+    fn a_rerun_at_the_same_timestamp_updates_the_conclusion() {
+        // A re-run keeps the original run's `created_at` and changes only its
+        // conclusion, so ties must go to the fresh observation. Comparing with
+        // `>=` instead of `>` would pin a re-run's outcome to the failure it was
+        // re-run to clear, and no later cycle could ever revise it.
+        let known = reduction("CI", RunConclusion::Failure, "2026-08-19T00:00:00Z");
+        let rerun = reduction("CI", RunConclusion::Success, "2026-08-19T00:00:00Z");
+
+        let reconciled = rerun.reconciled_with(&known, &live(&["CI"]));
+
+        assert_eq!(
+            newest_of(&reconciled, "CI").map(|(c, _)| c),
+            Some(RunConclusion::Success),
+            "a re-run's new conclusion must land"
+        );
+    }
+
+    #[test]
+    fn a_deleted_workflow_is_not_carried_forward() {
+        // Otherwise the guard would become a way to keep a removed workflow's
+        // final failure alive forever -- the orphaned-run bug, reintroduced
+        // through the back door.
+        let known = reduction(
+            "Update pre-commit hooks",
+            RunConclusion::Failure,
+            "2025-12-14T00:54:24Z",
+        );
+
+        let reconciled = RepoRuns::default().reconciled_with(&known, &live(&["CI"]));
+
+        assert!(
+            reconciled.latest.is_empty(),
+            "a workflow whose file is gone must retire: {:?}",
+            reconciled.latest
+        );
+    }
+
+    #[test]
+    fn reconciliation_keeps_the_later_last_success() {
+        // `last_success` feeds "how long has this been broken", so a truncated
+        // page must not move it backwards either.
+        let mut known = RepoRuns::default();
+        known.last_success.insert(
+            "CI".to_owned(),
+            "2026-08-16T00:00:00Z".parse().expect("timestamp"),
+        );
+        let mut truncated = RepoRuns::default();
+        truncated.last_success.insert(
+            "CI".to_owned(),
+            "2026-07-01T00:00:00Z".parse().expect("timestamp"),
+        );
+
+        let reconciled = truncated.reconciled_with(&known, &live(&["CI"]));
+
+        assert_eq!(
+            reconciled.last_success.get("CI").map(DateTime::to_rfc3339),
+            Some("2026-08-16T00:00:00+00:00".to_owned())
+        );
+    }
+
+    #[test]
+    fn reconciliation_accepts_a_newer_last_success() {
+        let mut known = RepoRuns::default();
+        known.last_success.insert(
+            "CI".to_owned(),
+            "2026-07-01T00:00:00Z".parse().expect("timestamp"),
+        );
+        let mut fresh = RepoRuns::default();
+        fresh.last_success.insert(
+            "CI".to_owned(),
+            "2026-08-16T00:00:00Z".parse().expect("timestamp"),
+        );
+
+        let reconciled = fresh.reconciled_with(&known, &live(&["CI"]));
+
+        assert_eq!(
+            reconciled.last_success.get("CI").map(DateTime::to_rfc3339),
+            Some("2026-08-16T00:00:00+00:00".to_owned())
+        );
+    }
+
+    // ---- request shape ---------------------------------------------------
+
+    /// A repository whose default branch is [`DEFAULT_BRANCH`].
+    fn repo() -> Repo {
+        Repo {
+            owner: "sdr-enthusiasts".to_owned(),
+            name: "docker-beast-splitter".to_owned(),
+            default_branch: DEFAULT_BRANCH.to_owned(),
+        }
+    }
+
+    /// A runs payload holding one green `schedule` run of `update-flakes`.
+    fn runs_payload() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_runs": [{
+                "path": ".github/workflows/update-flakes.yaml",
+                "head_branch": DEFAULT_BRANCH,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "schedule",
+                "created_at": "2026-08-16T05:31:31Z",
+                "html_url": "https://github.com/o/r/actions/runs/1",
+            }]
+        })
+    }
+
+    fn update_flakes() -> Vec<Workflow> {
+        vec![Workflow {
+            id: 311_284_543,
+            name: "update-flakes".to_owned(),
+            path: ".github/workflows/update-flakes.yaml".to_owned(),
+            state: WorkflowState::Active,
+            triggers: vec!["schedule".to_owned(), "workflow_dispatch".to_owned()],
+        }]
+    }
+
+    #[tokio::test]
+    async fn the_runs_request_carries_no_server_side_filters() {
+        // THE guard against reintroducing this module's defect. Every filtering
+        // parameter on this endpoint -- `branch=`, `event=` -- is answered from
+        // an eventually-consistent index that intermittently returns a partial
+        // or empty page as a well-formed 200. Measured on
+        // sdr-enthusiasts/docker-beast-splitter, whose true `?branch=main`
+        // total_count is 264: fifty samples returned 0, 23, 30, 92, 111, 133,
+        // 135, 190, 192, 206 and 264, roughly one in ten of them empty. The
+        // unfiltered listing returned the same complete answer every time.
+        //
+        // So the query string must stay unfiltered. `per_page` is a page size,
+        // not a filter, and does not select which runs exist.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .and(wiremock::matchers::query_param(
+                "per_page",
+                RUNS_PER_PAGE.to_string(),
+            ))
+            .and(wiremock::matchers::query_param_is_missing("branch"))
+            .and(wiremock::matchers::query_param_is_missing("event"))
+            .and(wiremock::matchers::query_param_is_missing("status"))
+            .and(wiremock::matchers::query_param_is_missing("created"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(runs_payload()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new("t", &server.uri(), &format!("{}/graphql", server.uri()))
+            .expect("client builds");
+        let runs = fetch_runs(&client, &repo(), &update_flakes())
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(runs.latest.len(), 1);
+        assert_eq!(runs.latest[0].conclusion, RunConclusion::Success);
+    }
+
+    #[tokio::test]
+    async fn the_top_up_addresses_the_workflow_by_numeric_id_and_is_unfiltered() {
+        // The top-up exists because dropping `branch=` leaves the shared page
+        // diluted by pull-request runs: one page of fredsystems/nixos spans
+        // about a day and speaks for 5 of its 14 workflows. It must not reach
+        // for the flaky filter to compensate.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/311284543/runs",
+            ))
+            .and(wiremock::matchers::query_param_is_missing("branch"))
+            .and(wiremock::matchers::query_param_is_missing("event"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(runs_payload()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new("t", &server.uri(), &format!("{}/graphql", server.uri()))
+            .expect("client builds");
+        let workflows = update_flakes();
+        let runs = fetch_workflow_runs(&client, &repo(), &workflows[0])
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(runs.latest.len(), 1);
+        assert_eq!(runs.latest[0].workflow, "update-flakes");
+    }
+
+    #[tokio::test]
+    async fn renaming_the_default_branch_invalidates_the_cached_reduction() {
+        // The branch is a reduction input now rather than a request parameter,
+        // so it has to be in the cache key. Without it the unchanged URL would
+        // answer 304 and replay a reduction computed against the old branch --
+        // the same stale-reduction trap the workflow fingerprint exists for.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", "\"unchanged\"")
+                    .set_body_json(runs_payload()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new("t", &server.uri(), &format!("{}/graphql", server.uri()))
+            .expect("client builds");
+        let workflows = update_flakes();
+
+        let on_main = fetch_runs(&client, &repo(), &workflows)
+            .await
+            .expect("first fetch");
+        assert_eq!(on_main.latest.len(), 1, "main is the run's branch");
+
+        let mut renamed = repo();
+        renamed.default_branch = "trunk".to_owned();
+        let on_trunk = fetch_runs(&client, &renamed, &workflows)
+            .await
+            .expect("second fetch");
+
+        assert!(
+            on_trunk.latest.is_empty(),
+            "the reduction must be recomputed for the new branch, not replayed"
+        );
+    }
+
+    #[test]
+    fn reconciliation_leaves_output_sorted_by_workflow() {
+        // `record_runs` iterates this, and a stable order keeps a diff of the
+        // exposed text meaningful.
+        let known = reduction("Zebra", RunConclusion::Success, "2026-08-16T00:00:00Z");
+        let fresh = reduction("Alpha", RunConclusion::Success, "2026-08-16T00:00:00Z");
+
+        let reconciled = fresh.reconciled_with(&known, &live(&["Alpha", "Zebra"]));
+
+        let order: Vec<&str> = reconciled
+            .latest
+            .iter()
+            .map(|r| r.workflow.as_str())
+            .collect();
+        assert_eq!(order, ["Alpha", "Zebra"]);
     }
 }
