@@ -484,28 +484,54 @@ pub async fn fetch_workflow_runs(
     Ok(runs)
 }
 
+/// Everything a run reduction depends on besides the API response itself.
+///
+/// A reduction is only meaningful under the inputs that produced it, and it is
+/// retained in two places: the `ETag` cache, and the collector's last-known-good
+/// state for [`RepoRuns::reconciled_with`]. **Both** have to be invalidated when
+/// these change, and for the same reason in each case -- a retained reduction
+/// that outlives its inputs is a fossil that the current code would never have
+/// produced.
+///
+/// * The **workflow fingerprint** covers path, display name, and triggers.
+///   Deleting, renaming, or retriggering a workflow does not change the runs
+///   listing, so the request would answer `304` and replay a reduction computed
+///   against the old workflow set -- reviving the orphaned-run and
+///   superseded-trigger bugs the reduction exists to prevent.
+/// * The **branch** is a reduction input now rather than a request parameter, so
+///   a repository that renames its default branch must not go on reporting runs
+///   selected against the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReductionInputs {
+    branch: String,
+    workflows: u64,
+}
+
+impl ReductionInputs {
+    /// The inputs a reduction of `repo`'s runs against `live` depends on.
+    #[must_use]
+    pub fn of(repo: &Repo, live: &[Workflow]) -> Self {
+        Self {
+            branch: repo.default_branch.clone(),
+            workflows: fingerprint_workflows(live),
+        }
+    }
+
+    /// A cache key for `path` that changes whenever these inputs do.
+    fn cache_key(&self, path: &str) -> String {
+        format!("{path}#branch={}#wf={}", self.branch, self.workflows)
+    }
+}
+
 /// Issues a runs request and reduces it, with the cache keyed by every input
 /// the reduction reads.
-///
-/// The cached value is a *reduction*, so it must be invalidated whenever
-/// anything the reduction depends on changes -- not only when the response
-/// does. Deleting or renaming a workflow does not change the runs listing, so
-/// the request would answer `304` and replay a reduction computed against the
-/// previous workflow set, reviving the orphaned-run bug the reduction exists to
-/// prevent. The default branch is in the key for the same reason: it is now a
-/// reduction input rather than a request parameter, so a repository renaming
-/// its default branch must not replay a reduction computed against the old one.
 async fn fetch_reduced(
     client: &Client,
     repo: &Repo,
     path: &str,
     live: &[Workflow],
 ) -> Result<(RepoRuns, super::client::CacheOutcome), ClientError> {
-    let cache_key = format!(
-        "{path}#branch={}#wf={}",
-        repo.default_branch,
-        fingerprint_workflows(live)
-    );
+    let cache_key = ReductionInputs::of(repo, live).cache_key(path);
     let branch = repo.default_branch.clone();
     client
         .get_cached_as(&cache_key, path, move |response: RunsResponse| {

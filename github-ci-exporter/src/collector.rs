@@ -77,18 +77,27 @@ pub struct WorkflowCache {
     /// runs of deleted workflows forever, and reporting them shows failures
     /// for CI that no longer exists.
     workflows: HashMap<String, Vec<rest::Workflow>>,
-    /// Last-known-good run reduction per `owner/name`.
+    /// Last-known-good run reduction per `owner/name`, with the inputs that
+    /// produced it.
     ///
     /// Retained because GitHub's runs listing is only eventually consistent, so
     /// a single response can be silently incomplete. Reconciling each cycle
     /// against the previous one is the only way to tell an incomplete page from
     /// a real change -- see [`rest::RepoRuns::reconciled_with`].
     ///
+    /// The [`rest::ReductionInputs`] are stored alongside and checked before the
+    /// reduction is reused, for exactly the reason the `ETag` cache keys on them
+    /// too: a retained reduction that outlives its inputs is a fossil. Without
+    /// the check, renaming the default branch would keep publishing runs
+    /// selected against the old one, and dropping a workflow's `push` trigger
+    /// would keep publishing its last `push` run -- resurrecting the two classes
+    /// of stale data that `reduce_runs`'s filters exist to remove.
+    ///
     /// Deliberately not persisted with the `ETag` cache. A restart therefore
     /// starts with no high-water mark and trusts its first response, which is
     /// the correct trade: the alternative is carrying a possibly-wrong retained
     /// value across a deploy with no way to ever revise it downwards.
-    runs: HashMap<String, rest::RepoRuns>,
+    runs: HashMap<String, (rest::ReductionInputs, rest::RepoRuns)>,
     /// Repositories monitored by the previous cycle, used to size the
     /// budget pre-flight check.
     monitored_count: u64,
@@ -247,7 +256,13 @@ pub async fn collect(
     }
 
     // Actions runs.
-    let mut workflow_count = 0u64;
+    //
+    // Counted as `usize` and converted once below. Accumulating in `u64` would
+    // need a fallible conversion per repository, and neither fallback is right:
+    // saturating low understates the budget estimate the count exists to raise,
+    // and saturating high poisons the running total so the pre-flight check
+    // bypasses every subsequent cycle.
+    let mut workflow_count = 0usize;
     for repo in &monitored {
         let live = cache
             .workflows
@@ -265,7 +280,7 @@ pub async fn collect(
             );
             continue;
         }
-        workflow_count = workflow_count.saturating_add(u64::try_from(live.len()).unwrap_or(0));
+        workflow_count = workflow_count.saturating_add(live.len());
         record_workflow_states(metrics, repo, &live);
         if let Some(runs) = fetch_repo_runs(client, repo, &live, cache).await {
             record_runs(metrics, repo, &runs, cache, now);
@@ -274,7 +289,9 @@ pub async fn collect(
 
     // Self-monitoring.
     cache.monitored_count = u64::try_from(monitored.len()).unwrap_or(u64::MAX);
-    cache.workflow_count = workflow_count;
+    // Saturating high, matching `monitored_count`: overestimating the budget
+    // costs an early skip, underestimating it costs a half-applied cycle.
+    cache.workflow_count = u64::try_from(workflow_count).unwrap_or(u64::MAX);
     record_budget_metrics(client, metrics);
     metrics.scrape_duration.set(started.elapsed().as_secs_f64());
     metrics.scrape_success.set(1);
@@ -358,10 +375,22 @@ async fn fetch_repo_runs(
         }
     }
 
-    if let Some(previous) = cache.runs.get(&full_name) {
-        runs = runs.reconciled_with(previous, live);
+    // Reused only under the inputs that produced it. A mismatch costs one cycle
+    // of truncation protection, which is the same price the `ETag` cache pays
+    // for a fingerprint change, and is far cheaper than publishing a run
+    // selected against a branch or a trigger set that no longer applies.
+    let inputs = rest::ReductionInputs::of(repo, live);
+    match cache.runs.get(&full_name) {
+        Some((previous_inputs, previous)) if *previous_inputs == inputs => {
+            runs = runs.reconciled_with(previous, live);
+        }
+        Some(_) => debug!(
+            repo = %repo,
+            "discarding the retained reduction: the branch or workflow set changed"
+        ),
+        None => {}
     }
-    cache.runs.insert(full_name, runs.clone());
+    cache.runs.insert(full_name, (inputs, runs.clone()));
     Some(runs)
 }
 
@@ -2079,6 +2108,170 @@ mod tests {
         assert!(
             !cache.runs.contains_key(&repo.full_name()),
             "and must not leave a retained reduction behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_the_default_branch_discards_the_retained_reduction() {
+        // The retained reduction is only meaningful under the inputs that
+        // produced it. Keyed by `owner/name` alone, a rename would keep
+        // publishing runs selected against the old branch indefinitely -- until
+        // a newer run on the new branch happened to arrive, or the process
+        // restarted. That is the fossil that `reduce_runs`'s branch filter
+        // exists to prevent, reintroduced through the retained state.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let live = scheduled_workflow();
+        let mut cache = WorkflowCache::default();
+
+        let on_main = fetch_repo_runs(&client, &test_repo(), &live, &mut cache)
+            .await
+            .expect("cycle on main");
+        assert_eq!(on_main.latest.len(), 1);
+
+        // Same repository, new default branch. Every run in the response is on
+        // `main`, so nothing legitimately describes `trunk` yet.
+        let mut renamed = test_repo();
+        renamed.default_branch = "trunk".to_owned();
+        let on_trunk = fetch_repo_runs(&client, &renamed, &live, &mut cache)
+            .await
+            .expect("cycle on trunk");
+
+        assert!(
+            on_trunk.latest.is_empty(),
+            "a run selected against the old branch must not be carried forward: {:?}",
+            on_trunk.latest
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_trigger_discards_the_retained_reduction() {
+        // Run history outlives a trigger change, which is why `reduce_runs`
+        // checks each run's event against the workflow's current `on:` block.
+        // The retained reduction has to honour the same rule: a workflow that
+        // no longer runs on `schedule` must stop reporting its last `schedule`
+        // run, rather than having it carried forward forever.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("failure", "2026-08-16T05:31:31Z")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let mut cache = WorkflowCache::default();
+
+        let cadenced = fetch_repo_runs(&client, &repo, &scheduled_workflow(), &mut cache)
+            .await
+            .expect("cycle with a schedule trigger");
+        assert_eq!(cadenced.latest.len(), 1, "a schedule run is branch state");
+
+        // The same workflow file now declares only `workflow_dispatch`, so its
+        // old `schedule` runs describe a configuration that no longer exists.
+        let mut retriggered = scheduled_workflow();
+        retriggered[0].triggers = vec!["workflow_dispatch".to_owned()];
+        let after = fetch_repo_runs(&client, &repo, &retriggered, &mut cache)
+            .await
+            .expect("cycle after the trigger change");
+
+        assert!(
+            after.latest.is_empty(),
+            "a run from a superseded trigger must not be carried forward: {:?}",
+            after.latest
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_inputs_still_reconcile_across_cycles() {
+        // The invalidation must be narrow: if it fired on every cycle the
+        // truncation guard would never engage at all, which is the whole point
+        // of retaining the reduction.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(runs_body("success", "2026-08-16T05:31:31Z")),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/sdr-enthusiasts/docker-beast-splitter/actions/workflows/42/runs",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "workflow_runs": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let repo = test_repo();
+        let live = scheduled_workflow();
+        let mut cache = WorkflowCache::default();
+
+        fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle one");
+        let second = fetch_repo_runs(&client, &repo, &live, &mut cache)
+            .await
+            .expect("cycle two");
+
+        assert_eq!(
+            second.latest.len(),
+            1,
+            "an empty second response must be recognised as a lost update"
         );
     }
 }
