@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::client::{Client, ClientError};
-use crate::model::{AuthorKind, ChecksState, MergeableState, Repo, SkipReason};
+use crate::model::{AuthorKind, ChecksState, MergeableState, Repo, RepoIndexEntry, SkipReason};
 
 /// Repositories per discovery page. 100 is GraphQL's maximum page size.
 const DISCOVERY_PAGE_SIZE: usize = 100;
@@ -46,6 +46,11 @@ const BATCH_SIZE: usize = 50;
 /// series under a fabricated `org` label, for a repository that already had
 /// one. Reading the owner back from the response makes that unrepresentable
 /// regardless of what the connection decides to include.
+///
+/// `description` is selected for [`crate::model::RepoIndex`] rather than for
+/// monitoring, which has no use for it. It is free: a scalar field on a node
+/// the query already fetches adds nothing to the GraphQL point cost, which is
+/// computed from the connection page sizes.
 const DISCOVERY_QUERY: &str = r"
 query($owner: String!, $cursor: String) {
   repositoryOwner(login: $owner) {
@@ -59,6 +64,7 @@ query($owner: String!, $cursor: String) {
       nodes {
         name
         owner { login }
+        description
         isArchived
         pushedAt
         defaultBranchRef { name }
@@ -98,6 +104,7 @@ struct PageInfo {
 struct DiscoveryNode {
     name: String,
     owner: NodeOwner,
+    description: Option<String>,
     #[serde(rename = "isArchived")]
     is_archived: bool,
     #[serde(rename = "pushedAt")]
@@ -122,6 +129,22 @@ pub struct DiscoveredRepo {
     pub repo: Repo,
     pub is_archived: bool,
     pub pushed_at: Option<DateTime<Utc>>,
+    /// Carried for [`crate::model::RepoIndex`] only; no filter reads it.
+    pub description: Option<String>,
+}
+
+impl DiscoveredRepo {
+    /// Projects this into the form served by `/repos.json`.
+    #[must_use]
+    pub fn to_index_entry(&self) -> RepoIndexEntry {
+        RepoIndexEntry {
+            owner: self.repo.owner.clone(),
+            name: self.repo.name.clone(),
+            description: self.description.clone(),
+            archived: self.is_archived,
+            pushed_at: self.pushed_at,
+        }
+    }
 }
 
 /// Enumerates every repository owned by `owner`, following pagination.
@@ -167,6 +190,7 @@ pub async fn discover_owner(
                 },
                 is_archived: node.is_archived,
                 pushed_at: node.pushed_at,
+                description: node.description,
             });
         }
 
@@ -502,6 +526,7 @@ mod tests {
                         "nodes": [{
                             "name": name,
                             "owner": { "login": owner },
+                            "description": "a test repository",
                             "isArchived": false,
                             "pushedAt": "2026-01-01T00:00:00Z",
                             "defaultBranchRef": { "name": "main" }
@@ -647,7 +672,104 @@ mod tests {
             repo: repo("sdr-enthusiasts", name),
             is_archived: archived,
             pushed_at: pushed,
+            description: None,
         }
+    }
+
+    #[test]
+    fn discovery_selects_description_for_the_repo_index() {
+        // `RepoIndex` is the only consumer, and it is populated from discovery
+        // rather than a second query precisely because this field is free
+        // here. Dropping it from the selection would silently empty every
+        // description in the served index.
+        assert!(
+            DISCOVERY_QUERY.contains("description"),
+            "the repo index needs descriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_carries_the_description_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_page("fredsystems", "nixos")),
+            )
+            .mount(&server)
+            .await;
+
+        let found = discover_owner(&client_for(&server), "fredsystems")
+            .await
+            .expect("discovery should succeed");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description.as_deref(), Some("a test repository"));
+    }
+
+    #[tokio::test]
+    async fn a_null_description_is_not_an_error() {
+        // GitHub returns `null`, not an omitted key, for a repository with no
+        // description. That is the common case across the fleet, so it must
+        // not fail the whole page's deserialisation.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": { "repositories": {
+                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "nodes": [{
+                        "name": "scratch",
+                        "owner": { "login": "fredclausen" },
+                        "description": null,
+                        "isArchived": false,
+                        "pushedAt": "2026-01-01T00:00:00Z",
+                        "defaultBranchRef": { "name": "main" }
+                    }]
+                }}}
+            })))
+            .mount(&server)
+            .await;
+
+        let found = discover_owner(&client_for(&server), "fredclausen")
+            .await
+            .expect("a null description must not fail discovery");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description, None);
+    }
+
+    #[test]
+    fn index_entry_keeps_archived_repositories_flagged() {
+        // Archived repos are excluded from monitoring but included in the
+        // index, so the flag has to survive the projection for a client to be
+        // able to mark them.
+        let entry = discovered("old-thing", true, None).to_index_entry();
+
+        assert_eq!(entry.owner, "sdr-enthusiasts");
+        assert_eq!(entry.name, "old-thing");
+        assert!(entry.archived);
+    }
+
+    #[test]
+    fn index_entries_are_built_before_filtering() {
+        // The whole point of the index: `partition_repos` drops the archived
+        // repository, but the index built from the same discovery result keeps
+        // it. If these ever agree, the index has been wired to the wrong set.
+        let discovered_repos = vec![
+            discovered("live", false, None),
+            discovered("archived", true, None),
+        ];
+        let indexed: Vec<String> = discovered_repos
+            .iter()
+            .map(|d| d.to_index_entry().name)
+            .collect();
+
+        let (monitored, _skipped) = partition_repos(discovered_repos, &|_| false, None, Utc::now());
+        let watched: Vec<String> = monitored.into_iter().map(|r| r.name).collect();
+
+        assert_eq!(indexed, ["live", "archived"], "the index keeps both");
+        assert_eq!(watched, ["live"], "monitoring drops the archived one");
     }
 
     #[test]
