@@ -182,6 +182,56 @@ impl fmt::Display for Repo {
     }
 }
 
+/// Every repository owned by a configured owner, as of the last complete sweep.
+///
+/// This is deliberately the *pre-filter* discovery result, not the monitored
+/// set. The monitored set exists to answer "what CI should I be watching?" and
+/// so drops archived repositories, denylisted ones, and -- by default --
+/// everything with no workflow files. The index answers a different question,
+/// "what repositories exist?", and every one of those exclusions is wrong for
+/// it: a docs repository with no CI is exactly the sort of thing a human wants
+/// to look up.
+///
+/// Publishing it costs no additional API calls. Discovery already enumerates
+/// all of this on every cycle to feed the filter; the index is that same data
+/// captured before the filter runs, so the marginal cost is a clone.
+///
+/// One thing discovery does drop is a repository with no default branch, i.e.
+/// one that has never received a commit. That filter lives in `discover_owner`
+/// and is left alone: unwinding it would make `Repo::default_branch` optional
+/// across every monitoring path, which is a large change to make an empty
+/// repository appear in a lookup box.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RepoIndex {
+    /// When the sweep that produced this index completed discovery.
+    ///
+    /// `None` only before the first sweep finishes. Clients use it to show how
+    /// stale the list is rather than silently presenting hours-old data as
+    /// current.
+    pub generated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub repos: Vec<RepoIndexEntry>,
+}
+
+/// One repository in a [`RepoIndex`].
+///
+/// `url` is deliberately absent: it is always
+/// `https://github.com/{owner}/{name}`, and sending ~35 bytes per repository
+/// to restate a constant template is worse than letting the client build it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RepoIndexEntry {
+    pub owner: String,
+    pub name: String,
+    /// Omitted from the JSON entirely when GitHub has none, rather than
+    /// serialised as `null`, so clients need only one absent-check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Archived repositories are included, not dropped, so old work stays
+    /// reachable. Clients are expected to mark them rather than hide them.
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// A reference to one pull request, as `owner/name#number`.
 ///
 /// Exists so the operator's ignore list is parsed and validated once, at

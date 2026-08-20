@@ -7,12 +7,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
-    github::{Client, client::RateLimitResource, graphql, rest},
+    github::{Client, client::RateLimitResource, graphql, graphql::DiscoveredRepo, rest},
     metrics::{
         AuthorLabels, Metrics, Publisher, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
         WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
     },
-    model::{PullRef, Repo, SkipReason},
+    model::{PullRef, Repo, RepoIndex, SkipReason},
 };
 
 /// GraphQL requests a full cycle needs: discovery pages plus batched activity
@@ -231,6 +231,8 @@ pub async fn collect(
         anyhow::bail!("discovery failed for every configured owner");
     }
 
+    publish_repo_index(publisher, &discovered, discovery_failures, now);
+
     let max_age = config
         .max_repo_age
         .and_then(|d| chrono::Duration::from_std(d).ok());
@@ -305,6 +307,43 @@ pub async fn collect(
     }
 
     Ok(CycleOutcome::Complete)
+}
+
+/// Publishes the unfiltered discovery result as the served repository index.
+///
+/// Called before filtering, because the index is the set that answers "what
+/// repositories exist?" rather than "what CI should I watch?" -- see
+/// [`RepoIndex`].
+///
+/// Only a *complete* sweep may replace it. One owner failing while the others
+/// succeed is survivable for metrics, which are per-repository and simply go
+/// stale for the missing owner. It is not survivable for the index, which is
+/// consumed as a whole: publishing a partial result would silently drop every
+/// repository of the failed owner from the served list, and a client cannot
+/// distinguish that from those repositories having been deleted upstream.
+/// Keeping the last complete index is the honest answer, and `generated_at` is
+/// what lets a client see how old it is.
+fn publish_repo_index(
+    publisher: &Publisher,
+    discovered: &[DiscoveredRepo],
+    discovery_failures: usize,
+    now: DateTime<Utc>,
+) {
+    if discovery_failures > 0 {
+        warn!(
+            failures = discovery_failures,
+            "partial discovery; keeping the previous repository index"
+        );
+        return;
+    }
+
+    publisher.publish_repo_index(RepoIndex {
+        generated_at: Some(now),
+        repos: discovered
+            .iter()
+            .map(DiscoveredRepo::to_index_entry)
+            .collect(),
+    });
 }
 
 /// Collects one repository's default-branch run state.

@@ -33,7 +33,7 @@ use prometheus_client::{
     registry::Registry,
 };
 
-use crate::model::AuthorKind;
+use crate::model::{AuthorKind, RepoIndex};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RepoLabels {
@@ -387,6 +387,7 @@ pub struct Publisher(Arc<Mutex<Published>>);
 struct Published {
     metrics: Arc<Metrics>,
     registry: Registry,
+    repo_index: Arc<RepoIndex>,
 }
 
 impl std::fmt::Debug for Publisher {
@@ -401,6 +402,7 @@ impl Publisher {
         Self(Arc::new(Mutex::new(Published {
             metrics: Arc::new(metrics),
             registry,
+            repo_index: Arc::new(RepoIndex::default()),
         })))
     }
 
@@ -433,6 +435,38 @@ impl Publisher {
         if let Ok(published) = self.0.lock() {
             update(&published.metrics);
         }
+    }
+
+    /// Replaces the served repository index.
+    ///
+    /// Separate from [`Publisher::publish`] because the index depends only on
+    /// discovery, which runs at the very top of a cycle, while the metric set
+    /// is not complete until the REST run-fetching at the bottom has finished.
+    /// Tying them together would mean a cycle that discovered every repository
+    /// but then failed while collecting Actions state served a stale
+    /// repository list, even though the list it held was known-good. The two
+    /// have genuinely different validity conditions, so they are published
+    /// independently.
+    ///
+    /// The caller is responsible for only calling this after a *complete*
+    /// discovery pass -- see the partial-failure guard in `collector::collect`.
+    pub fn publish_repo_index(&self, index: RepoIndex) {
+        if let Ok(mut published) = self.0.lock() {
+            published.repo_index = Arc::new(index);
+        }
+    }
+
+    /// The currently-served repository index.
+    ///
+    /// Returns an [`Arc`] so the caller can serialise it after releasing the
+    /// lock; a scrape of `/metrics` must not block behind JSON encoding of a
+    /// few hundred repositories.
+    #[must_use]
+    pub fn repo_index(&self) -> Arc<RepoIndex> {
+        self.0.lock().map_or_else(
+            |_| Arc::new(RepoIndex::default()),
+            |p| Arc::clone(&p.repo_index),
+        )
     }
 
     /// Renders the served registry in the Prometheus text exposition format.
@@ -484,6 +518,62 @@ mod tests {
         );
         assert!(rendered.contains(r#"author_kind="human""#));
         assert!(rendered.contains(r#"repo="nixos""#));
+    }
+
+    #[test]
+    fn repo_index_starts_empty_and_is_replaced_wholesale() {
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new(metrics, registry);
+
+        // Before the first sweep completes there is nothing to serve, and
+        // `generated_at` is what tells a client to say so rather than render
+        // an empty list as "you own no repositories".
+        let before = publisher.repo_index();
+        assert!(before.repos.is_empty());
+        assert!(before.generated_at.is_none());
+
+        publisher.publish_repo_index(RepoIndex {
+            generated_at: Some(chrono::Utc::now()),
+            repos: vec![crate::model::RepoIndexEntry {
+                owner: "fredsystems".to_owned(),
+                name: "nixos".to_owned(),
+                description: None,
+                archived: false,
+                pushed_at: None,
+            }],
+        });
+
+        let after = publisher.repo_index();
+        assert_eq!(after.repos.len(), 1);
+        assert_eq!(after.repos[0].name, "nixos");
+        assert!(after.generated_at.is_some());
+    }
+
+    #[test]
+    fn publishing_metrics_leaves_the_repo_index_alone() {
+        // The two have different validity conditions on purpose: a metric
+        // swap at the end of a cycle must not disturb the index published
+        // from discovery at the start of it.
+        let publisher = publisher_monitoring("kept");
+        publisher.publish_repo_index(RepoIndex {
+            generated_at: Some(chrono::Utc::now()),
+            repos: vec![crate::model::RepoIndexEntry {
+                owner: "fredsystems".to_owned(),
+                name: "nixos".to_owned(),
+                description: None,
+                archived: false,
+                pushed_at: None,
+            }],
+        });
+
+        let (metrics, registry) = Metrics::new();
+        publisher.publish(metrics, registry);
+
+        assert_eq!(
+            publisher.repo_index().repos.len(),
+            1,
+            "a metrics swap must not clear the repository index"
+        );
     }
 
     /// A publisher serving one monitored repository named `name`.

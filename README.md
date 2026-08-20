@@ -192,6 +192,51 @@ Fork status is deliberately **not** a filter: actively-maintained
 infrastructure forks and dormant upstream forks are indistinguishable by that
 flag alone.
 
+## The repository index (`/repos.json`)
+
+Every repository the exporter *discovers* is also served as JSON, separately
+from the metrics:
+
+```json
+{
+  "generated_at": "2026-08-19T12:00:00Z",
+  "repos": [
+    {
+      "owner": "fredsystems",
+      "name": "nixos",
+      "description": "NixOS flake for the fleet",
+      "archived": false,
+      "pushed_at": "2026-08-19T09:14:02Z"
+    }
+  ]
+}
+```
+
+This is the **pre-filter** discovery result, not the monitored set. The table
+above exists to answer "what CI should I be watching?", and every one of its
+exclusions is wrong for a lookup: a documentation repository with no workflows
+is exactly the sort of thing a human wants to find. Archived repositories are
+included and flagged rather than dropped, so old work stays reachable.
+
+It costs no additional API calls. Discovery already enumerates all of this on
+every cycle to feed the filter, and `description` is a scalar field on a node
+the query already fetches, so it adds nothing to the GraphQL point cost.
+
+Two behaviours worth knowing:
+
+- **Only a complete sweep replaces it.** If one owner's discovery fails while
+  the others succeed, the previous index is kept and a warning is logged.
+  Publishing a partial result would silently drop every repository of the
+  failed owner, which a client cannot distinguish from upstream deletion.
+  `generated_at` is `null` until the first complete sweep finishes.
+- **It is a snapshot, not a search endpoint.** There is no `?q=`. The intended
+  consumer is a type-ahead box, and a query endpoint would mean an HTTP round
+  trip per keystroke to filter a list that fits in a few kilobytes. Fetch it
+  once and match locally.
+
+A repository that has never received a commit does not appear, because
+discovery drops repositories with no default branch.
+
 ## Exported metrics
 
 | Metric                                             | Type    | Labels                                              |
