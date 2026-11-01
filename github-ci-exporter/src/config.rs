@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn ignore_pulls_defaults_to_empty_and_is_read_from_toml() {
-        assert!(Config::default().ignore_pulls.is_empty());
+        assert_eq!(Config::default().ignore_pulls, Vec::<String>::new());
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp config");
         write!(
