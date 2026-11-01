@@ -19,6 +19,13 @@ confidence-threshold = 0.8
 
 [advisories]
 version = 2
+ignore = [
+  # unsafe-libyaml is unmaintained (informational, not a vulnerability) and
+  # comes in via serde_yaml_ng 0.10.0, the latest release, so there is no
+  # update that clears it. Remove once we migrate off serde_yaml_ng:
+  # https://github.com/fredsystems/github-ci-exporter/issues/28
+  { id = "RUSTSEC-2024-0449", reason = "unmaintained, no patched serde_yaml_ng; tracked in #28" },
+]
 
 [bans]
 multiple-versions = "allow"

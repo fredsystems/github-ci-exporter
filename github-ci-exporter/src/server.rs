@@ -250,7 +250,7 @@ mod tests {
             .expect("body");
         let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
 
-        assert!(parsed["repos"].as_array().expect("repos array").is_empty());
+        assert_eq!(parsed["repos"], serde_json::json!([]));
         assert!(parsed["generated_at"].is_null());
     }
 
