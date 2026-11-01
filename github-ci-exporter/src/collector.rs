@@ -2002,7 +2002,7 @@ mod tests {
         )
         .await
         .expect("fetch succeeds");
-        assert!(runs.latest.is_empty());
+        assert_eq!(runs.latest, Vec::<crate::github::rest::LatestRun>::new());
     }
 
     #[tokio::test]
