@@ -529,7 +529,7 @@ mod tests {
         // `generated_at` is what tells a client to say so rather than render
         // an empty list as "you own no repositories".
         let before = publisher.repo_index();
-        assert!(before.repos.is_empty());
+        assert_eq!(before.repos, Vec::<crate::model::RepoIndexEntry>::new());
         assert!(before.generated_at.is_none());
 
         publisher.publish_repo_index(RepoIndex {

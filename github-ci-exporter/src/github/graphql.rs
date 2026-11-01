@@ -945,7 +945,7 @@ mod tests {
 
         let (keep, skip) =
             partition_repos(input, &|_| false, Some(chrono::Duration::days(365)), now);
-        assert!(keep.is_empty());
+        assert_eq!(keep, Vec::<crate::model::Repo>::new());
         assert_eq!(skip[0].1, SkipReason::Inactive);
     }
 

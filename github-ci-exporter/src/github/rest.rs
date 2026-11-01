@@ -1087,7 +1087,7 @@ mod tests {
         // `head_branch` is nullable, and a run that cannot be attributed to a
         // branch cannot be attributed to the default one.
         let runs = vec![run_on_branch("CI", None, "2026-08-09T00:00:00Z")];
-        assert!(reduce(runs, &live(&["CI"])).latest.is_empty());
+        assert_eq!(reduce(runs, &live(&["CI"])).latest, Vec::<LatestRun>::new());
     }
 
     #[test]
@@ -1599,7 +1599,10 @@ mod tests {
             "2026-08-09T00:00:00Z",
         );
         orphan.path = None;
-        assert!(reduce(vec![orphan], &live(&["CI"])).latest.is_empty());
+        assert_eq!(
+            reduce(vec![orphan], &live(&["CI"])).latest,
+            Vec::<LatestRun>::new()
+        );
     }
 
     fn wf(name: &str, triggers: &[&str]) -> Vec<Workflow> {
@@ -1698,8 +1701,11 @@ jobs:
     #[test]
     fn malformed_yaml_yields_no_triggers() {
         // Which means "accept anything", the safe direction.
-        assert!(parse_triggers("this: is: not: valid: yaml:").is_empty());
-        assert!(parse_triggers("").is_empty());
+        assert_eq!(
+            parse_triggers("this: is: not: valid: yaml:"),
+            Vec::<String>::new()
+        );
+        assert_eq!(parse_triggers(""), Vec::<String>::new());
     }
 
     #[test]
@@ -1735,13 +1741,16 @@ on:
   pull_request:
   merge_group:
 ";
-        assert!(parse_crons(yaml).is_empty());
+        assert_eq!(parse_crons(yaml), Vec::<String>::new());
     }
 
     #[test]
     fn malformed_yaml_does_not_panic() {
-        assert!(parse_crons("this: is: not: valid: yaml:").is_empty());
-        assert!(parse_crons("").is_empty());
+        assert_eq!(
+            parse_crons("this: is: not: valid: yaml:"),
+            Vec::<String>::new()
+        );
+        assert_eq!(parse_crons(""), Vec::<String>::new());
     }
 
     #[test]
