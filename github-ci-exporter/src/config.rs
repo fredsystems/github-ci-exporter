@@ -26,6 +26,18 @@ use crate::model::PullRef;
 /// cycle. With `ETag` revalidation the realistic figure is a few percent.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Default interval for the flake-lock pass.
+///
+/// `flake.lock` changes far less often than CI or PR state, so this runs on
+/// its own, much longer, cadence -- see [`Config::flake_interval`].
+const DEFAULT_FLAKE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Minimum `flake_interval`. The Contents API fetch is cheap (one request per
+/// configured repository, `ETag`-revalidated), but there is nothing to gain
+/// from polling a file that changes on the order of days to weeks faster than
+/// a quarter of an hour.
+const MIN_FLAKE_INTERVAL: Duration = Duration::from_secs(900);
+
 /// `GHCI_`-prefixed variables that are not configuration fields.
 ///
 /// Compared lowercased, matching how figment normalises env keys.
@@ -89,6 +101,24 @@ pub struct Config {
 
     /// GitHub GraphQL endpoint.
     pub github_graphql_url: String,
+
+    /// Repositories whose flake inputs are tracked, as `owner/name`.
+    ///
+    /// Each entry's `flake.lock` is read from its default branch through the
+    /// `ETag` cache. Empty by default: tracking is opt-in per repository
+    /// rather than inferred from `orgs`, because most monitored repositories
+    /// are not flakes at all.
+    pub flake_repos: Vec<String>,
+
+    /// How often to run the flake-lock pass.
+    ///
+    /// Independent of `interval`: `flake.lock` changes on the order of days
+    /// to weeks, far slower than CI or PR state, so tying it to the 5-minute
+    /// default would spend most of that budget re-fetching a file that has
+    /// not moved. Every cycle still republishes the cached result, since the
+    /// metrics registry is rebuilt from scratch each cycle.
+    #[serde(with = "humantime_serde")]
+    pub flake_interval: Duration,
 }
 
 impl Default for Config {
@@ -105,6 +135,8 @@ impl Default for Config {
             token_file: None,
             github_api_url: "https://api.github.com".to_owned(),
             github_graphql_url: "https://api.github.com/graphql".to_owned(),
+            flake_repos: Vec::new(),
+            flake_interval: DEFAULT_FLAKE_INTERVAL,
         }
     }
 }
@@ -119,6 +151,10 @@ pub enum ConfigError {
     IntervalTooShort(Duration),
     #[error("invalid `ignore_pulls` entry: {0}")]
     IgnorePull(#[from] crate::model::PullRefError),
+    #[error("invalid `flake_repos` entry `{0}`; expected `owner/name`")]
+    InvalidFlakeRepo(String),
+    #[error("flake_interval must be at least {MIN_FLAKE_INTERVAL:?}, got {0:?}")]
+    FlakeIntervalTooShort(Duration),
     #[error("no token available: set GHCI_TOKEN or `token_file`")]
     NoToken,
     #[error("failed to read token file {path}: {source}")]
@@ -175,6 +211,14 @@ impl Config {
         // the worst outcome: the operator believes a PR is suppressed and the
         // alert keeps firing.
         self.ignored_pulls()?;
+        for repo in &self.flake_repos {
+            if !crate::model::is_full_repo_name(repo) {
+                return Err(ConfigError::InvalidFlakeRepo(repo.clone()));
+            }
+        }
+        if self.flake_interval < MIN_FLAKE_INTERVAL {
+            return Err(ConfigError::FlakeIntervalTooShort(self.flake_interval));
+        }
         Ok(())
     }
 
@@ -467,6 +511,81 @@ mod tests {
             config.resolve_token_from(None).expect_err("empty token"),
             ConfigError::EmptyToken(_)
         ));
+    }
+
+    #[test]
+    fn flake_repos_and_interval_default_sensibly() {
+        let config = Config::default();
+        assert_eq!(config.flake_repos, Vec::<String>::new());
+        assert_eq!(config.flake_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn a_malformed_flake_repo_entry_fails_validation() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            flake_repos: vec!["not-a-repo".into()],
+            ..Config::default()
+        };
+        assert!(matches!(
+            config
+                .validate()
+                .expect_err("a malformed flake repo must be rejected"),
+            ConfigError::InvalidFlakeRepo(entry) if entry == "not-a-repo"
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_flake_repo_entry_passes_validation() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            flake_repos: vec!["fredsystems/nixos".into()],
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn flake_interval_below_fifteen_minutes_is_rejected() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            flake_interval: Duration::from_secs(60),
+            ..Config::default()
+        };
+        assert!(matches!(
+            config
+                .validate()
+                .expect_err("too-fast flake polling must be rejected"),
+            ConfigError::FlakeIntervalTooShort(_)
+        ));
+    }
+
+    #[test]
+    fn flake_interval_of_exactly_fifteen_minutes_is_accepted() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            flake_interval: Duration::from_secs(900),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn flake_repos_and_interval_are_read_from_toml() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+            orgs = ["fredsystems"]
+            flake_repos = ["fredsystems/nixos"]
+            flake_interval = "2h"
+            "#
+        )
+        .expect("write temp config");
+
+        let config = Config::load(Some(file.path())).expect("config should load");
+        assert_eq!(config.flake_repos, ["fredsystems/nixos"]);
+        assert_eq!(config.flake_interval, Duration::from_secs(7200));
     }
 
     #[test]

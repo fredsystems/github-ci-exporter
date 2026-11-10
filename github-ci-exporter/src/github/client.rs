@@ -60,6 +60,11 @@ pub enum ClientError {
         #[source]
         source: serde_json::Error,
     },
+    /// A response that decoded fine as its raw shape `T` but whose projection
+    /// into the cached type `R` rejected its *content* -- an unsupported
+    /// schema version, for example. See [`Client::get_cached_fallible_as`].
+    #[error("failed to project response: {0}")]
+    Projection(String),
 }
 
 /// Snapshot of the API's reported rate-limit state for one bucket.
@@ -204,6 +209,21 @@ pub enum CacheOutcome {
     /// Server returned 304; the cached payload is still current and the
     /// request was not charged against the rate limit.
     NotModified,
+}
+
+/// Result of [`Client::fetch_for_projection`], the shared GET-plus-`ETag`
+/// step every `get_cached*` variant builds on.
+enum FetchForProjection<T, R> {
+    /// Server returned 304; already the final, previously-cached value.
+    NotModified(R),
+    /// Server returned 200; the raw body parsed as `T`, not yet projected,
+    /// plus the `ETag` and cache key to store the projection under once the
+    /// caller produces one.
+    Modified {
+        parsed: T,
+        etag: Option<String>,
+        cache_key: String,
+    },
 }
 
 #[derive(Debug)]
@@ -507,6 +527,94 @@ impl Client {
         R: Serialize + DeserializeOwned,
         F: FnOnce(T) -> R,
     {
+        // `project` cannot fail, so it is lifted into the fallible form with
+        // an error type that can never be constructed.
+        self.get_cached_fallible_as(cache_key, path, move |value| {
+            Ok::<R, std::convert::Infallible>(project(value))
+        })
+        .await
+    }
+
+    /// As [`Self::get_cached`], but `project` may itself reject the response
+    /// -- fit, for example, for a machine-produced payload that decodes fine
+    /// as `T` but whose *content* turns out to be unusable, such as an
+    /// unsupported schema version.
+    ///
+    /// A rejected projection is **not** cached: caching it would mean a
+    /// `304` on the next request replays that rejection (or whatever
+    /// placeholder `project` might otherwise be tempted to return) forever,
+    /// with no later point at which it could be retried. It surfaces instead
+    /// as [`ClientError::Projection`], exactly like a transport failure, so a
+    /// caller that already has a per-repository fallback for a failed fetch
+    /// gets one for a failed projection for free.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] on transport failure, a non-success status, a
+    /// body that does not match `T`, or `project` returning `Err`.
+    pub async fn get_cached_fallible<T, R, E, F>(
+        &self,
+        path: &str,
+        project: F,
+    ) -> Result<(R, CacheOutcome), ClientError>
+    where
+        T: DeserializeOwned,
+        R: Serialize + DeserializeOwned,
+        E: std::fmt::Display,
+        F: FnOnce(T) -> Result<R, E>,
+    {
+        self.get_cached_fallible_as(path, path, project).await
+    }
+
+    /// As [`Self::get_cached_fallible`], but with the cache key decoupled
+    /// from the request path -- see [`Self::get_cached_as`].
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] on transport failure, a non-success status, a
+    /// body that does not match `T`, or `project` returning `Err`.
+    pub async fn get_cached_fallible_as<T, R, E, F>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        project: F,
+    ) -> Result<(R, CacheOutcome), ClientError>
+    where
+        T: DeserializeOwned,
+        R: Serialize + DeserializeOwned,
+        E: std::fmt::Display,
+        F: FnOnce(T) -> Result<R, E>,
+    {
+        match self.fetch_for_projection::<T, R>(cache_key, path).await? {
+            FetchForProjection::NotModified(value) => Ok((value, CacheOutcome::NotModified)),
+            FetchForProjection::Modified {
+                parsed,
+                etag,
+                cache_key,
+            } => {
+                let projected =
+                    project(parsed).map_err(|error| ClientError::Projection(error.to_string()))?;
+                self.cache_projection(cache_key, etag, &projected);
+                Ok((projected, CacheOutcome::Modified))
+            }
+        }
+    }
+
+    /// Performs the `ETag`-revalidated GET shared by every `get_cached*`
+    /// variant, stopping just short of projecting the response: that step is
+    /// the one place the fallible and infallible callers differ.
+    ///
+    /// A `304` is resolved all the way to the final, already-projected `R`
+    /// here, because that value is exactly what a prior call cached; a `200`
+    /// is handed back only as far as the parsed raw `T`, leaving projection
+    /// (and therefore the choice of whether it can fail) to the caller.
+    async fn fetch_for_projection<T, R>(
+        &self,
+        cache_key: &str,
+        path: &str,
+    ) -> Result<FetchForProjection<T, R>, ClientError>
+    where
+        T: DeserializeOwned,
+        R: DeserializeOwned,
+    {
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {
@@ -569,7 +677,7 @@ impl Client {
                 // lookup-failed fallback forever. That is how the workflow
                 // trigger filter came to be silently inert in production.
                 match cached.as_deref().map(serde_json::from_str) {
-                    Some(Ok(value)) => return Ok((value, CacheOutcome::NotModified)),
+                    Some(Ok(value)) => return Ok(FetchForProjection::NotModified(value)),
                     Some(Err(error)) => warn!(
                         %url,
                         %error,
@@ -611,11 +719,25 @@ impl Client {
             url: url.clone(),
             source,
         })?;
-        let projected = project(parsed);
 
-        // Only cache what can be replayed; an unserialisable projection simply
-        // means the next cycle refetches.
-        if let (Some(etag), Ok(encoded)) = (etag, serde_json::to_string(&projected))
+        Ok(FetchForProjection::Modified {
+            parsed,
+            etag,
+            cache_key,
+        })
+    }
+
+    /// Caches a successfully produced projection under `cache_key`'s `ETag`.
+    ///
+    /// Only what can be replayed is cached; an unserialisable projection
+    /// simply means the next cycle refetches.
+    fn cache_projection<R: Serialize>(
+        &self,
+        cache_key: String,
+        etag: Option<String>,
+        projected: &R,
+    ) {
+        if let (Some(etag), Ok(encoded)) = (etag, serde_json::to_string(projected))
             && let Ok(mut cache) = self.cache.lock()
         {
             cache.insert(
@@ -626,8 +748,6 @@ impl Client {
                 },
             );
         }
-
-        Ok((projected, CacheOutcome::Modified))
     }
 
     /// Executes a GraphQL query.
@@ -969,6 +1089,92 @@ mod tests {
             CacheOutcome::NotModified,
             "a repeated custom key must revalidate rather than refetch"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_projection_is_not_cached() {
+        // Regression guard for a payload that decodes fine as its raw shape
+        // but whose content is unusable -- an unparsable `flake.lock`, for
+        // example. Caching it under the response's ETag would mean a later
+        // `304` replays that rejection, or whatever empty placeholder the
+        // caller might otherwise be tempted to produce, forever: the ETag
+        // stays valid, so there is no later point at which a fixed payload
+        // could be observed. Both calls here must hit the server -- if the
+        // first had been cached, the second would be answered from it
+        // instead of making a second request.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rejected"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"bad\"")
+                    .set_body_json(json!({"n": 1})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // A capture-free closure is `Copy`, so it can be handed to
+        // `get_cached_fallible` more than once without being reconstructed.
+        let reject = |value: serde_json::Value| -> Result<i64, String> {
+            Err(format!("rejected {}", value["n"]))
+        };
+
+        let client = client_for(&server);
+        for _ in 0..2 {
+            let result = client.get_cached_fallible("/rejected", reject).await;
+            assert!(
+                matches!(result, Err(ClientError::Projection(_))),
+                "a rejected projection must surface as ClientError::Projection"
+            );
+        }
+
+        let is_empty = client.cache.lock().expect("lock").is_empty();
+        assert!(
+            is_empty,
+            "a rejected projection must never be written to the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_fallible_projection_is_cached_like_any_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/accepted"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"ok\"")
+                    .set_body_json(json!({"n": 9})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/accepted"))
+            .and(header("if-none-match", "\"ok\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let accept = |value: serde_json::Value| -> Result<i64, std::convert::Infallible> {
+            Ok(value["n"].as_i64().unwrap_or_default())
+        };
+
+        let client = client_for(&server);
+        let (first, outcome) = client
+            .get_cached_fallible("/accepted", accept)
+            .await
+            .expect("first call");
+        assert_eq!(first, 9);
+        assert_eq!(outcome, CacheOutcome::Modified);
+
+        let (second, outcome) = client
+            .get_cached_fallible("/accepted", accept)
+            .await
+            .expect("second call");
+        assert_eq!(second, 9, "the accepted projection must be replayed");
+        assert_eq!(outcome, CacheOutcome::NotModified);
     }
 
     #[tokio::test]

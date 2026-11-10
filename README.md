@@ -115,6 +115,12 @@ a half-rebuilt metric set. A skipped cycle is reported by
 and previous values are retained so a transient shortage does not look like
 CI disappearing.
 
+The flake-lock pass (below) is priced and gated separately from CI. A cycle
+is only bypassed outright if it cannot afford CI on its own; if CI fits but
+CI plus a due flake pass does not, the cycle still runs, just without the
+flake pass for that one cycle -- it stays due, so the next cycle retries it,
+and whatever was last observed is still republished.
+
 Because a `304` returns no body, the cache must be able to reproduce the value.
 It stores a **projection** of each response rather than the raw payload; the
 Actions runs endpoint alone returns ~1.5 MB per repository, which measured at
@@ -256,6 +262,7 @@ discovery drops repositories with no default branch.
 | `github_workflow_expected_interval_seconds`        | gauge   | `org`, `repo`, `workflow`                           |
 | `github_repo_monitored`                            | gauge   | `org`, `repo`                                       |
 | `github_repos_skipped`                             | gauge   | `reason`                                            |
+| `github_flake_input_locked_timestamp_seconds`      | gauge   | `repo`, `input`, `path`, `ref`, `channel`           |
 | `github_exporter_rate_limit_remaining`             | gauge   | `resource`                                          |
 | `github_exporter_rate_limit_limit`                 | gauge   | `resource`                                          |
 | `github_exporter_rate_limit_reset_timestamp_seconds` | gauge | `resource`                                          |
@@ -275,6 +282,13 @@ activity for visibility while alert rules select only `author_kind="human"`.
 `github_workflow_run_status` is `1` for the current conclusion of each
 workflow. An in-flight run reports `conclusion="running"` and does not clear a
 previous failure.
+
+For `github_flake_input_locked_timestamp_seconds`, `input` is the root `flake.lock`
+input (`niri`), `path` is the full input path including any owned nixpkgs
+(`niri` or `niri/nixpkgs`), `ref` is the branch or tag it is locked to (empty
+for the default branch or for anything not locked through `github`), and
+`channel` is the NixOS channel it tracks, when it tracks one (empty
+otherwise). See "Flake input tracking" above.
 
 ## What counts as the current CI state
 
@@ -336,6 +350,39 @@ A malformed entry is a startup error, not a filter that silently never matches:
 the worst outcome would be an operator believing a PR is suppressed while its
 alert keeps firing.
 
+## Flake input tracking
+
+For repositories named in `flake_repos`, the exporter reads `flake.lock` from
+the default branch through the Contents API -- the same `ETag`-cached path
+`list_workflows` and the workflow-definition lookup already use -- and parses
+it into the set of inputs worth watching:
+
+- every root input in `flake.lock`, except one locked through a `follows`
+  path rather than its own node, since that input has nothing of its own to
+  watch;
+- for each of those, its own `nixpkgs` input, if it locks one independently
+  rather than following ours. This is where a pin going stale or a rebuild no
+  one asked for tends to come from (`niri/nixpkgs`,
+  `catppuccin/nixpkgs`), so it is tracked under its own path rather than
+  folded into its parent.
+
+Each tracked input is classified from how it is locked -- a GitHub branch
+(including "no ref", the default branch), a GitHub release tag, or a
+`channels.nixos.org` tarball -- and, where it applies, labelled with the NixOS
+channel it tracks (`nixos-unstable`, `nixos-26.05`, ...).
+
+This pass runs on its own interval (`flake_interval`, default `1h`, minimum
+`15m`), separate from and much slower than the CI poll interval:
+`flake.lock` changes on the order of days to weeks, so polling it every few
+minutes would spend request budget for no new signal. Every cycle still
+republishes whatever was last observed, since each cycle rebuilds the metrics
+registry from scratch and discards it only once the new one is complete (see
+"Rate-limit behaviour" above).
+
+This first pass publishes only what the lock alone can say: when each tracked
+input was locked. Comparing that against its upstream, detecting an open
+update pull request, and reporting NixOS channel health are later work.
+
 ## Configuration
 
 TOML file, with `GHCI_`-prefixed environment overrides:
@@ -350,6 +397,8 @@ denylist = []
 ignore_pulls = []
 skip_repos_without_workflows = true
 # max_repo_age = "365d"
+flake_repos = []
+flake_interval = "1h"
 ```
 
 The token is never a config-file field. Supply it with `GHCI_TOKEN` or

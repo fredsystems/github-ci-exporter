@@ -24,6 +24,8 @@ let
     ignore_pulls = cfg.ignorePulls;
     skip_repos_without_workflows = cfg.skipReposWithoutWorkflows;
     state_dir = "/var/lib/github-ci-exporter";
+    flake_repos = cfg.flakeRepos;
+    flake_interval = cfg.flakeInterval;
   }
   // lib.optionalAttrs (cfg.maxRepoAge != null) { max_repo_age = cfg.maxRepoAge; };
 
@@ -139,6 +141,33 @@ in
       description = ''
         Drop repositories that define no workflow files. These are
         content-hosting repositories with no CI signal to report.
+      '';
+    };
+
+    flakeRepos = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "fredsystems/nixos" ];
+      description = ''
+        Repositories whose flake inputs are tracked, as `owner/name`. Each
+        entry's `flake.lock` is read from its default branch through the
+        same `ETag` cache the rest of the exporter uses.
+
+        Empty by default: flake tracking is opt-in per repository rather than
+        inferred from `orgs`, since most monitored repositories are not
+        flakes at all.
+      '';
+    };
+
+    flakeInterval = mkOption {
+      type = types.str;
+      default = "1h";
+      description = ''
+        How often to run the flake-lock pass. Independent of `interval`,
+        and on a much longer default cadence: `flake.lock` changes on the
+        order of days to weeks, so tying it to the CI poll interval would
+        spend most of that budget re-fetching a file that has not moved.
+        Must be at least 15 minutes.
       '';
     };
 

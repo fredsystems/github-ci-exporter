@@ -264,20 +264,12 @@ impl std::str::FromStr for PullRef {
         let (repo, number) = raw
             .split_once('#')
             .ok_or_else(|| PullRefError(raw.to_owned()))?;
-        // `owner/name`, both halves non-empty, no stray extra slash, and no
-        // internal whitespace. Every one of those would otherwise parse into a
-        // reference that can never match an API-supplied name -- `#32`,
-        // `owner#32`, and `owner/name #32` alike -- which is precisely the
-        // silent no-op this validation exists to prevent. Note that only the
-        // *outer* whitespace is trimmed, so an inner space survives into the
-        // comparison.
-        let is_full_name = repo.split_once('/').is_some_and(|(owner, name)| {
-            !owner.is_empty()
-                && !name.is_empty()
-                && !name.contains('/')
-                && !repo.chars().any(char::is_whitespace)
-        });
-        if !is_full_name {
+        // Every one of these would otherwise parse into a reference that can
+        // never match an API-supplied name -- `#32`, `owner#32`, and
+        // `owner/name #32` alike -- which is precisely the silent no-op this
+        // validation exists to prevent. Note that only the *outer* whitespace
+        // is trimmed, so an inner space survives into the comparison.
+        if !is_full_repo_name(repo) {
             return Err(PullRefError(raw.to_owned()));
         }
         let number: u64 = number.parse().map_err(|_| PullRefError(raw.to_owned()))?;
@@ -286,6 +278,22 @@ impl std::str::FromStr for PullRef {
         }
         Ok(Self::new(repo, number))
     }
+}
+
+/// Whether `value` is a well-formed `owner/name` repository reference: both
+/// halves non-empty, no stray extra slash, and no internal whitespace.
+///
+/// Shared by [`PullRef::from_str`] and `Config`'s `flake_repos` validation --
+/// the two places in this crate that accept an operator-supplied repository
+/// name rather than one read back from the API.
+#[must_use]
+pub(crate) fn is_full_repo_name(value: &str) -> bool {
+    value.split_once('/').is_some_and(|(owner, name)| {
+        !owner.is_empty()
+            && !name.is_empty()
+            && !name.contains('/')
+            && !value.chars().any(char::is_whitespace)
+    })
 }
 
 impl fmt::Display for PullRef {

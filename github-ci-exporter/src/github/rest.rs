@@ -773,8 +773,10 @@ pub struct WorkflowDefinition {
     pub triggers: Vec<String>,
 }
 
-/// Decodes GitHub's line-wrapped base64 content payloads.
-fn decode_base64(input: &str) -> String {
+/// Decodes GitHub's line-wrapped base64 content payloads (the Contents API
+/// `content` field). Shared with [`crate::flake`], which reads `flake.lock`
+/// through the same API.
+pub(crate) fn decode_base64(input: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lookup = [255u8; 256];
     let mut i = 0;
