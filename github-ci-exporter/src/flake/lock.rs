@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 /// Nix has held this steady for years; an actual bump is rare enough that
 /// failing loudly and extending the parser is better than guessing a newer
 /// schema parses the same way.
+///
+/// **Whenever the set of lock shapes this parser accepts changes** -- a
+/// supported version is added, or [`classify`] learns to read a new `type`,
+/// `ref`, or `rev` shape differently -- bump `CACHE_FORMAT_VERSION` in
+/// `github::client` too. The flake-lock pass's cached projection is
+/// [`TrackedNode`], produced by this parser; a persisted entry from before
+/// the change would otherwise keep decoding and keep replaying under its
+/// still-valid `ETag`, exactly the fossil-projection failure mode that
+/// constant's own documentation describes.
 const SUPPORTED_VERSION: u64 = 7;
 
 /// What a tracked node is locked as, and therefore how its upstream must be
@@ -140,6 +149,21 @@ fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
     let kind_str = source.and_then(|r| r.kind.as_deref());
 
     let (kind, reference) = match kind_str {
+        // `original.rev` is checked before falling back to "no ref = default
+        // branch": a flake can pin a `github` input to an immutable commit,
+        // with or without also naming a `ref`, and either way nothing about
+        // that pin is a branch or a tag to compare against an upstream head
+        // or release. `locked.rev` is not a substitute for this check -- it
+        // is set on every resolved `github` node, pinned or not.
+        Some("github")
+            if node
+                .original
+                .as_ref()
+                .and_then(|r| r.rev.as_deref())
+                .is_some() =>
+        {
+            (NodeKind::Untracked, None)
+        }
         Some("github") => match source.and_then(|r| r.git_ref.clone()) {
             None => (NodeKind::Branch, None),
             Some(r) if is_tag_ref(&r) => (NodeKind::Tag, Some(r)),
@@ -410,6 +434,63 @@ mod tests {
         assert_eq!(tracked.len(), 1);
         assert_eq!(tracked[0].kind, NodeKind::Branch);
         assert_eq!(tracked[0].reference, None);
+    }
+
+    #[test]
+    fn a_commit_pin_with_no_ref_is_untracked_not_a_branch() {
+        // `original.rev` without a `ref` previously fell through to "no ref =
+        // default branch", classifying an immutable commit pin as though it
+        // tracked a branch head.
+        let raw = lock_json(
+            &serde_json::json!({ "input": "input" }),
+            &serde_json::json!({
+                "input": {
+                    "inputs": {},
+                    "original": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                    },
+                    "locked": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                        "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(tracked[0].kind, NodeKind::Untracked);
+        assert_eq!(tracked[0].reference, None);
+    }
+
+    #[test]
+    fn a_commit_pin_with_a_ref_is_still_untracked() {
+        // A `rev` is a pin regardless of whether a `ref` is also present --
+        // the lock stays on that commit even if the named branch or tag moves
+        // on, so it must not classify as a `Branch` or a `Tag`.
+        let raw = lock_json(
+            &serde_json::json!({ "input": "input" }),
+            &serde_json::json!({
+                "input": {
+                    "inputs": {},
+                    "original": {
+                        "type": "github", "owner": "o", "repo": "r", "ref": "main",
+                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                    },
+                    "locked": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                        "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(
+            tracked[0].kind,
+            NodeKind::Untracked,
+            "a ref alongside a rev is still a pin"
+        );
     }
 
     #[test]

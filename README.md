@@ -115,6 +115,12 @@ a half-rebuilt metric set. A skipped cycle is reported by
 and previous values are retained so a transient shortage does not look like
 CI disappearing.
 
+The flake-lock pass (below) is priced and gated separately from CI. A cycle
+is only bypassed outright if it cannot afford CI on its own; if CI fits but
+CI plus a due flake pass does not, the cycle still runs, just without the
+flake pass for that one cycle -- it stays due, so the next cycle retries it,
+and whatever was last observed is still republished.
+
 Because a `304` returns no body, the cache must be able to reproduce the value.
 It stores a **projection** of each response rather than the raw payload; the
 Actions runs endpoint alone returns ~1.5 MB per repository, which measured at

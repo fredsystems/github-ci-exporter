@@ -73,16 +73,30 @@ impl FlakeCache {
 /// other per-repository fetch. A repository with no `flake.lock` (a 404) is
 /// not a failure: its cache entry is cleared, so nothing is published for it,
 /// and the absence is logged once per pass at `info`.
+///
+/// The pass is marked as run -- which resets [`FlakeCache::should_run`]'s
+/// interval -- only if `repos` is empty or at least one repository actually
+/// produced [`FetchOutcome::Fetched`] or [`FetchOutcome::NotFound`]. If every
+/// repository errored (a transport failure, or the budget check inside
+/// [`Client::get_cached`] refusing the request), marking the pass as run
+/// regardless would start the next `flake_interval`-long wait from a pass
+/// that observed nothing at all, silently extending an outage into a much
+/// longer one.
 pub async fn run_pass(client: &Client, repos: &[String], cache: &mut FlakeCache) {
+    let mut any_observed = false;
     for repo in repos {
         match fetch_tracked_nodes(client, repo).await {
-            Ok(FetchOutcome::Fetched(nodes)) => cache.set_nodes(repo, nodes),
+            Ok(FetchOutcome::Fetched(nodes)) => {
+                cache.set_nodes(repo, nodes);
+                any_observed = true;
+            }
             Ok(FetchOutcome::NotFound) => {
                 info!(
                     repo,
                     "no flake.lock on the default branch; nothing to track"
                 );
                 cache.clear_nodes(repo);
+                any_observed = true;
             }
             Err(error) => {
                 warn!(
@@ -93,7 +107,9 @@ pub async fn run_pass(client: &Client, repos: &[String], cache: &mut FlakeCache)
             }
         }
     }
-    cache.mark_ran();
+    if repos.is_empty() || any_observed {
+        cache.mark_ran();
+    }
 }
 
 /// Publishes the locked-timestamp gauge for every node currently cached for
@@ -135,6 +151,11 @@ enum FetchOutcome {
 /// following the same rule every other cached endpoint in this crate does --
 /// see `github::client`'s module documentation.
 ///
+/// Fetched through [`Client::get_cached_fallible`] rather than
+/// [`Client::get_cached`]: unlike a workflow file's crons and triggers, an
+/// empty tracked-node set is not a safe default for an unparsable
+/// `flake.lock` -- see [`project_flake_lock`]'s documentation.
+///
 /// No existing `CACHE_FORMAT_VERSION` bump is needed for this: the cache is a
 /// flat `url -> (etag, body)` map with no shared schema across endpoints, and
 /// this is a brand new URL with a brand new projection type. A version bump
@@ -143,7 +164,7 @@ enum FetchOutcome {
 /// new one.
 async fn fetch_tracked_nodes(client: &Client, repo: &str) -> Result<FetchOutcome, ClientError> {
     let path = format!("/repos/{repo}/contents/flake.lock");
-    match client.get_cached(&path, project_flake_lock).await {
+    match client.get_cached_fallible(&path, project_flake_lock).await {
         Ok((nodes, _outcome)) => Ok(FetchOutcome::Fetched(nodes)),
         Err(ClientError::Status { status, .. }) if status == StatusCode::NOT_FOUND => {
             Ok(FetchOutcome::NotFound)
@@ -158,32 +179,37 @@ struct ContentResponse {
     encoding: String,
 }
 
+/// Why [`project_flake_lock`] could not turn a Contents API response into a
+/// tracked node set.
+#[derive(Debug, thiserror::Error)]
+enum ProjectionError {
+    #[error("flake.lock contents response used an unexpected encoding: {0}")]
+    UnexpectedEncoding(String),
+    #[error(transparent)]
+    Lock(#[from] lock::LockError),
+}
+
 /// Decodes and parses a Contents API response into the tracked node set.
 ///
-/// Parse failures degrade to an empty set rather than propagating as an
-/// error, the same lenient-default idiom `github::rest::fetch_workflow_definition`
-/// uses for an unparsable workflow file: the projection this function
-/// produces is exactly what gets cached and replayed on a `304`, so there is
-/// no later point at which a parse failure could be retried.
-fn project_flake_lock(response: ContentResponse) -> Vec<TrackedNode> {
+/// A failure here -- an unexpected encoding, or anything [`lock::tracked_nodes`]
+/// rejects -- is returned as an error rather than degrading to an empty set.
+/// Unlike `github::rest::fetch_workflow_definition`'s lenient default for an
+/// unparsable workflow file, an empty *result* is not a safe stand-in for a
+/// failed *parse* here: it is handed straight to [`crate::collector::collect`]
+/// through [`Client::get_cached_fallible`], which does not cache a rejected
+/// projection, so the caller's existing failed-fetch handling in [`run_pass`]
+/// keeps the previously observed tracked nodes instead -- an unparsable lock
+/// must not be able to replace good cached data with nothing, nor get stuck
+/// replaying an empty set from under a still-valid `ETag`.
+fn project_flake_lock(response: ContentResponse) -> Result<Vec<TrackedNode>, ProjectionError> {
     // Destructured rather than accessed through `response.field`, so this
     // function genuinely consumes its argument instead of only borrowing it.
     let ContentResponse { content, encoding } = response;
     if encoding != "base64" {
-        warn!(
-            encoding,
-            "flake.lock contents response used an unexpected encoding; nothing to track"
-        );
-        return Vec::new();
+        return Err(ProjectionError::UnexpectedEncoding(encoding));
     }
     let raw = rest::decode_base64(&content);
-    match lock::tracked_nodes(&raw) {
-        Ok(nodes) => nodes,
-        Err(error) => {
-            warn!(%error, "failed to parse flake.lock; publishing no tracked nodes for this pass");
-            Vec::new()
-        }
-    }
+    Ok(lock::tracked_nodes(&raw)?)
 }
 
 #[cfg(test)]
@@ -432,6 +458,130 @@ mod tests {
             cache.nodes_for("o/r").len(),
             1,
             "a fetch failure must keep the previously observed nodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_lock_after_a_good_one_keeps_the_previous_nodes_and_metrics() {
+        // Regression guard: a `flake.lock` that fails to parse -- an
+        // unsupported version, here -- used to degrade to an empty tracked
+        // node set rather than an error, which replaced the previous cycle's
+        // good data with nothing and cached that nothing under the response's
+        // ETag.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flake.lock"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&sample_lock()),
+                        "encoding": "base64",
+                    })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // The second fetch is a 200 with a decodable body that nonetheless
+        // fails to parse as a `flake.lock`, rather than a transport error.
+        let unparsable_lock = serde_json::json!({
+            "version": 6,
+            "root": "root",
+            "nodes": { "root": { "inputs": {} } },
+        })
+        .to_string();
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flake.lock"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2-bad\"")
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&unparsable_lock),
+                        "encoding": "base64",
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let mut cache = FlakeCache::default();
+        let repos = vec!["o/r".to_owned()];
+
+        run_pass(&client, &repos, &mut cache).await;
+        assert_eq!(cache.nodes_for("o/r").len(), 1, "cycle one parses cleanly");
+
+        run_pass(&client, &repos, &mut cache).await;
+        assert_eq!(
+            cache.nodes_for("o/r").len(),
+            1,
+            "an unparsable lock must keep the previously observed nodes"
+        );
+
+        let (metrics, registry) = Metrics::new();
+        record_metrics(&metrics, "o/r", cache.nodes_for("o/r"));
+        let rendered = crate::metrics::Publisher::new(metrics, registry).render();
+        assert!(
+            rendered.contains("1700000000"),
+            "the retained metrics must still publish:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_where_every_repository_fails_is_not_marked_as_run() {
+        // Regression guard: marking the pass as run unconditionally meant a
+        // pass where every repository errored -- a transport failure, or
+        // every request refused for budget -- still reset the interval,
+        // silently extending an outage into a much longer one before the
+        // next retry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/down/contents/flake.lock"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let mut cache = FlakeCache::default();
+        let repos = vec!["o/down".to_owned()];
+
+        run_pass(&client, &repos, &mut cache).await;
+
+        assert!(
+            cache.should_run(Duration::from_secs(3600)),
+            "a pass where every repository errored must not consume the interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_with_one_successful_repository_is_marked_as_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/down/contents/flake.lock"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/up/contents/flake.lock"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&sample_lock()),
+                        "encoding": "base64",
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let mut cache = FlakeCache::default();
+        let repos = vec!["o/down".to_owned(), "o/up".to_owned()];
+
+        run_pass(&client, &repos, &mut cache).await;
+
+        assert!(
+            !cache.should_run(Duration::from_secs(3600)),
+            "one successful repository is enough for the pass to count as having run"
         );
     }
 

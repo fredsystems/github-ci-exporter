@@ -60,11 +60,11 @@ const fn estimate_core_requests(monitored: u64, workflows: u64) -> u64 {
 }
 
 /// Whether the flake-lock pass is due this cycle, and the request budget to
-/// reserve for it if so.
+/// reserve for it if it runs.
 ///
-/// Split out of [`collect`] so its pre-flight budget check can fold in the
-/// flake pass's cost with a single call, the same way it already folds in the
-/// CI sweep's.
+/// Split out of [`collect`] so the pre-flight budget check and the
+/// CI-plus-flake affordability check can both price the pass with a single
+/// call.
 fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64) {
     let due = cache.flake.should_run(config.flake_interval);
     let cost = if due {
@@ -75,21 +75,82 @@ fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64) {
     (due, cost)
 }
 
-/// Runs the flake-lock pass if due, then republishes whatever is cached.
+/// Decides whether this cycle may proceed, and if so whether the flake pass
+/// (when due) fits alongside it.
 ///
-/// Every cycle re-publishes, independent of `due`: the metrics registry
+/// Returns `None` if CI alone is unaffordable, which is the signal for
+/// [`collect`] to bypass the whole cycle exactly as before -- this check
+/// deliberately does not fold in the flake pass's cost: doing so used to
+/// bypass the *entire* cycle whenever the budget covered CI but not CI plus
+/// flake, which both stalled CI (nothing ran) and never cleared the due flag
+/// (the pass never got to mark itself run).
+///
+/// Returns `Some(run_flake)` once CI is known to be affordable on its own.
+/// `run_flake` is `true` only if the flake pass is also due *and* the cycle
+/// can afford CI plus flake together; otherwise it is skipped for just this
+/// cycle (logged once at `warn`) rather than bypassing CI, and stays due so
+/// the next cycle retries it.
+fn decide_budget(
+    client: &Client,
+    config: &Config,
+    cache: &WorkflowCache,
+    now: DateTime<Utc>,
+) -> Option<bool> {
+    let (flake_due, flake_request_estimate) = flake_budget(cache, config);
+    let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count());
+
+    if !client.can_afford(RateLimitResource::Core, estimated_core)
+        || !client.can_afford(RateLimitResource::GraphQl, ESTIMATED_GRAPHQL_REQUESTS)
+    {
+        let core = client.rate_limit(RateLimitResource::Core);
+        let graphql_budget = client.rate_limit(RateLimitResource::GraphQl);
+        warn!(
+            core_remaining = core.remaining,
+            graphql_remaining = graphql_budget.remaining,
+            reserve = client.reserve(),
+            estimated_core,
+            reset_in_secs = core.reset_in_secs(now.timestamp()),
+            "skipping collection cycle: insufficient API budget"
+        );
+        client.record_skipped(estimated_core);
+        return None;
+    }
+
+    let run_flake = flake_due
+        && client.can_afford(
+            RateLimitResource::Core,
+            estimated_core.saturating_add(flake_request_estimate),
+        );
+    if flake_due && !run_flake {
+        warn!(
+            estimated_core,
+            flake_request_estimate,
+            core_remaining = client.rate_limit(RateLimitResource::Core).remaining,
+            "skipping the flake-lock pass this cycle: budget covers CI but not CI plus flake; will retry next cycle"
+        );
+    }
+    Some(run_flake)
+}
+
+/// Runs the flake-lock pass if `run_flake`, then republishes whatever is
+/// cached.
+///
+/// Every cycle re-publishes, independent of `run_flake`: the metrics registry
 /// [`collect`] builds is fresh each cycle, so cached data not republished
 /// here simply disappears between hourly passes -- see
 /// `flake_interval`'s documentation for why the pass itself runs on a much
-/// longer cadence than the rest of the cycle.
+/// longer cadence than the rest of the cycle. `run_flake` is `false` both
+/// when the pass is not due and when it is due but the cycle could not afford
+/// it alongside CI -- in the latter case the pass stays due, so it is
+/// retried next cycle.
 async fn run_flake_stage(
     client: &Client,
     config: &Config,
     metrics: &Metrics,
     cache: &mut WorkflowCache,
-    due: bool,
+    run_flake: bool,
 ) {
-    if due {
+    if run_flake {
         flake::run_pass(client, &config.flake_repos, &mut cache.flake).await;
     }
     for repo in &config.flake_repos {
@@ -225,43 +286,17 @@ pub async fn collect(
     let (cycle_metrics, registry) = Metrics::new();
     let metrics = &cycle_metrics;
 
-    // Whether the flake-lock pass is due this cycle, decided up front so its
-    // request cost can be folded into the same pre-flight budget check as
-    // everything else: a cycle that affords the CI sweep but not the flake
-    // pass is still a cycle that should run, just without that pass.
-    let (flake_due, flake_request_estimate) = flake_budget(cache, config);
-
-    // Pre-flight budget check. A cycle that runs out of quota halfway leaves
-    // a partially-rebuilt registry: some repositories updated, others cleared
-    // and never refilled, which reads as "CI vanished" on the dashboard. It is
-    // strictly better to skip the cycle whole and keep the previous values.
-    let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count())
-        .saturating_add(flake_request_estimate);
-    if !client.can_afford(RateLimitResource::Core, estimated_core)
-        || !client.can_afford(RateLimitResource::GraphQl, ESTIMATED_GRAPHQL_REQUESTS)
-    {
-        let core = client.rate_limit(RateLimitResource::Core);
-        let graphql_budget = client.rate_limit(RateLimitResource::GraphQl);
-        warn!(
-            core_remaining = core.remaining,
-            graphql_remaining = graphql_budget.remaining,
-            reserve = client.reserve(),
-            estimated_core,
-            reset_in_secs = core.reset_in_secs(now.timestamp()),
-            "skipping collection cycle: insufficient API budget"
-        );
-        client.record_skipped(estimated_core);
-        // Annotates the published set rather than replacing it: the point of
-        // skipping is to keep the previous cycle's data, so the fresh registry
-        // built above is discarded unused. One `annotate` call, so the three
-        // updates land together.
+    // Pre-flight budget check: bypasses the whole cycle if CI alone is
+    // unaffordable, otherwise decides whether the flake pass (if due) also
+    // fits. See `decide_budget`'s documentation.
+    let Some(run_flake) = decide_budget(client, config, cache, now) else {
         publisher.annotate(|published| {
             record_budget_metrics(client, published);
             published.cycles_bypassed.inc();
             published.budget_exhausted.set(1);
         });
         return Ok(CycleOutcome::BypassedLowBudget);
-    }
+    };
     metrics.budget_exhausted.set(0);
 
     // Discovery
@@ -342,7 +377,7 @@ pub async fn collect(
     }
 
     // Flake input tracking: see `run_flake_stage`'s documentation.
-    run_flake_stage(client, config, metrics, cache, flake_due).await;
+    run_flake_stage(client, config, metrics, cache, run_flake).await;
 
     // Self-monitoring.
     cache.monitored_count = u64::try_from(monitored.len()).unwrap_or(u64::MAX);
@@ -1211,6 +1246,8 @@ pub fn record_failure(publisher: &Publisher) {
     reason = "panicking is how a test reports failure"
 )]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -2366,6 +2403,207 @@ mod tests {
             second.latest.len(),
             1,
             "an empty second response must be recognised as a lost update"
+        );
+    }
+
+    /// Base64-encodes `content` the way GitHub's Contents API does. Duplicated
+    /// from `flake::collect`'s test helper of the same name: this crate's only
+    /// base64 handling is the decoder it exercises, and the two test modules
+    /// do not share a dependency to put a shared helper in.
+    fn github_base64(content: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = content.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = chunk.get(1).copied();
+            let b2 = chunk.get(2).copied();
+            out.push(TABLE[usize::from(b0 >> 2)] as char);
+            out.push(
+                TABLE[usize::from(((b0 & 0b0000_0011) << 4) | (b1.unwrap_or(0) >> 4))] as char,
+            );
+            out.push(b1.map_or('=', |b1| {
+                TABLE[usize::from(((b1 & 0b0000_1111) << 2) | (b2.unwrap_or(0) >> 6))] as char
+            }));
+            out.push(b2.map_or('=', |b2| TABLE[usize::from(b2 & 0b0011_1111)] as char));
+        }
+        out
+    }
+
+    /// A minimal, valid `flake.lock` with one root input, `nixpkgs`.
+    fn sample_flake_lock() -> String {
+        serde_json::json!({
+            "version": 7,
+            "root": "root",
+            "nodes": {
+                "root": { "inputs": { "nixpkgs": "nixpkgs" } },
+                "nixpkgs": {
+                    "inputs": {},
+                    "original": {
+                        "type": "github", "owner": "nixos", "repo": "nixpkgs", "ref": "nixos-unstable",
+                    },
+                    "locked": {
+                        "type": "github", "owner": "nixos", "repo": "nixpkgs",
+                        "rev": "abc123", "lastModified": 1_700_000_000_i64,
+                    },
+                },
+            },
+        })
+        .to_string()
+    }
+
+    /// Mocks owner `o`'s discovery query with an empty repository set, so a
+    /// test can reach the flake stage without also having to mock every REST
+    /// endpoint `resolve_monitored` and `fetch_repo_runs` would otherwise
+    /// exercise.
+    fn mock_empty_discovery() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/graphql"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "repositoryOwner": {
+                            "repositories": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [],
+                            },
+                        },
+                    },
+                })),
+            )
+    }
+
+    /// A config that discovers owner `o` and tracks `o/r`'s `flake.lock`.
+    ///
+    /// `flake_interval` is zero, which forces `FlakeCache::should_run` true on
+    /// every cycle regardless of how much real time elapsed since the last
+    /// one -- what lets a test force the flake pass due again on a second
+    /// call without reaching into `FlakeCache`'s private `last_run` field.
+    fn flake_only_config() -> Config {
+        Config {
+            orgs: vec!["o".to_owned()],
+            flake_repos: vec!["o/r".to_owned()],
+            flake_interval: Duration::ZERO,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_covering_ci_but_not_ci_plus_flake_runs_ci_and_keeps_flake_due() {
+        // Regression guard for the bug both reviewers flagged: folding the
+        // flake pass's cost into the whole-cycle estimate meant a cycle that
+        // could afford CI but not CI plus flake was bypassed *entirely* --
+        // CI never ran, and because the pass never got to mark itself run,
+        // it stayed due forever. CI must run, the flake pass must be skipped
+        // for just this cycle, and its cached metrics must still publish.
+        let server = wiremock::MockServer::start().await;
+        mock_empty_discovery().mount(&server).await;
+        // Exactly one flake.lock fetch across both cycles: the first
+        // populates the cache and the rate-limit budget, the second must not
+        // repeat it.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/o/r/contents/flake.lock"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("x-ratelimit-limit", "5000")
+                    // Exactly enough to afford a CI-only cycle (plus reserve)
+                    // but one short of CI plus the one-repository flake pass.
+                    .insert_header(
+                        "x-ratelimit-remaining",
+                        (estimate_core_requests(0, 0) + 250).to_string(),
+                    )
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&sample_flake_lock()),
+                        "encoding": "base64",
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let config = flake_only_config();
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new(metrics, registry);
+        let mut cache = WorkflowCache::default();
+
+        // Cycle one: the rate-limit bucket starts unpopulated, so the
+        // pre-flight check cannot yet see a constrained budget. This cycle
+        // exists only to populate the cache and the budget via the response
+        // headers above.
+        let first = collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle one");
+        assert_eq!(first, CycleOutcome::Complete);
+        assert_eq!(client.reserve(), 250, "assumed by the header value above");
+
+        // Cycle two: the budget now covers CI alone but not CI plus flake.
+        let second = collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle two");
+        assert_eq!(
+            second,
+            CycleOutcome::Complete,
+            "a cycle that affords CI must not be bypassed just because it cannot also afford flake"
+        );
+
+        let rendered = publisher.render();
+        assert!(
+            rendered.contains("github_exporter_budget_exhausted 0"),
+            "the cycle must not be reported as budget-exhausted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"repo="o/r""#) && rendered.contains("1700000000"),
+            "the flake metrics cached from cycle one must still be published:\n{rendered}"
+        );
+        assert!(
+            cache.flake.should_run(config.flake_interval),
+            "the flake pass must still be due: it was skipped, not run, this cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_covering_ci_plus_flake_runs_the_flake_pass() {
+        let server = wiremock::MockServer::start().await;
+        mock_empty_discovery().mount(&server).await;
+        // Hit on cycle one (to seed the budget) and again on cycle two, since
+        // the budget comfortably covers both.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/o/r/contents/flake.lock"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("x-ratelimit-limit", "5000")
+                    .insert_header("x-ratelimit-remaining", "100000")
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&sample_flake_lock()),
+                        "encoding": "base64",
+                    })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let config = flake_only_config();
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new(metrics, registry);
+        let mut cache = WorkflowCache::default();
+
+        collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle one");
+        let second = collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle two");
+
+        assert_eq!(second, CycleOutcome::Complete);
+        let rendered = publisher.render();
+        assert!(
+            rendered.contains(r#"repo="o/r""#) && rendered.contains("1700000000"),
+            "the flake pass must have run and published its metrics:\n{rendered}"
         );
     }
 }
