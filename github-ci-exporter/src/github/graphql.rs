@@ -20,7 +20,11 @@ const DISCOVERY_PAGE_SIZE: usize = 100;
 /// GraphQL cost scales with aliased root fields; 50 keeps a single request
 /// comfortably under the node limit while still covering ~60 repos in two
 /// requests.
-const BATCH_SIZE: usize = 50;
+///
+/// `pub(crate)` rather than private: `flake::upstream` reuses the same
+/// aliasing approach and batch size for its own GraphQL query, so this is the
+/// one place that decides it.
+pub(crate) const BATCH_SIZE: usize = 50;
 
 /// Repository discovery, resolved through the `RepositoryOwner` interface.
 ///

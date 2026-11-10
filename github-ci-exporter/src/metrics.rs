@@ -114,6 +114,43 @@ pub struct FlakeInputLabels {
     pub channel: String,
 }
 
+/// Labels for `flake_input_commits_behind`.
+///
+/// No `channel` label: it is published only for a `Branch` node that is
+/// behind, and a commit count means nothing for a tag-pinned or
+/// channel-tracking comparison.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FlakeInputCommitsBehindLabels {
+    pub repo: String,
+    pub input: String,
+    pub path: String,
+    pub r#ref: String,
+}
+
+/// Labels for `flake_input_update_pr_open`. `number` matches the label on the
+/// existing `github_pull_*` series, so an update PR joins to its age and
+/// check state.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FlakeInputPrLabels {
+    pub repo: String,
+    pub input: String,
+    pub number: String,
+}
+
+/// Labels for `flake_input_impact`, read from the flake-watch Action's status
+/// file.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FlakeInputImpactLabels {
+    pub repo: String,
+    pub input: String,
+    /// `linux` or `darwin`.
+    pub os: String,
+    /// `none`, `rebuild`, or `source` -- see
+    /// `PLAN_03_FLAKE_INPUT_TRACKING.md`'s "Impact is decided by evaluation,
+    /// not by file names".
+    pub kind: String,
+}
+
 /// Every metric family the exporter publishes.
 #[derive(Debug)]
 pub struct Metrics {
@@ -137,6 +174,22 @@ pub struct Metrics {
     /// Lock time of each tracked flake input. The one metric derivable from
     /// `flake.lock` alone -- see `crate::flake`.
     pub flake_input_locked_timestamp: Family<FlakeInputLabels, Gauge>,
+    /// Upstream commit/tag time for each tracked flake input -- see
+    /// `crate::flake::upstream`.
+    pub flake_input_upstream_timestamp: Family<FlakeInputLabels, Gauge>,
+    /// 1 if up to date, 0 if behind; no series when the comparison is
+    /// unknown.
+    pub flake_input_up_to_date: Family<FlakeInputLabels, Gauge>,
+    /// When a node that is behind was first observed that way, measured from
+    /// the oldest missing change -- never resets while still behind.
+    pub flake_input_outdated_since: Family<FlakeInputLabels, Gauge>,
+    /// Commits behind upstream, for a `Branch` node that is behind.
+    pub flake_input_commits_behind: Family<FlakeInputCommitsBehindLabels, Gauge>,
+    /// 1 for each open `update-<input>` pull request found this pass.
+    pub flake_input_update_pr_open: Family<FlakeInputPrLabels, Gauge>,
+    /// 1 for each OS/kind the flake-watch Action's status file recorded for
+    /// an input.
+    pub flake_input_impact: Family<FlakeInputImpactLabels, Gauge>,
     pub rate_limit_remaining: Family<ResourceLabels, Gauge>,
     pub rate_limit_limit: Family<ResourceLabels, Gauge>,
     pub rate_limit_reset: Family<ResourceLabels, Gauge>,
@@ -270,6 +323,48 @@ impl Metrics {
             flake_input_locked_timestamp.clone(),
         );
 
+        let flake_input_upstream_timestamp = Family::<FlakeInputLabels, Gauge>::default();
+        registry.register(
+            "flake_input_upstream_timestamp_seconds",
+            "Upstream commit (branch) or release (tag) time for each tracked flake input",
+            flake_input_upstream_timestamp.clone(),
+        );
+
+        let flake_input_up_to_date = Family::<FlakeInputLabels, Gauge>::default();
+        registry.register(
+            "flake_input_up_to_date",
+            "1 if a tracked flake input is up to date with its upstream, 0 if behind; absent if unknown",
+            flake_input_up_to_date.clone(),
+        );
+
+        let flake_input_outdated_since = Family::<FlakeInputLabels, Gauge>::default();
+        registry.register(
+            "flake_input_outdated_since_timestamp_seconds",
+            "When a flake input that is behind was first observed that way, from its oldest missing change",
+            flake_input_outdated_since.clone(),
+        );
+
+        let flake_input_commits_behind = Family::<FlakeInputCommitsBehindLabels, Gauge>::default();
+        registry.register(
+            "flake_input_commits_behind",
+            "Commits a branch-tracking flake input is behind its upstream",
+            flake_input_commits_behind.clone(),
+        );
+
+        let flake_input_update_pr_open = Family::<FlakeInputPrLabels, Gauge>::default();
+        registry.register(
+            "flake_input_update_pr_open",
+            "1 for each open update-<input> pull request found for a tracked flake input",
+            flake_input_update_pr_open.clone(),
+        );
+
+        let flake_input_impact = Family::<FlakeInputImpactLabels, Gauge>::default();
+        registry.register(
+            "flake_input_impact",
+            "1 for each OS/kind the flake-watch Action's status file recorded for an input",
+            flake_input_impact.clone(),
+        );
+
         let rate_limit_remaining = Family::<ResourceLabels, Gauge>::default();
         registry.register(
             "exporter_rate_limit_remaining",
@@ -372,6 +467,12 @@ impl Metrics {
                 repo_monitored,
                 repos_skipped,
                 flake_input_locked_timestamp,
+                flake_input_upstream_timestamp,
+                flake_input_up_to_date,
+                flake_input_outdated_since,
+                flake_input_commits_behind,
+                flake_input_update_pr_open,
+                flake_input_impact,
                 rate_limit_remaining,
                 rate_limit_limit,
                 rate_limit_reset,

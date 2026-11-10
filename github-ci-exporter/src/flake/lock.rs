@@ -72,6 +72,14 @@ pub struct TrackedNode {
     /// revision, only a URL and a `lastModified`.
     pub locked_rev: Option<String>,
     pub locked_last_modified: Option<i64>,
+    /// The GitHub owner this node is locked to, for a `github` node. Read
+    /// from `original`, falling back to `locked` -- see [`classify`] -- so an
+    /// entry missing `original` (not expected from a real lock file) still
+    /// resolves. `None` for anything not locked through `github`, which is
+    /// what gates the upstream lookup in `super::upstream`.
+    pub owner: Option<String>,
+    /// The GitHub repository this node is locked to. See [`Self::owner`].
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +204,8 @@ fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
         channel,
         locked_rev: node.locked.as_ref().and_then(|l| l.rev.clone()),
         locked_last_modified: node.locked.as_ref().and_then(|l| l.last_modified),
+        owner: source.and_then(|r| r.owner.clone()),
+        repo: source.and_then(|r| r.repo.clone()),
     }
 }
 
@@ -422,6 +432,60 @@ mod tests {
         );
         assert_eq!(nested.kind, NodeKind::Branch);
         assert_eq!(nested.channel.as_deref(), Some("nixos-unstable"));
+    }
+
+    #[test]
+    fn a_github_nodes_owner_and_repo_are_extracted() {
+        let raw = lock_json(
+            &serde_json::json!({ "niri": "niri" }),
+            &serde_json::json!({ "niri": github_node("epireyn", "niri-flake", None, "abc", 1) }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(tracked[0].owner.as_deref(), Some("epireyn"));
+        assert_eq!(tracked[0].repo.as_deref(), Some("niri-flake"));
+    }
+
+    #[test]
+    fn owner_and_repo_fall_back_to_locked_when_original_is_absent() {
+        let raw = lock_json(
+            &serde_json::json!({ "node": "node" }),
+            &serde_json::json!({
+                "node": {
+                    "inputs": {},
+                    "locked": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "abc", "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(tracked[0].owner.as_deref(), Some("o"));
+        assert_eq!(tracked[0].repo.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn a_tarball_node_has_no_owner_or_repo() {
+        let raw = lock_json(
+            &serde_json::json!({ "node": "node" }),
+            &serde_json::json!({
+                "node": {
+                    "inputs": {},
+                    "original": {
+                        "type": "tarball",
+                        "url": "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst",
+                    },
+                    "locked": {
+                        "type": "tarball",
+                        "url": "https://releases.nixos.org/nixpkgs/x/nixexprs.tar.zst",
+                        "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(tracked[0].owner, None);
+        assert_eq!(tracked[0].repo, None);
     }
 
     #[test]
