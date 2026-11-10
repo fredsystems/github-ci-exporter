@@ -99,6 +99,21 @@ pub struct ResourceLabels {
     pub resource: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FlakeInputLabels {
+    pub repo: String,
+    /// The root input this node belongs to -- itself for a root input, or the
+    /// owning root input for a nested owned-nixpkgs node.
+    pub input: String,
+    /// The full input path, e.g. `"niri"` or `"niri/nixpkgs"`.
+    pub path: String,
+    /// The `ref` this node is locked to. Empty for the default branch and
+    /// for anything not locked through `github`.
+    pub r#ref: String,
+    /// The NixOS channel this node tracks. Empty if it does not track one.
+    pub channel: String,
+}
+
 /// Every metric family the exporter publishes.
 #[derive(Debug)]
 pub struct Metrics {
@@ -119,6 +134,9 @@ pub struct Metrics {
     pub workflow_run_stale: Family<WorkflowLabels, Gauge>,
     pub repo_monitored: Family<RepoLabels, Gauge>,
     pub repos_skipped: Family<SkipLabels, Gauge>,
+    /// Lock time of each tracked flake input. The one metric derivable from
+    /// `flake.lock` alone -- see `crate::flake`.
+    pub flake_input_locked_timestamp: Family<FlakeInputLabels, Gauge>,
     pub rate_limit_remaining: Family<ResourceLabels, Gauge>,
     pub rate_limit_limit: Family<ResourceLabels, Gauge>,
     pub rate_limit_reset: Family<ResourceLabels, Gauge>,
@@ -245,6 +263,13 @@ impl Metrics {
             repos_skipped.clone(),
         );
 
+        let flake_input_locked_timestamp = Family::<FlakeInputLabels, Gauge>::default();
+        registry.register(
+            "flake_input_locked_timestamp_seconds",
+            "Lock time of each tracked flake input, read from flake.lock alone",
+            flake_input_locked_timestamp.clone(),
+        );
+
         let rate_limit_remaining = Family::<ResourceLabels, Gauge>::default();
         registry.register(
             "exporter_rate_limit_remaining",
@@ -346,6 +371,7 @@ impl Metrics {
                 workflow_run_stale,
                 repo_monitored,
                 repos_skipped,
+                flake_input_locked_timestamp,
                 rate_limit_remaining,
                 rate_limit_limit,
                 rate_limit_reset,
@@ -713,6 +739,28 @@ mod tests {
             held,
             "the publisher mutex must be held for the duration of the closure"
         );
+    }
+
+    #[test]
+    fn flake_input_locked_timestamp_encodes_its_labels() {
+        let (metrics, registry) = Metrics::new();
+        metrics
+            .flake_input_locked_timestamp
+            .get_or_create(&FlakeInputLabels {
+                repo: "fredsystems/nixos".into(),
+                input: "niri".into(),
+                path: "niri/nixpkgs".into(),
+                r#ref: "nixos-unstable".into(),
+                channel: "nixos-unstable".into(),
+            })
+            .set(1_700_000_000);
+
+        let rendered = Publisher::new(metrics, registry).render();
+        assert!(rendered.contains("github_flake_input_locked_timestamp_seconds"));
+        assert!(rendered.contains(r#"input="niri""#));
+        assert!(rendered.contains(r#"path="niri/nixpkgs""#));
+        assert!(rendered.contains(r#"ref="nixos-unstable""#));
+        assert!(rendered.contains("1700000000"));
     }
 
     #[test]

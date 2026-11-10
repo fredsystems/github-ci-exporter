@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
+    flake::{self, FlakeCache},
     github::{Client, client::RateLimitResource, graphql, graphql::DiscoveredRepo, rest},
     metrics::{
         AuthorLabels, Metrics, Publisher, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
@@ -56,6 +57,44 @@ const fn estimate_core_requests(monitored: u64, workflows: u64) -> u64 {
         .saturating_mul(2)
         .saturating_add(workflows.saturating_mul(2))
         .saturating_add(50)
+}
+
+/// Whether the flake-lock pass is due this cycle, and the request budget to
+/// reserve for it if so.
+///
+/// Split out of [`collect`] so its pre-flight budget check can fold in the
+/// flake pass's cost with a single call, the same way it already folds in the
+/// CI sweep's.
+fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64) {
+    let due = cache.flake.should_run(config.flake_interval);
+    let cost = if due {
+        u64::try_from(config.flake_repos.len()).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    (due, cost)
+}
+
+/// Runs the flake-lock pass if due, then republishes whatever is cached.
+///
+/// Every cycle re-publishes, independent of `due`: the metrics registry
+/// [`collect`] builds is fresh each cycle, so cached data not republished
+/// here simply disappears between hourly passes -- see
+/// `flake_interval`'s documentation for why the pass itself runs on a much
+/// longer cadence than the rest of the cycle.
+async fn run_flake_stage(
+    client: &Client,
+    config: &Config,
+    metrics: &Metrics,
+    cache: &mut WorkflowCache,
+    due: bool,
+) {
+    if due {
+        flake::run_pass(client, &config.flake_repos, &mut cache.flake).await;
+    }
+    for repo in &config.flake_repos {
+        flake::record_metrics(metrics, repo, cache.flake.nodes_for(repo));
+    }
 }
 
 /// Cached per-repository workflow metadata.
@@ -113,6 +152,12 @@ pub struct WorkflowCache {
     /// cycle would be pure repeated work for a set that cannot change while
     /// the process runs.
     ignored_pulls: Option<HashSet<PullRef>>,
+    /// Cross-cycle state for the flake-lock pass: see [`crate::flake`].
+    ///
+    /// Held here, rather than as a separate argument threaded through
+    /// `main.rs`, so this cache's existing `WorkflowCache::default()`
+    /// construction picks it up with no change at the call site.
+    flake: FlakeCache,
 }
 
 impl WorkflowCache {
@@ -180,11 +225,18 @@ pub async fn collect(
     let (cycle_metrics, registry) = Metrics::new();
     let metrics = &cycle_metrics;
 
+    // Whether the flake-lock pass is due this cycle, decided up front so its
+    // request cost can be folded into the same pre-flight budget check as
+    // everything else: a cycle that affords the CI sweep but not the flake
+    // pass is still a cycle that should run, just without that pass.
+    let (flake_due, flake_request_estimate) = flake_budget(cache, config);
+
     // Pre-flight budget check. A cycle that runs out of quota halfway leaves
     // a partially-rebuilt registry: some repositories updated, others cleared
     // and never refilled, which reads as "CI vanished" on the dashboard. It is
     // strictly better to skip the cycle whole and keep the previous values.
-    let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count());
+    let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count())
+        .saturating_add(flake_request_estimate);
     if !client.can_afford(RateLimitResource::Core, estimated_core)
         || !client.can_afford(RateLimitResource::GraphQl, ESTIMATED_GRAPHQL_REQUESTS)
     {
@@ -288,6 +340,9 @@ pub async fn collect(
             record_runs(metrics, repo, &runs, cache, now);
         }
     }
+
+    // Flake input tracking: see `run_flake_stage`'s documentation.
+    run_flake_stage(client, config, metrics, cache, flake_due).await;
 
     // Self-monitoring.
     cache.monitored_count = u64::try_from(monitored.len()).unwrap_or(u64::MAX);
