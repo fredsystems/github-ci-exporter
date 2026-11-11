@@ -320,7 +320,11 @@ struct LookupKey {
 enum LookupKeyKind {
     /// `None` is the default branch.
     Branch(Option<String>),
-    Tag,
+    /// The newest tag, for a node pinned to the tag named here. The pinned
+    /// name is part of the key because a branch of the same name, if the
+    /// repository has one, is what Nix actually locks (see
+    /// [`ResolvedUpstream::shadow_branch_oid`]).
+    Tag(String),
 }
 
 /// The upstream lookup a node needs, or `None` for a node with nothing to
@@ -331,7 +335,7 @@ fn lookup_key_for(node: &TrackedNode) -> Option<LookupKey> {
     let repo = node.repo.clone()?;
     let kind = match node.kind {
         NodeKind::Branch => LookupKeyKind::Branch(node.reference.clone()),
-        NodeKind::Tag => LookupKeyKind::Tag,
+        NodeKind::Tag => LookupKeyKind::Tag(node.reference.clone()?),
         NodeKind::ChannelTarball | NodeKind::Untracked => return None,
     };
     Some(LookupKey { owner, repo, kind })
@@ -588,9 +592,19 @@ async fn apply_upstream(
         // commit after the fact, which still resolves the same name. Only
         // agreement on *both* the name and the commit it now points to
         // means nothing has changed underneath the lock.
+        //
+        // "The commit it now points to" is what Nix resolves the ref to: a
+        // same-named branch's head when one exists (Nix prefers the branch),
+        // else the tag's commit. Comparing against the tag's commit there
+        // would report the newest release as outdated forever, since no
+        // update could ever lock it.
         NodeKind::Tag => {
+            let resolves_to = resolved
+                .shadow_branch_oid
+                .as_deref()
+                .unwrap_or(resolved.oid.as_str());
             if node.reference.as_deref() == resolved.tag_name.as_deref()
-                && node.locked_rev.as_deref() == Some(resolved.oid.as_str())
+                && node.locked_rev.as_deref() == Some(resolves_to)
             {
                 Freshness::UpToDate
             } else {
@@ -766,10 +780,16 @@ fn build_query(upstream: &[&LookupKey], prs: &[&PrLookup]) -> (String, serde_jso
                     "  u{index}: repository(owner: ${owner_var}, name: ${name_var}) {{ defaultBranchRef {{ target {{ ... on Commit {{ oid committedDate }} }} }} }}",
                 );
             }
-            LookupKeyKind::Tag => {
+            LookupKeyKind::Tag(pinned) => {
+                let shadow_var = format!("shadow{index}");
+                declarations.push(format!("${shadow_var}: String!"));
+                variables.insert(
+                    shadow_var.clone(),
+                    serde_json::json!(format!("refs/heads/{pinned}")),
+                );
                 let _ = writeln!(
                     body,
-                    "  u{index}: repository(owner: ${owner_var}, name: ${name_var}) {{ latestRelease {{ tagName tagCommit {{ oid committedDate }} }} refs(refPrefix: \"refs/tags/\", first: 1, orderBy: {{field: TAG_COMMIT_DATE, direction: DESC}}) {{ nodes {{ name target {{ __typename ... on Commit {{ oid committedDate }} ... on Tag {{ target {{ ... on Commit {{ oid committedDate }} }} }} }} }} }} }}",
+                    "  u{index}: repository(owner: ${owner_var}, name: ${name_var}) {{ latestRelease {{ tagName tagCommit {{ oid committedDate }} }} refs(refPrefix: \"refs/tags/\", first: 1, orderBy: {{field: TAG_COMMIT_DATE, direction: DESC}}) {{ nodes {{ name target {{ __typename ... on Commit {{ oid committedDate }} ... on Tag {{ target {{ ... on Commit {{ oid committedDate }} }} }} }} }} }} shadowBranch: ref(qualifiedName: ${shadow_var}) {{ target {{ ... on Commit {{ oid }} }} }} }}",
                 );
             }
         }
@@ -805,6 +825,13 @@ struct ResolvedUpstream {
     oid: String,
     committed_at: i64,
     tag_name: Option<String>,
+    /// For a tag lookup: the head of a *branch* with the pinned tag's name,
+    /// when the repository has one. Nix resolves `github:owner/repo/<ref>`
+    /// to a branch before a tag of the same name, so that branch head --
+    /// not the tag's commit -- is what the lock holds and what
+    /// `nix flake update` would move it to. gmodena/nix-flatpak has both a
+    /// `v0.8.0` tag and a `v0.8.0` branch, at different commits.
+    shadow_branch_oid: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -816,13 +843,25 @@ struct UpstreamNode {
     #[serde(rename = "latestRelease")]
     latest_release: Option<LatestRelease>,
     refs: Option<RefsConnection>,
+    #[serde(rename = "shadowBranch")]
+    shadow_branch: Option<ShadowBranch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowBranch {
+    target: Option<ShadowTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowTarget {
+    oid: Option<String>,
 }
 
 impl UpstreamNode {
     fn resolve(&self, kind: &LookupKeyKind) -> Option<ResolvedUpstream> {
         match kind {
             LookupKeyKind::Branch(_) => self.resolve_branch(),
-            LookupKeyKind::Tag => self.resolve_tag(),
+            LookupKeyKind::Tag(_) => self.resolve_tag(),
         }
     }
 
@@ -833,10 +872,16 @@ impl UpstreamNode {
             oid: target.oid.clone(),
             committed_at: target.committed_date.timestamp(),
             tag_name: None,
+            shadow_branch_oid: None,
         })
     }
 
     fn resolve_tag(&self) -> Option<ResolvedUpstream> {
+        let shadow_branch_oid = self
+            .shadow_branch
+            .as_ref()
+            .and_then(|branch| branch.target.as_ref())
+            .and_then(|target| target.oid.clone());
         if let Some(release) = &self.latest_release
             && let Some(commit) = &release.tag_commit
         {
@@ -844,6 +889,7 @@ impl UpstreamNode {
                 oid: commit.oid.clone(),
                 committed_at: commit.committed_date.timestamp(),
                 tag_name: Some(release.tag_name.clone()),
+                shadow_branch_oid,
             });
         }
         // `latestRelease` is only populated for a repository using GitHub
@@ -858,6 +904,7 @@ impl UpstreamNode {
             oid: commit.oid.clone(),
             committed_at: commit.committed_date.timestamp(),
             tag_name: Some(node.name.clone()),
+            shadow_branch_oid,
         })
     }
 }
@@ -1139,7 +1186,7 @@ mod tests {
             LookupKey {
                 owner: "o".into(),
                 repo: "tagged".into(),
-                kind: LookupKeyKind::Tag,
+                kind: LookupKeyKind::Tag("v1.0.0".into()),
             },
         ];
         let refs: Vec<&LookupKey> = keys.iter().collect();
@@ -1158,6 +1205,11 @@ mod tests {
         );
         assert!(query.contains("u1: repository(owner: $owner1, name: $name1) { defaultBranchRef"));
         assert!(query.contains("u2: repository(owner: $owner2, name: $name2) { latestRelease"));
+        assert!(query.contains("shadowBranch: ref(qualifiedName: $shadow2)"));
+        assert_eq!(
+            variables.get("shadow2").and_then(|v| v.as_str()),
+            Some("refs/heads/v1.0.0")
+        );
         assert!(query.contains("refPrefix: \"refs/tags/\""));
         assert!(query.contains("TAG_COMMIT_DATE"));
         assert!(query.contains(
@@ -2260,6 +2312,107 @@ mod tests {
             "the upstream oid moved, so the previous comparison no longer applies"
         );
         assert_eq!(second.commits_behind, None);
+    }
+
+    /// Runs one pass for a single tag node against a canned `u0` response.
+    async fn tag_freshness(u0: serde_json::Value, node: &TrackedNode) -> Freshness {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "data": { "u0": u0 } })),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let mut nodes_by_repo = HashMap::new();
+        nodes_by_repo.insert("o/r".to_owned(), vec![node.clone()]);
+        let mut cache = UpstreamCache::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_pass(
+            &client,
+            &["o/r".to_owned()],
+            &nodes_by_repo,
+            &mut cache,
+            dir.path(),
+            1,
+        )
+        .await;
+        cache
+            .status_for("o/r", node)
+            .expect("status recorded")
+            .freshness
+    }
+
+    #[tokio::test]
+    async fn the_newest_tag_shadowed_by_a_same_named_branch_reads_up_to_date() {
+        // gmodena/nix-flatpak: tag v0.8.0 and branch v0.8.0 at different
+        // commits. Nix locks the branch, so the lock holds the branch head
+        // and can never hold the tag's commit.
+        let node = tag_node(
+            "nix-flatpak",
+            "gmodena",
+            "nix-flatpak",
+            "v0.8.0",
+            "branchoid",
+        );
+        let freshness = tag_freshness(
+            serde_json::json!({
+                "latestRelease": {
+                    "tagName": "v0.8.0",
+                    "tagCommit": { "oid": "tagoid", "committedDate": "2026-01-01T00:00:00Z" }
+                },
+                "shadowBranch": { "target": { "oid": "branchoid" } }
+            }),
+            &node,
+        )
+        .await;
+        assert_eq!(freshness, Freshness::UpToDate);
+    }
+
+    #[tokio::test]
+    async fn a_shadowing_branch_that_moved_reads_behind() {
+        // The lock is on the old branch head: `nix flake update` would move
+        // it to the new one, so it is behind even though the tag name is the
+        // newest release.
+        let node = tag_node(
+            "nix-flatpak",
+            "gmodena",
+            "nix-flatpak",
+            "v0.8.0",
+            "oldbranchoid",
+        );
+        let freshness = tag_freshness(
+            serde_json::json!({
+                "latestRelease": {
+                    "tagName": "v0.8.0",
+                    "tagCommit": { "oid": "tagoid", "committedDate": "2026-01-01T00:00:00Z" }
+                },
+                "shadowBranch": { "target": { "oid": "newbranchoid" } }
+            }),
+            &node,
+        )
+        .await;
+        assert_eq!(freshness, Freshness::Behind);
+    }
+
+    #[tokio::test]
+    async fn without_a_shadowing_branch_the_tag_commit_still_decides() {
+        // No same-named branch (`ref` is null): Finding J is unchanged.
+        let node = tag_node("opencode", "sst", "opencode", "v1.0.0", "original-oid");
+        let freshness = tag_freshness(
+            serde_json::json!({
+                "latestRelease": {
+                    "tagName": "v1.0.0",
+                    "tagCommit": { "oid": "moved-oid", "committedDate": "2026-01-01T00:00:00Z" }
+                },
+                "shadowBranch": null
+            }),
+            &node,
+        )
+        .await;
+        assert_eq!(freshness, Freshness::Behind);
     }
 
     #[tokio::test]
