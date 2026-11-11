@@ -38,6 +38,9 @@ prometheus-client = "0.25.0"
 reqwest = { version = "0.13.4", default-features = false, features = [
   "gzip",
   "json",
+  # Only `NixosClient` (the NixOS Prometheus instant-query client) uses
+  # `RequestBuilder::query`; everything else builds its URLs by hand.
+  "query",
   "rustls",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }

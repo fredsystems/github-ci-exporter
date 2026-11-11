@@ -202,7 +202,20 @@ fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
         kind,
         reference,
         channel,
-        locked_rev: node.locked.as_ref().and_then(|l| l.rev.clone()),
+        locked_rev: match kind {
+            // A tarball's `locked.rev`, when Nix populates it at all, is the
+            // *full* revision; comparing a channel-tarball node's freshness
+            // (3.6) needs the *short* one actually embedded in the URL, so
+            // it is always derived from there rather than trusted from
+            // `rev` -- which also means this works on the older lock shape
+            // that carries no `rev` for a tarball node at all.
+            NodeKind::ChannelTarball => node
+                .locked
+                .as_ref()
+                .and_then(|l| l.url.as_deref())
+                .and_then(tarball_locked_rev),
+            _ => node.locked.as_ref().and_then(|l| l.rev.clone()),
+        },
         locked_last_modified: node.locked.as_ref().and_then(|l| l.last_modified),
         owner: source.and_then(|r| r.owner.clone()),
         repo: source.and_then(|r| r.repo.clone()),
@@ -253,6 +266,28 @@ fn channel_of_url(url: &str) -> Option<String> {
     }
     let first_segment = rest.split('/').next()?;
     (!first_segment.is_empty()).then(|| first_segment.to_owned())
+}
+
+/// Extracts a `channels.nixos.org` tarball's short revision from its
+/// *locked* (not `original`) URL, e.g.
+/// `https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1104102.e62746b0b472/nixexprs.tar.zst`
+/// -> `"e62746b0b472"`. `original`'s URL is the `channels.nixos.org` one and
+/// carries no revision at all; only the resolved `releases.nixos.org` URL in
+/// `locked` does.
+///
+/// The revision is everything after the last `.` in the second-to-last path
+/// segment -- nixpkgs' release directory naming
+/// (`nixpkgs-<version>.<short-rev>`) is the only shape this needs to
+/// understand. Returns `None` for anything that does not fit it, which
+/// leaves the node's `locked_rev` absent rather than a guess.
+fn tarball_locked_rev(url: &str) -> Option<String> {
+    let segments: Vec<&str> = url.split('/').collect();
+    let dir = segments
+        .len()
+        .checked_sub(2)
+        .and_then(|i| segments.get(i))?;
+    let (_, short_rev) = dir.rsplit_once('.')?;
+    (!short_rev.is_empty()).then(|| short_rev.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,8 +681,63 @@ mod tests {
         assert_eq!(tracked[0].channel.as_deref(), Some("nixpkgs-unstable"));
         assert_eq!(tracked[0].locked_last_modified, Some(1_794_000_000));
         assert_eq!(
+            tracked[0].locked_rev,
+            Some("e62746b0b472".to_owned()),
+            "a tarball's locked_rev is the short revision embedded in its locked URL"
+        );
+    }
+
+    #[test]
+    fn a_tarball_node_with_an_already_present_full_rev_still_uses_the_short_url_revision() {
+        // Some lock shapes carry a `rev` alongside the tarball's `url` -- the
+        // full 40-char revision, of which the URL's short revision is a
+        // prefix. `locked_rev` must still be the short one: 3.6's freshness
+        // comparison matches it as a prefix of the channel's full revision.
+        let raw = lock_json(
+            &serde_json::json!({ "node": "node" }),
+            &serde_json::json!({
+                "node": {
+                    "inputs": {},
+                    "original": {
+                        "type": "tarball",
+                        "url": "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst",
+                    },
+                    "locked": {
+                        "type": "tarball",
+                        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1104102.e62746b0b472/nixexprs.tar.zst",
+                        "rev": "e62746b0b472753ef019baceab6f1e2e52014980",
+                        "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(tracked[0].locked_rev, Some("e62746b0b472".to_owned()));
+    }
+
+    #[test]
+    fn a_tarball_url_with_no_dot_in_its_directory_has_no_locked_rev() {
+        let raw = lock_json(
+            &serde_json::json!({ "node": "node" }),
+            &serde_json::json!({
+                "node": {
+                    "inputs": {},
+                    "original": {
+                        "type": "tarball",
+                        "url": "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst",
+                    },
+                    "locked": {
+                        "type": "tarball",
+                        "url": "https://releases.nixos.org/nixpkgs/x/nixexprs.tar.zst",
+                        "lastModified": 1,
+                    },
+                },
+            }),
+        );
+        let tracked = tracked_nodes(&raw).expect("parses");
+        assert_eq!(
             tracked[0].locked_rev, None,
-            "a tarball has no rev, only a URL and a modification time"
+            "no `.` in the directory segment means no revision to extract"
         );
     }
 
@@ -757,6 +847,10 @@ mod tests {
             by_path("catppuccin/nixpkgs").expect("catppuccin owns its nixpkgs");
         assert_eq!(catppuccin_nixpkgs.kind, NodeKind::ChannelTarball);
         assert_eq!(catppuccin_nixpkgs.input, "catppuccin");
+        assert_eq!(
+            catppuccin_nixpkgs.locked_rev,
+            Some("e62746b0b472".to_owned())
+        );
 
         assert!(
             by_path("niri/nixpkgs").is_some(),

@@ -117,6 +117,41 @@ pub struct NodeStatus {
     identity: NodeIdentity,
 }
 
+impl NodeStatus {
+    /// Builds a [`NodeStatus`] for `node` whose freshness is already known
+    /// outright, rather than derived from this module's own GitHub
+    /// comparison.
+    ///
+    /// The identity-carrying constructor [`super::channels`] (3.6) needs: a
+    /// channel-tarball node's upstream is a NixOS channel, not anything this
+    /// module's GraphQL query resolves, so that module computes its own
+    /// freshness and uses this to stamp the result with `node`'s
+    /// [`NodeIdentity`] -- the same identity [`UpstreamCache::status_for`]
+    /// checks at publish time -- without reaching into a private field.
+    /// `comparison` is always [`ComparisonState::Complete`]: there is no
+    /// REST compare to fail for a node with no GitHub lookup at all, so
+    /// nothing here can ever be `Pending`.
+    #[must_use]
+    pub fn for_node(
+        node: &TrackedNode,
+        upstream_oid: String,
+        upstream_tag: Option<String>,
+        upstream_committed_at: i64,
+        freshness: Freshness,
+    ) -> Self {
+        Self {
+            upstream_oid,
+            upstream_tag,
+            upstream_committed_at,
+            freshness,
+            outdated_since: None,
+            commits_behind: None,
+            comparison: ComparisonState::Complete,
+            identity: NodeIdentity::of(node),
+        }
+    }
+}
+
 /// Cross-cycle state for the upstream pass.
 #[derive(Debug, Default)]
 pub struct UpstreamCache {
@@ -159,6 +194,39 @@ impl UpstreamCache {
         self.open_prs
             .get(&(repo.to_owned(), input.to_owned()))
             .copied()
+    }
+
+    /// Records a tracked node's [`NodeStatus`] directly, bypassing this
+    /// pass's own GitHub lookup.
+    ///
+    /// The other seam `super::channels` (3.6) needs to publish a
+    /// channel-tarball node's freshness through the exact same
+    /// `github_flake_input_*` families this module already renders: its
+    /// upstream is a NixOS channel, not anything this module's own GraphQL
+    /// query resolves, so it computes the [`NodeStatus`] itself -- via
+    /// [`NodeStatus::for_node`], so it still carries the right
+    /// [`NodeIdentity`] -- and stores it here rather than this module
+    /// growing a second upstream-lookup strategy.
+    pub fn set_status(&mut self, repo: &str, path: &str, status: NodeStatus) {
+        self.statuses
+            .insert((repo.to_owned(), path.to_owned()), status);
+    }
+
+    /// Records `identity` as behind, returning the timestamp it was first
+    /// observed that way -- see [`FirstSeenStore::observe_behind`].
+    ///
+    /// Exposed so [`super::channels`] can measure a channel-tarball node's
+    /// `outdated_since` from its own identity (its locked revision, not the
+    /// channel's -- see that module's documentation for why) without this
+    /// module growing tarball-specific logic of its own.
+    pub fn observe_behind(&mut self, identity: &str, now: i64) -> i64 {
+        self.first_seen.observe_behind(identity, now)
+    }
+
+    /// Clears `identity`'s first-seen entry -- see
+    /// [`FirstSeenStore::clear`] and [`Self::observe_behind`].
+    pub fn clear_behind(&mut self, identity: &str) {
+        self.first_seen.clear(identity);
     }
 
     /// Requests this pass should budget for, based on the previous pass's
