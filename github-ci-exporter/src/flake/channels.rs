@@ -553,7 +553,7 @@ pub fn apply_tarball_freshness<S: BuildHasher>(
                 freshness,
             );
 
-            let identity = tarball_first_seen_identity(repo, &node.path, locked);
+            let identity = tarball_first_seen_identity(repo, &node.path, channel_name, locked);
             match freshness {
                 Freshness::Behind => {
                     status.outdated_since = Some(upstream.observe_behind(&identity, now));
@@ -573,13 +573,13 @@ pub fn apply_tarball_freshness<S: BuildHasher>(
 }
 
 /// The identity a channel-tarball node's first-seen entry is stored under:
-/// `<repo>|<path>|<locked short revision>`. Keyed on the node's own lock
-/// rather than the channel's current revision, so the clock survives the
-/// channel moving further ahead while the node stays exactly as behind as it
-/// already was, and only resets once the lock itself changes or the node
-/// catches up.
-fn tarball_first_seen_identity(repo: &str, path: &str, locked_rev: &str) -> String {
-    format!("{repo}|{path}|{locked_rev}")
+/// `<repo>|<path>|<channel>|<locked short revision>`. Keyed on the node's
+/// own lock rather than the channel's current revision, so the clock survives
+/// the channel moving further ahead while the node stays exactly as behind as
+/// it already was, and only resets once the lock itself changes, the node is
+/// repointed at another channel, or it catches up.
+fn tarball_first_seen_identity(repo: &str, path: &str, channel: &str, locked_rev: &str) -> String {
+    format!("{repo}|{path}|{channel}|{locked_rev}")
 }
 
 /// Publishes every `nixos_channel_*` family for the currently cached state.
@@ -1288,6 +1288,16 @@ mod tests {
             3,
         );
         assert!(upstream.status_for("fredsystems/nixos", &lock_b).is_none());
+    }
+
+    #[test]
+    fn a_tarball_moved_to_another_channel_starts_a_new_first_seen_key() {
+        // Same repo, path and locked revision, different channel: the new
+        // channel must not inherit the old channel's outdated-since clock.
+        assert_ne!(
+            tarball_first_seen_identity("o/r", "catppuccin/nixpkgs", "nixos-unstable", "abc"),
+            tarball_first_seen_identity("o/r", "catppuccin/nixpkgs", "nixpkgs-unstable", "abc")
+        );
     }
 
     fn tarball_node(path: &str, channel: &str, locked_rev: &str) -> TrackedNode {
