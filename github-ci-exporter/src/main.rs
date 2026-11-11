@@ -6,6 +6,7 @@ use clap::Parser;
 use github_ci_exporter::{
     collector::{self, CycleOutcome, WorkflowCache},
     config::Config,
+    flake::NixosClient,
     github::Client,
     metrics::{Metrics, Publisher},
     server,
@@ -49,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let cache_path = config.state_dir.join("etags.json");
     let client = Client::new(&token, &config.github_api_url, &config.github_graphql_url)?
         .with_cache_file(&cache_path);
+    let nixos_client = NixosClient::new(&config.nixos_prometheus_url)?;
 
     if cli.check {
         info!(
@@ -99,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                match collector::collect(&client, &config, &publisher, &mut cache).await {
+                match collector::collect(&client, &nixos_client, &config, &publisher, &mut cache).await {
                     Ok(CycleOutcome::Complete) => info!("collection cycle complete"),
                     Ok(CycleOutcome::BypassedLowBudget) => {
                         warn!("collection cycle bypassed to protect the API budget");

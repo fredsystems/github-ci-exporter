@@ -7,11 +7,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
-    flake::{self, FlakeCache},
+    flake::{self, FlakeCache, NixosClient},
     github::{Client, client::RateLimitResource, graphql, graphql::DiscoveredRepo, rest},
     metrics::{
-        AuthorLabels, Metrics, Publisher, PullLabels, RepoLabels, ResourceLabels, SkipLabels,
-        WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
+        AuthorLabels, ChannelMetrics, Metrics, Publisher, PullLabels, RepoLabels, ResourceLabels,
+        SkipLabels, WorkflowEnabledLabels, WorkflowLabels, WorkflowStateLabels, author_label,
     },
     model::{PullRef, Repo, RepoIndex, SkipReason},
 };
@@ -151,16 +151,24 @@ fn decide_budget(
 /// when the pass is not due and when it is due but the cycle could not afford
 /// it alongside CI -- in the latter case the pass stays due, so it is
 /// retried next cycle.
+///
+/// NixOS channel status (`channel_metrics`) is republished unconditionally
+/// too, and for the same reason -- it runs nested inside the flake pass, on
+/// the same cadence, and does not draw on the GitHub rate-limit budget this
+/// function's own gating is about.
 async fn run_flake_stage(
     client: &Client,
+    nixos_client: &NixosClient,
     config: &Config,
     metrics: &Metrics,
+    channel_metrics: &ChannelMetrics,
     cache: &mut WorkflowCache,
     run_flake: bool,
 ) {
     if run_flake {
         flake::run_pass(
             client,
+            nixos_client,
             &config.flake_repos,
             &config.state_dir,
             &mut cache.flake,
@@ -170,6 +178,7 @@ async fn run_flake_stage(
     for repo in &config.flake_repos {
         flake::record_all_metrics(metrics, repo, &cache.flake);
     }
+    flake::channels::record_metrics(channel_metrics, cache.flake.channels());
 }
 
 /// Cached per-repository workflow metadata.
@@ -288,6 +297,7 @@ pub enum CycleOutcome {
 #[allow(clippy::too_many_lines)] // One linear cycle; splitting it would scatter the stages it documents.
 pub async fn collect(
     client: &Client,
+    nixos_client: &NixosClient,
     config: &Config,
     publisher: &Publisher,
     cache: &mut WorkflowCache,
@@ -300,6 +310,8 @@ pub async fn collect(
     // exist are absent by construction rather than by an explicit clear.
     let (cycle_metrics, registry) = Metrics::new();
     let metrics = &cycle_metrics;
+    // Same contract, second registry: see `Publisher::publish_with_channels`.
+    let (channel_metrics, channel_registry) = ChannelMetrics::new();
 
     // Pre-flight budget check: bypasses the whole cycle if CI alone is
     // unaffordable, otherwise decides whether the flake pass (if due) also
@@ -392,7 +404,16 @@ pub async fn collect(
     }
 
     // Flake input tracking: see `run_flake_stage`'s documentation.
-    run_flake_stage(client, config, metrics, cache, run_flake).await;
+    run_flake_stage(
+        client,
+        nixos_client,
+        config,
+        metrics,
+        &channel_metrics,
+        cache,
+        run_flake,
+    )
+    .await;
 
     // Self-monitoring.
     cache.monitored_count = u64::try_from(monitored.len()).unwrap_or(u64::MAX);
@@ -405,7 +426,7 @@ pub async fn collect(
     metrics.last_success_timestamp.set(now.timestamp());
 
     // The single point at which any of this becomes visible to a scrape.
-    publisher.publish(cycle_metrics, registry);
+    publisher.publish_with_channels(cycle_metrics, registry, channel_registry);
 
     if let Err(error) = client.persist_cache() {
         warn!(%error, "failed to persist etag cache");
@@ -1990,6 +2011,27 @@ mod tests {
             .expect("client builds")
     }
 
+    fn nixos_client_for(server: &wiremock::MockServer) -> flake::NixosClient {
+        flake::NixosClient::new(&server.uri()).expect("nixos client builds")
+    }
+
+    /// `sample_flake_lock`'s `nixpkgs` node tracks `nixos-unstable`, so any
+    /// cycle that runs the flake pass against it triggers a NixOS channel
+    /// fetch. None of these budget tests assert on channel status, so all
+    /// three queries are stubbed with an empty-but-successful result.
+    async fn mock_empty_channel_queries(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/query"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "success",
+                    "data": { "resultType": "vector", "result": [] },
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn a_workflow_the_shared_page_missed_is_topped_up() {
         // Dropping the `branch=` filter means the shared page is diluted by
@@ -2514,6 +2556,7 @@ mod tests {
         // for just this cycle, and its cached metrics must still publish.
         let server = wiremock::MockServer::start().await;
         mock_empty_discovery().mount(&server).await;
+        mock_empty_channel_queries(&server).await;
         // Exactly one flake.lock fetch across both cycles: the first
         // populates the cache and the rate-limit budget, the second must not
         // repeat it.
@@ -2539,6 +2582,7 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let config = flake_only_config();
         let (metrics, registry) = Metrics::new();
         let publisher = Publisher::new(metrics, registry);
@@ -2548,14 +2592,14 @@ mod tests {
         // pre-flight check cannot yet see a constrained budget. This cycle
         // exists only to populate the cache and the budget via the response
         // headers above.
-        let first = collect(&client, &config, &publisher, &mut cache)
+        let first = collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle one");
         assert_eq!(first, CycleOutcome::Complete);
         assert_eq!(client.reserve(), 250, "assumed by the header value above");
 
         // Cycle two: the budget now covers CI alone but not CI plus flake.
-        let second = collect(&client, &config, &publisher, &mut cache)
+        let second = collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle two");
         assert_eq!(
@@ -2675,6 +2719,7 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let config = flake_only_config();
         let (metrics, registry) = Metrics::new();
         let publisher = Publisher::new(metrics, registry);
@@ -2684,7 +2729,7 @@ mod tests {
         // cannot yet see a constrained budget. This cycle exists only to
         // populate the cache and both rate-limit buckets via the response
         // headers above.
-        let first = collect(&client, &config, &publisher, &mut cache)
+        let first = collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle one");
         assert_eq!(first, CycleOutcome::Complete);
@@ -2692,7 +2737,7 @@ mod tests {
         // Cycle two: the core pool comfortably covers CI plus flake, but the
         // GraphQL pool covers CI alone and not CI plus the flake pass's two
         // batches.
-        let second = collect(&client, &config, &publisher, &mut cache)
+        let second = collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle two");
         assert_eq!(
@@ -2721,6 +2766,7 @@ mod tests {
     async fn budget_covering_ci_plus_flake_runs_the_flake_pass() {
         let server = wiremock::MockServer::start().await;
         mock_empty_discovery().mount(&server).await;
+        mock_empty_channel_queries(&server).await;
         // Hit on cycle one (to seed the budget) and again on cycle two, since
         // the budget comfortably covers both.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2740,15 +2786,16 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let config = flake_only_config();
         let (metrics, registry) = Metrics::new();
         let publisher = Publisher::new(metrics, registry);
         let mut cache = WorkflowCache::default();
 
-        collect(&client, &config, &publisher, &mut cache)
+        collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle one");
-        let second = collect(&client, &config, &publisher, &mut cache)
+        let second = collect(&client, &nixos_client, &config, &publisher, &mut cache)
             .await
             .expect("cycle two");
 

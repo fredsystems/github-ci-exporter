@@ -282,6 +282,11 @@ discovery drops repositories with no default branch.
 | `github_exporter_api_not_modified`                 | gauge   | --                                                  |
 | `github_exporter_api_requests_skipped`             | gauge   | --                                                  |
 
+Every metric above lives in the exporter's own `github_`-prefixed registry.
+`/metrics` also serves a second, **unprefixed** `nixos_channel_*` registry in
+the same response -- see "NixOS channel status" under "Flake input tracking"
+below.
+
 `author_kind` is `human` or `bot`. This is what allows a dashboard to show bot
 activity for visibility while alert rules select only `author_kind="human"`.
 
@@ -297,11 +302,13 @@ for the default branch or for anything not locked through `github`), and
 otherwise). See "Flake input tracking" above.
 
 The remaining `github_flake_input_*` families compare that lock against its
-upstream, read from a single aliased GraphQL query every flake pass:
+upstream: a GitHub-locked node's upstream comes from a single aliased
+GraphQL query every flake pass, and a channel-tarball node's comes from
+NixOS channel status -- see "NixOS channel status" below.
 
 - `github_flake_input_upstream_timestamp_seconds` is the upstream commit time
-  for a branch-tracking input, or the newest release's commit time for a
-  tag-pinned one.
+  for a branch-tracking input, the newest release's commit time for a
+  tag-pinned one, or the channel's last-moved time for a channel tarball.
 - `github_flake_input_up_to_date` is `1` when the lock matches that upstream,
   `0` when it does not. When a node's upstream lookup fails this pass -- a
   transport error, or the whole GraphQL batch rejected -- the previously
@@ -312,16 +319,23 @@ upstream, read from a single aliased GraphQL query every flake pass:
   different: that is confirmed gone rather than merely unreachable, so any
   previously cached status for it is dropped instead of kept. "No series at
   all" therefore covers two cases, not every failed lookup: an input that
-  has never once resolved (including one with no upstream notion yet, a
-  channel tarball), and one whose repository has just been confirmed gone.
+  has never once resolved -- including a channel tarball before any NixOS
+  channel status has been cached for it -- and one whose repository has just
+  been confirmed gone.
 - `github_flake_input_outdated_since_timestamp_seconds` is published only
   when an input is behind, and is measured from the **oldest** change it is
   missing, not the newest, so a busy upstream cannot keep resetting the
   clock. For a branch this comes from a REST compare between the locked
-  revision and the upstream head; for a tag-pinned input, which has no
-  compare to measure from, it is the first time the exporter observed that
-  input behind that particular upstream tag, persisted to
-  `<state_dir>/flake-first-seen.json` and cleared again once it catches up.
+  revision and the upstream head; for a tag-pinned input or a channel
+  tarball, neither of which has a compare to measure from, it is the first
+  time the exporter observed that input behind the revision (a tag, or a
+  channel-tarball node's own locked revision) it is currently pinned
+  against, persisted to `<state_dir>/flake-first-seen.json` and cleared
+  again once it catches up. A channel tarball's identity is deliberately its
+  *own* locked revision, not the channel's -- the channel moves far more
+  often than the lock does, and keying the clock to it would restart "how
+  long has this been outdated" on every channel update even though the node
+  stayed exactly as behind as before.
 - `github_flake_input_commits_behind` is published only for a branch-tracking
   input that is behind, from the same REST compare.
 - `github_flake_input_update_pr_open` is `1` for each open
@@ -438,10 +452,11 @@ registry from scratch and discards it only once the new one is complete (see
 
 ### Upstream comparison
 
-Every GitHub-locked tracked node (a branch or a release tag, never a channel
-tarball -- that is later work) is compared against its upstream in the same
-pass, through **one** aliased GraphQL query per cycle, batched to at most 50
-aliases per request:
+Every GitHub-locked tracked node (a branch or a release tag) is compared
+against its upstream in the same pass, through **one** aliased GraphQL query
+per cycle, batched to at most 50 aliases per request. A channel-tarball node
+is compared separately, against NixOS channel status -- see "NixOS channel
+status" below.
 
 - A **branch** node's upstream is its branch head (or the default branch's
   head, for a node with no `ref`).
@@ -464,9 +479,66 @@ dropped rather than republished (see `github_flake_input_up_to_date` above).
 
 A node that is behind gets one more fetch: a branch gets a REST compare
 between its locked revision and the upstream head, cached the same way every
-other REST response in this exporter is, and a tag gets its first-seen
-timestamp recorded (or left alone, if already recorded) -- see
-`github_flake_input_outdated_since_timestamp_seconds` above.
+other REST response in this exporter is, and a tag or a channel tarball gets
+its first-seen timestamp recorded (or left alone, if already recorded) --
+see `github_flake_input_outdated_since_timestamp_seconds` above.
+
+### NixOS channel status
+
+Prometheus treats a series as stale after 5 minutes without a sample, so
+federating `prometheus.nixos.org` on this exporter's hourly cadence would
+leave gaps, and federating it every few minutes would not be a good
+neighbour. Instead, once per flake pass -- and only when at least one
+tracked node across every `flake_repos` entry actually tracks a channel --
+the exporter runs three instant queries against `nixos_prometheus_url`
+(`https://prometheus.nixos.org` by default) for exactly the channels those
+nodes reference:
+
+- `channel_revision` for each channel's current revision and whether it is
+  still supported (`current="1"`, `current="0"` for end of life).
+- `channel_update_time` for when that revision last changed.
+- `hydra_job_failed{exported_job=~".*tested"}` for whether any of a
+  channel's `tested`-suffixed Hydra jobs -- the gate every package in the
+  channel sits behind -- is currently failing.
+
+The result is cached and republished every scrape regardless of whether the
+pass itself ran this cycle, exactly like every other flake metric. A failed
+fetch (transport error, a non-success status, or an unparsable response,
+after one short retry) keeps the previously cached values and is reported
+through `nixos_channel_status_up`, rather than either blocking the flake
+pass or publishing a false `EndOfLife`/`Failing` reading.
+
+This is also the exporter's first non-GitHub origin: a separate,
+unauthenticated HTTP client identifies itself with its own `User-Agent` and
+shares none of the GitHub client's `ETag` cache or rate-limit bookkeeping.
+
+A **channel-tarball** node's (`catppuccin/nixpkgs`, say) upstream is its
+channel's current revision from `channel_revision`, compared against the
+short revision embedded in the node's own locked `releases.nixos.org` URL
+(`nixpkgs-26.11pre1104102.e62746b0b472` -> `e62746b0b472`): up to date if the
+channel's revision starts with it, behind otherwise. These feed the same
+`github_flake_input_*` families every other tracked node does -- no separate
+metric family exists for a channel tarball's own freshness.
+
+Published **unprefixed**, alongside the exporter's `github_`-prefixed
+registry in the same `/metrics` response, because these describe NixOS
+infrastructure the exporter merely observes:
+
+| Metric                                   | Type  | Labels    |
+| ----------------------------------------- | ----- | --------- |
+| `nixos_channel_update_timestamp_seconds` | gauge | `channel` |
+| `nixos_channel_current`                  | gauge | `channel` |
+| `nixos_channel_tested_failed`            | gauge | `channel` |
+| `nixos_channel_status_up`                | gauge | --        |
+
+`nixos_channel_current` is `1` if the channel is still supported, `0` if it
+is end of life. `nixos_channel_tested_failed` is `1` if any of a channel's
+`tested`-suffixed Hydra jobs is failing, `0` if all are passing, and absent
+if the channel has never been evaluated by one. `nixos_channel_status_up` is
+`1` if the last fetch succeeded, `0` if it failed and cached values are
+being served, and absent entirely before the exporter has ever attempted a
+fetch -- which, since the fetch itself only runs when a tracked node
+references a channel, includes every deployment that never configures one.
 
 ### Impact
 
@@ -493,6 +565,7 @@ skip_repos_without_workflows = true
 # max_repo_age = "365d"
 flake_repos = []
 flake_interval = "1h"
+nixos_prometheus_url = "https://prometheus.nixos.org"
 ```
 
 The token is never a config-file field. Supply it with `GHCI_TOKEN` or

@@ -28,7 +28,10 @@
 use std::sync::{Arc, Mutex};
 
 use prometheus_client::{
-    encoding::{EncodeLabelSet, text::encode},
+    encoding::{
+        EncodeLabelSet,
+        text::{encode_eof, encode_registry},
+    },
     metrics::{counter::Counter, family::Family, gauge::Gauge},
     registry::Registry,
 };
@@ -149,6 +152,86 @@ pub struct FlakeInputImpactLabels {
     /// `PLAN_03_FLAKE_INPUT_TRACKING.md`'s "Impact is decided by evaluation,
     /// not by file names".
     pub kind: String,
+}
+
+/// Labels for the `nixos_channel_*` family -- see [`ChannelMetrics`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ChannelLabels {
+    pub channel: String,
+}
+
+/// The (empty) label set for `nixos_channel_status_up`.
+///
+/// A plain [`Gauge`] always encodes, even at its default value, so one would
+/// make `nixos_channel_status_up 0` appear before the exporter has ever
+/// attempted a fetch. Wrapping it in a [`Family`] with no labels lets it stay
+/// genuinely absent -- an empty family is omitted entirely -- until
+/// [`crate::flake::channels::record_metrics`] calls `get_or_create` for the
+/// first time, which only happens once an attempt has actually been made.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ChannelAttemptLabels {}
+
+/// NixOS channel status -- see `crate::flake::channels`.
+///
+/// Deliberately a separate struct with its own [`Registry`], not more fields
+/// on [`Metrics`]: these metrics are rendered **unprefixed**
+/// (`nixos_channel_*`), alongside the exporter's own `github_`-prefixed
+/// registry in the same `/metrics` response, because they describe NixOS
+/// infrastructure this exporter merely observes rather than anything of its
+/// own. See [`Publisher::publish_with_channels`] for how the two registries
+/// are kept in step.
+#[derive(Debug)]
+pub struct ChannelMetrics {
+    pub update_timestamp: Family<ChannelLabels, Gauge>,
+    pub current: Family<ChannelLabels, Gauge>,
+    pub tested_failed: Family<ChannelLabels, Gauge>,
+    pub status_up: Family<ChannelAttemptLabels, Gauge>,
+}
+
+impl ChannelMetrics {
+    /// Builds the unprefixed `nixos_channel` registry.
+    #[must_use]
+    pub fn new() -> (Self, Registry) {
+        let mut registry = Registry::with_prefix("nixos_channel");
+
+        let update_timestamp = Family::<ChannelLabels, Gauge>::default();
+        registry.register(
+            "update_timestamp_seconds",
+            "When this NixOS channel's revision last changed, per prometheus.nixos.org",
+            update_timestamp.clone(),
+        );
+
+        let current = Family::<ChannelLabels, Gauge>::default();
+        registry.register(
+            "current",
+            "1 if this NixOS channel is still supported, 0 if it is end of life",
+            current.clone(),
+        );
+
+        let tested_failed = Family::<ChannelLabels, Gauge>::default();
+        registry.register(
+            "tested_failed",
+            "1 if this channel's tested Hydra job is failing; absent if never evaluated",
+            tested_failed.clone(),
+        );
+
+        let status_up = Family::<ChannelAttemptLabels, Gauge>::default();
+        registry.register(
+            "status_up",
+            "1 if the last NixOS channel status fetch succeeded, 0 if it failed and cached values are being served; absent before the first attempt",
+            status_up.clone(),
+        );
+
+        (
+            Self {
+                update_timestamp,
+                current,
+                tested_failed,
+                status_up,
+            },
+            registry,
+        )
+    }
 }
 
 /// Every metric family the exporter publishes.
@@ -514,6 +597,11 @@ pub struct Publisher(Arc<Mutex<Published>>);
 struct Published {
     metrics: Arc<Metrics>,
     registry: Registry,
+    /// The unprefixed `nixos_channel_*` registry -- see [`ChannelMetrics`].
+    /// Defaults to an empty [`Registry`] (nothing registered, so it encodes
+    /// to nothing) until the first call to
+    /// [`Publisher::publish_with_channels`].
+    channel_registry: Registry,
     repo_index: Arc<RepoIndex>,
 }
 
@@ -529,11 +617,29 @@ impl Publisher {
         Self(Arc::new(Mutex::new(Published {
             metrics: Arc::new(metrics),
             registry,
+            channel_registry: Registry::default(),
             repo_index: Arc::new(RepoIndex::default()),
         })))
     }
 
-    /// Replaces the served metric set with `metrics`/`registry`.
+    /// As [`Self::new`], additionally seeding the served `nixos_channel_*`
+    /// registry rather than leaving it empty.
+    #[must_use]
+    pub fn new_with_channels(
+        metrics: Metrics,
+        registry: Registry,
+        channel_registry: Registry,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(Published {
+            metrics: Arc::new(metrics),
+            registry,
+            channel_registry,
+            repo_index: Arc::new(RepoIndex::default()),
+        })))
+    }
+
+    /// Replaces the served `github`-prefixed metric set with
+    /// `metrics`/`registry`, leaving the `nixos_channel_*` registry as it was.
     ///
     /// Monotonic counters are carried across so the swap is invisible to
     /// `rate()` and `increase()`.
@@ -542,6 +648,30 @@ impl Publisher {
             metrics.carry_forward_from(&published.metrics);
             published.metrics = Arc::new(metrics);
             published.registry = registry;
+        }
+    }
+
+    /// As [`Self::publish`], additionally replacing the unprefixed
+    /// `nixos_channel_*` registry in the same locked section.
+    ///
+    /// Used by the real collection cycle, which rebuilds both registries from
+    /// scratch every time regardless of whether the flake pass (and
+    /// therefore the NixOS channel fetch nested inside it) actually ran this
+    /// cycle -- same as every other cached flake metric. Swapping both under
+    /// one lock acquisition is what keeps a scrape from ever seeing one
+    /// cycle's `github_*` series paired with a different cycle's
+    /// `nixos_channel_*` ones.
+    pub fn publish_with_channels(
+        &self,
+        metrics: Metrics,
+        registry: Registry,
+        channel_registry: Registry,
+    ) {
+        if let Ok(mut published) = self.0.lock() {
+            metrics.carry_forward_from(&published.metrics);
+            published.metrics = Arc::new(metrics);
+            published.registry = registry;
+            published.channel_registry = channel_registry;
         }
     }
 
@@ -596,13 +726,26 @@ impl Publisher {
         )
     }
 
-    /// Renders the served registry in the Prometheus text exposition format.
+    /// Renders both served registries -- `github`-prefixed, then the
+    /// unprefixed `nixos_channel_*` one -- as a single Prometheus text
+    /// exposition, with one `# EOF` marker at the end.
+    ///
+    /// `prometheus-client` has no API for encoding two registries under one
+    /// prefix scheme in a single call -- a registry only ever gets *one*
+    /// prefix, applied to everything under it -- so an unprefixed sibling has
+    /// to be a genuinely separate top-level [`Registry`]. `encode_registry`
+    /// is public exactly for this: it writes one registry's body without the
+    /// `# EOF` marker, so composing several into one response is calling it
+    /// more than once and appending the marker last.
     #[must_use]
     pub fn render(&self) -> String {
         let mut buffer = String::new();
         if let Ok(published) = self.0.lock() {
             // Writing into a String is infallible for these metric types.
-            let _: Result<(), std::fmt::Error> = encode(&mut buffer, &published.registry);
+            let _: Result<(), std::fmt::Error> = encode_registry(&mut buffer, &published.registry);
+            let _: Result<(), std::fmt::Error> =
+                encode_registry(&mut buffer, &published.channel_registry);
+            let _: Result<(), std::fmt::Error> = encode_eof(&mut buffer);
         }
         buffer
     }
@@ -881,5 +1024,90 @@ mod tests {
         let rendered = Publisher::new(metrics, registry).render();
         assert!(rendered.contains(r#"conclusion="failure""#));
         assert!(rendered.contains(r#"workflow="Deploy""#));
+    }
+
+    #[test]
+    fn channel_metrics_render_unprefixed_alongside_the_github_registry() {
+        let (metrics, registry) = Metrics::new();
+        metrics.rate_limit_reserve.set(42);
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        channel_metrics
+            .update_timestamp
+            .get_or_create(&ChannelLabels {
+                channel: "nixos-unstable".into(),
+            })
+            .set(1_700_000_000);
+        channel_metrics
+            .current
+            .get_or_create(&ChannelLabels {
+                channel: "nixos-unstable".into(),
+            })
+            .set(1);
+        channel_metrics
+            .status_up
+            .get_or_create(&ChannelAttemptLabels::default())
+            .set(1);
+
+        let rendered = Publisher::new_with_channels(metrics, registry, channel_registry).render();
+
+        assert!(
+            rendered.contains("github_exporter_rate_limit_reserve 42"),
+            "the github-prefixed registry must still render:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("nixos_channel_update_timestamp_seconds"),
+            "the channel registry must render unprefixed:\n{rendered}"
+        );
+        assert!(!rendered.contains("github_nixos_channel"));
+        assert!(rendered.contains(r#"channel="nixos-unstable""#));
+        assert!(rendered.contains("nixos_channel_status_up"));
+        assert_eq!(
+            rendered.matches("# EOF").count(),
+            1,
+            "composing two registries must still produce exactly one EOF marker:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_up_is_absent_until_an_attempt_is_recorded() {
+        // A plain `Gauge` always encodes, even at its default value, which
+        // would make `nixos_channel_status_up 0` appear before the exporter
+        // has ever attempted a fetch. `status_up` is instead a `Family` with
+        // no labels specifically so it can stay genuinely absent until the
+        // first `get_or_create` call -- this asserts that actually holds.
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new_with_channels(metrics, registry, channel_registry);
+        assert!(
+            !publisher.render().contains("nixos_channel_status_up"),
+            "status_up must not appear before any fetch has been attempted:\n{}",
+            publisher.render()
+        );
+
+        channel_metrics
+            .status_up
+            .get_or_create(&ChannelAttemptLabels::default())
+            .set(0);
+        assert!(publisher.render().contains("nixos_channel_status_up"));
+    }
+
+    #[test]
+    fn publish_with_channels_keeps_both_registries_in_step() {
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new(metrics, registry);
+        assert!(!publisher.render().contains("nixos_channel"));
+
+        let (next_metrics, next_registry) = Metrics::new();
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        channel_metrics
+            .current
+            .get_or_create(&ChannelLabels {
+                channel: "nixos-26.05".into(),
+            })
+            .set(0);
+        publisher.publish_with_channels(next_metrics, next_registry, channel_registry);
+
+        let rendered = publisher.render();
+        assert!(rendered.contains(r#"nixos_channel_current{channel="nixos-26.05"} 0"#));
     }
 }

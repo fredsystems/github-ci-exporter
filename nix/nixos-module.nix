@@ -26,6 +26,7 @@ let
     state_dir = "/var/lib/github-ci-exporter";
     flake_repos = cfg.flakeRepos;
     flake_interval = cfg.flakeInterval;
+    nixos_prometheus_url = cfg.nixosPrometheusUrl;
   }
   // lib.optionalAttrs (cfg.maxRepoAge != null) { max_repo_age = cfg.maxRepoAge; };
 
@@ -168,6 +169,18 @@ in
         order of days to weeks, so tying it to the CI poll interval would
         spend most of that budget re-fetching a file that has not moved.
         Must be at least 15 minutes.
+      '';
+    };
+
+    nixosPrometheusUrl = mkOption {
+      type = types.str;
+      default = "https://prometheus.nixos.org";
+      description = ''
+        Base URL for NixOS channel status (`channel_revision`,
+        `channel_update_time`, `hydra_job_failed`), queried once per flake
+        pass for the channels any tracked input references. Published
+        unprefixed as `nixos_channel_*`, alongside the exporter's own
+        `github_`-prefixed metrics.
       '';
     };
 

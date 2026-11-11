@@ -15,6 +15,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::model::PullRef;
@@ -37,6 +38,9 @@ const DEFAULT_FLAKE_INTERVAL: Duration = Duration::from_secs(3600);
 /// from polling a file that changes on the order of days to weeks faster than
 /// a quarter of an hour.
 const MIN_FLAKE_INTERVAL: Duration = Duration::from_secs(900);
+
+/// Default origin for NixOS channel status -- see [`Config::nixos_prometheus_url`].
+const DEFAULT_NIXOS_PROMETHEUS_URL: &str = "https://prometheus.nixos.org";
 
 /// `GHCI_`-prefixed variables that are not configuration fields.
 ///
@@ -119,6 +123,12 @@ pub struct Config {
     /// metrics registry is rebuilt from scratch each cycle.
     #[serde(with = "humantime_serde")]
     pub flake_interval: Duration,
+
+    /// Base URL for NixOS channel status (`channel_revision`,
+    /// `channel_update_time`, `hydra_job_failed`), queried once per flake
+    /// pass for the channels any tracked node references. Overridable for
+    /// tests, which point it at a wiremock server.
+    pub nixos_prometheus_url: String,
 }
 
 impl Default for Config {
@@ -137,6 +147,7 @@ impl Default for Config {
             github_graphql_url: "https://api.github.com/graphql".to_owned(),
             flake_repos: Vec::new(),
             flake_interval: DEFAULT_FLAKE_INTERVAL,
+            nixos_prometheus_url: DEFAULT_NIXOS_PROMETHEUS_URL.to_owned(),
         }
     }
 }
@@ -155,6 +166,8 @@ pub enum ConfigError {
     InvalidFlakeRepo(String),
     #[error("flake_interval must be at least {MIN_FLAKE_INTERVAL:?}, got {0:?}")]
     FlakeIntervalTooShort(Duration),
+    #[error("nixos_prometheus_url must be an http(s) URL, got `{0}`")]
+    InvalidNixosPrometheusUrl(String),
     #[error("no token available: set GHCI_TOKEN or `token_file`")]
     NoToken,
     #[error("failed to read token file {path}: {source}")]
@@ -218,6 +231,14 @@ impl Config {
         }
         if self.flake_interval < MIN_FLAKE_INTERVAL {
             return Err(ConfigError::FlakeIntervalTooShort(self.flake_interval));
+        }
+        match Url::parse(&self.nixos_prometheus_url) {
+            Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {}
+            _ => {
+                return Err(ConfigError::InvalidNixosPrometheusUrl(
+                    self.nixos_prometheus_url.clone(),
+                ));
+            }
         }
         Ok(())
     }
@@ -586,6 +607,60 @@ mod tests {
         let config = Config::load(Some(file.path())).expect("config should load");
         assert_eq!(config.flake_repos, ["fredsystems/nixos"]);
         assert_eq!(config.flake_interval, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn nixos_prometheus_url_defaults_to_the_real_origin() {
+        assert_eq!(
+            Config::default().nixos_prometheus_url,
+            "https://prometheus.nixos.org"
+        );
+    }
+
+    #[test]
+    fn a_non_http_nixos_prometheus_url_is_rejected() {
+        for url in ["not a url", "ftp://prometheus.nixos.org", ""] {
+            let config = Config {
+                orgs: vec!["fredsystems".into()],
+                nixos_prometheus_url: url.to_owned(),
+                ..Config::default()
+            };
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ConfigError::InvalidNixosPrometheusUrl(_))
+                ),
+                "{url:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_http_or_https_nixos_prometheus_url_is_accepted() {
+        for url in ["https://prometheus.nixos.org", "http://127.0.0.1:9999"] {
+            let config = Config {
+                orgs: vec!["fredsystems".into()],
+                nixos_prometheus_url: url.to_owned(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_ok(), "{url:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn nixos_prometheus_url_is_read_from_toml() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+            orgs = ["fredsystems"]
+            nixos_prometheus_url = "http://127.0.0.1:9091"
+            "#
+        )
+        .expect("write temp config");
+
+        let config = Config::load(Some(file.path())).expect("config should load");
+        assert_eq!(config.nixos_prometheus_url, "http://127.0.0.1:9091");
     }
 
     #[test]

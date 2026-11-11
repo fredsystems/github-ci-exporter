@@ -2,15 +2,13 @@
 //!
 //! Fetches each configured repository's `flake.lock`, then hands the
 //! resulting tracked node set to [`super::upstream`] (upstream heads,
-//! freshness, update PRs) and [`super::status`] (the flake-watch Action's
-//! impact status file), and republishes everything cached every cycle
-//! regardless of whether the pass itself ran this one.
-//!
-//! NixOS channel status for channel-tarball nodes is later work --
-//! `PLAN_03_FLAKE_INPUT_TRACKING.md` subtask 3.6 in the `nixos` repo.
+//! freshness, update PRs), [`super::channels`] (NixOS channel status, and a
+//! channel-tarball node's freshness against it), and [`super::status`] (the
+//! flake-watch Action's impact status file), and republishes everything
+//! cached every cycle regardless of whether the pass itself ran this one.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     time::{Duration, Instant},
 };
@@ -20,6 +18,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::{
+    channels::{self, ChannelCache, NixosClient},
     lock::{self, TrackedNode},
     status::{self, StatusCache},
     upstream::{self, UpstreamCache},
@@ -49,9 +48,29 @@ pub struct FlakeCache {
     /// Cross-cycle state for the flake-watch Action's impact status file --
     /// see [`status`].
     status: StatusCache,
+    /// Cross-cycle state for NixOS channel status -- see [`channels`].
+    channels: ChannelCache,
 }
 
 impl FlakeCache {
+    /// The currently cached NixOS channel status, for
+    /// [`channels::record_metrics`].
+    #[must_use]
+    pub const fn channels(&self) -> &ChannelCache {
+        &self.channels
+    }
+
+    /// Every channel referenced by any currently tracked node, across every
+    /// repository -- what [`channels::run_pass`] fetches, and the only
+    /// channels it keeps.
+    fn referenced_channels(&self) -> HashSet<String> {
+        self.nodes
+            .values()
+            .flatten()
+            .filter_map(|node| node.channel.clone())
+            .collect()
+    }
+
     /// Whether the flake pass is due: it has never run, or `interval` has
     /// elapsed since it last did.
     #[must_use]
@@ -100,9 +119,12 @@ impl FlakeCache {
     }
 }
 
-/// Runs the flake pass: fetches `flake.lock` for every repository in `repos`,
-/// then resolves every tracked node's upstream and open update PR, then reads
-/// the flake-watch Action's impact status file.
+/// Runs the flake pass for every repository in `repos`.
+///
+/// Fetches `flake.lock`, then resolves every tracked node's upstream and
+/// open update PR, fetches NixOS channel status for the channels any
+/// tracked node references and feeds a channel-tarball node's freshness
+/// from it, then reads the flake-watch Action's impact status file.
 ///
 /// A fetch failure for one repository is logged and its previous tracked
 /// nodes are kept, so one broken repository cannot blind the exporter to the
@@ -118,14 +140,21 @@ impl FlakeCache {
 /// transport failure, or the budget check inside [`Client::get_cached_fallible`]
 /// refusing the request), marking the pass as run regardless would start the
 /// next `flake_interval`-long wait from a pass that observed nothing at all,
-/// silently extending an outage into a much longer one. The upstream and
-/// status stages keep their own previous values on failure independently of
-/// this and do not affect whether the pass is marked as run.
+/// silently extending an outage into a much longer one. The upstream,
+/// channel, and status stages keep their own previous values on failure
+/// independently of this and do not affect whether the pass is marked as run.
 ///
-/// The upstream and status stages run against this cycle's freshly-fetched
-/// node set, so a repository whose `flake.lock` fetch failed this cycle is
-/// still resolved against whatever nodes the previous cycle observed for it.
-pub async fn run_pass(client: &Client, repos: &[String], state_dir: &Path, cache: &mut FlakeCache) {
+/// The upstream, channel, and status stages run against this cycle's
+/// freshly-fetched node set, so a repository whose `flake.lock` fetch failed
+/// this cycle is still resolved against whatever nodes the previous cycle
+/// observed for it.
+pub async fn run_pass(
+    client: &Client,
+    nixos_client: &NixosClient,
+    repos: &[String],
+    state_dir: &Path,
+    cache: &mut FlakeCache,
+) {
     let mut any_observed = false;
     for repo in repos {
         match fetch_tracked_nodes(client, repo).await {
@@ -161,6 +190,25 @@ pub async fn run_pass(client: &Client, repos: &[String], state_dir: &Path, cache
         now,
     )
     .await;
+
+    channels::run_pass(
+        nixos_client,
+        &cache.referenced_channels(),
+        &mut cache.channels,
+    )
+    .await;
+    channels::apply_tarball_freshness(
+        repos,
+        &cache.nodes,
+        &mut cache.channels,
+        &mut cache.upstream,
+        now,
+    );
+    // The tarball stage records and clears first-seen entries after
+    // upstream::run_pass already saved the store; save again so they survive
+    // a restart before the next pass.
+    cache.upstream.persist_first_seen(state_dir);
+
     status::run_pass(client, repos, &mut cache.status).await;
 
     if repos.is_empty() || any_observed {
@@ -326,6 +374,38 @@ mod tests {
             .expect("client builds")
     }
 
+    fn nixos_client_for(server: &MockServer) -> channels::NixosClient {
+        channels::NixosClient::new(&server.uri()).expect("nixos client builds")
+    }
+
+    /// The `nixpkgs` channel-tarball node currently tracked for `o/r`, as
+    /// `cache.upstream.status_for` needs it to look up a tarball node's
+    /// status by identity rather than by path alone.
+    fn tarball_node(cache: &FlakeCache) -> TrackedNode {
+        cache
+            .nodes_for("o/r")
+            .iter()
+            .find(|node| node.path == "nixpkgs")
+            .expect("the tarball node is tracked")
+            .clone()
+    }
+
+    /// `sample_lock`'s `nixpkgs` node tracks `nixos-unstable`, so every test
+    /// below that runs the flake pass against it triggers a NixOS channel
+    /// fetch (see `FlakeCache::referenced_channels`). This stubs all three
+    /// queries with an empty-but-successful result, which is all these
+    /// tests need: none of them assert on channel status.
+    async fn mock_empty_channel_queries(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": { "resultType": "vector", "result": [] },
+            })))
+            .mount(server)
+            .await;
+    }
+
     /// A minimal, valid `flake.lock` with one root input, `nixpkgs`, locked to
     /// a branch.
     fn sample_lock() -> String {
@@ -352,6 +432,7 @@ mod tests {
     #[tokio::test]
     async fn a_fetched_lock_is_cached_and_its_metric_published() {
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/contents/flake.lock"))
             .respond_with(
@@ -367,10 +448,11 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
 
         let nodes = cache.nodes_for("o/r");
         assert_eq!(nodes.len(), 1);
@@ -394,6 +476,7 @@ mod tests {
     #[tokio::test]
     async fn a_304_keeps_the_cached_set_and_it_is_still_published() {
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/contents/flake.lock"))
             .respond_with(
@@ -414,15 +497,16 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         let first = cache.nodes_for("o/r").to_vec();
         assert_eq!(first.len(), 1);
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         let second = cache.nodes_for("o/r");
         assert_eq!(second, first.as_slice(), "a 304 must replay the cached set");
 
@@ -435,6 +519,7 @@ mod tests {
     #[tokio::test]
     async fn the_pass_is_skipped_before_the_interval_elapses() {
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         // Exactly one request: a second pass issued before the interval has
         // elapsed would be a bug in the orchestrator, not in this module, but
         // the cache's own `should_run` is what the orchestrator must obey --
@@ -454,6 +539,7 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
@@ -462,7 +548,7 @@ mod tests {
             cache.should_run(Duration::from_secs(3600)),
             "the pass has never run, so it is always due"
         );
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             !cache.should_run(Duration::from_secs(3600)),
@@ -480,10 +566,11 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/no-flake".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
 
         assert_eq!(cache.nodes_for("o/no-flake"), []);
 
@@ -496,6 +583,7 @@ mod tests {
     #[tokio::test]
     async fn a_fetch_failure_keeps_the_previous_tracked_nodes() {
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/contents/flake.lock"))
             .respond_with(
@@ -519,14 +607,15 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         assert_eq!(cache.nodes_for("o/r").len(), 1);
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         assert_eq!(
             cache.nodes_for("o/r").len(),
             1,
@@ -542,6 +631,7 @@ mod tests {
         // good data with nothing and cached that nothing under the response's
         // ETag.
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/contents/flake.lock"))
             .respond_with(
@@ -577,14 +667,15 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         assert_eq!(cache.nodes_for("o/r").len(), 1, "cycle one parses cleanly");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         assert_eq!(
             cache.nodes_for("o/r").len(),
             1,
@@ -615,11 +706,12 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/down".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             cache.should_run(Duration::from_secs(3600)),
@@ -630,6 +722,7 @@ mod tests {
     #[tokio::test]
     async fn a_pass_with_one_successful_repository_is_marked_as_run() {
         let server = MockServer::start().await;
+        mock_empty_channel_queries(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/down/contents/flake.lock"))
             .respond_with(ResponseTemplate::new(403))
@@ -649,15 +742,295 @@ mod tests {
             .await;
 
         let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/down".to_owned(), "o/up".to_owned()];
         let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, dir.path(), &mut cache).await;
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             !cache.should_run(Duration::from_secs(3600)),
             "one successful repository is enough for the pass to count as having run"
+        );
+    }
+
+    /// A `flake.lock` whose only root input is a `channels.nixos.org`
+    /// tarball locked to `short_rev`, tracking `nixpkgs-unstable`.
+    fn channel_tarball_lock(short_rev: &str) -> String {
+        serde_json::json!({
+            "version": 7,
+            "root": "root",
+            "nodes": {
+                "root": { "inputs": { "nixpkgs": "nixpkgs" } },
+                "nixpkgs": {
+                    "inputs": {},
+                    "original": {
+                        "type": "tarball",
+                        "url": "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst",
+                    },
+                    "locked": {
+                        "type": "tarball",
+                        "url": format!(
+                            "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre0.{short_rev}/nixexprs.tar.zst"
+                        ),
+                        "lastModified": 1_700_000_000_i64,
+                    },
+                },
+            },
+        })
+        .to_string()
+    }
+
+    /// The tarball stage records first-seen entries after
+    /// `upstream::run_pass` already saved the store; they must be on disk
+    /// after the same pass, so a restart before the next one keeps the clock.
+    fn assert_first_seen_persisted(state_dir: &Path, needle: &str) {
+        let persisted = std::fs::read_to_string(state_dir.join("flake-first-seen.json"))
+            .expect("first-seen state written");
+        assert!(
+            persisted.contains(needle),
+            "first-seen entry {needle} not persisted in the pass that observed it: {persisted}"
+        );
+    }
+
+    fn mock_channel_revision(revision: &str) -> wiremock::Mock {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_revision{",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [{
+                        "metric": {
+                            "channel": "nixpkgs-unstable",
+                            "revision": revision,
+                            "current": "1",
+                        },
+                        "value": [1_700_000_000, "1"],
+                    }],
+                },
+            })))
+    }
+
+    #[tokio::test]
+    async fn a_channel_tarball_node_stays_behind_across_channel_moves_then_catches_up() {
+        // Regression guard for the corrected design: a channel-tarball
+        // node's `outdated_since` must be keyed to its own locked revision,
+        // not the channel's -- otherwise the channel moving on (while the
+        // node's lock stays exactly as behind as before) would restart the
+        // clock on every pass.
+        let server = MockServer::start().await;
+        mock_channel_revision("channelrevA00000000000000000000000000000")
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Pass two and three both see this revision: the channel moved once,
+        // then held still while the lock caught up to it.
+        mock_channel_revision("channelrevB11111100000000000000000000000")
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_update_time{",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [{
+                        "metric": { "channel": "nixpkgs-unstable" },
+                        "value": [1_700_000_000, "1700000500"],
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "hydra_job_failed{",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": { "resultType": "vector", "result": [] },
+            })))
+            .mount(&server)
+            .await;
+
+        // Passes one and two: the lock stays on `oldrev000000`, behind both
+        // channel revisions above.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flake.lock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": github_base64(&channel_tarball_lock("oldrev000000")),
+                "encoding": "base64",
+            })))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        // Pass three: `nix flake update` moves the lock to the channel's
+        // current revision.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flake.lock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": github_base64(&channel_tarball_lock("channelrevB1")),
+                "encoding": "base64",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
+        let mut cache = FlakeCache::default();
+        let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
+        let first = cache
+            .upstream
+            .status_for("o/r", &tarball_node(&cache))
+            .expect("status recorded")
+            .clone();
+        assert_eq!(first.freshness, crate::flake::Freshness::Behind);
+        let first_outdated_since = first.outdated_since.expect("behind nodes publish this");
+        assert_first_seen_persisted(dir.path(), "|nixpkgs|");
+
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
+        let second = cache
+            .upstream
+            .status_for("o/r", &tarball_node(&cache))
+            .expect("status recorded")
+            .clone();
+        assert_eq!(second.freshness, crate::flake::Freshness::Behind);
+        assert_eq!(
+            second.outdated_since,
+            Some(first_outdated_since),
+            "the channel moving on must not reset the clock while the lock is unchanged"
+        );
+        assert_ne!(
+            second.upstream_oid, first.upstream_oid,
+            "the channel's revision must actually have moved between these two passes"
+        );
+
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
+        let third = cache
+            .upstream
+            .status_for("o/r", &tarball_node(&cache))
+            .expect("status recorded")
+            .clone();
+        assert_eq!(
+            third.freshness,
+            crate::flake::Freshness::UpToDate,
+            "the lock now matches the channel's current revision"
+        );
+        assert_eq!(third.outdated_since, None);
+    }
+
+    #[tokio::test]
+    async fn a_channel_fetch_failure_keeps_the_previous_tarball_freshness_published() {
+        // `upstream::run_pass` drops a channel-tarball node's cached status
+        // every pass -- it has no GitHub lookup of its own, see finding D in
+        // `super::upstream` -- and relies on `channels::apply_tarball_freshness`
+        // running after it to set it back from `ChannelCache`'s own data. If
+        // this pass's channel fetch fails, `ChannelCache` keeps whatever it
+        // fetched last (`channels::run_pass`'s own "keep cached values on
+        // failure" contract), so the tarball status published this pass must
+        // still be pass one's, not absent.
+        let server = MockServer::start().await;
+        mock_channel_revision("channelrev0000000000000000000000000000000")
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_revision{",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_update_time{",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [{
+                        "metric": { "channel": "nixpkgs-unstable" },
+                        "value": [1_700_000_000, "1700000500"],
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "hydra_job_failed{",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "data": { "resultType": "vector", "result": [] },
+            })))
+            .mount(&server)
+            .await;
+
+        // The lock never changes across either pass: only the channel fetch
+        // fails on pass two.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/flake.lock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": github_base64(&channel_tarball_lock("oldrev000000")),
+                "encoding": "base64",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let nixos_client = nixos_client_for(&server);
+        let mut cache = FlakeCache::default();
+        let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
+        assert_eq!(cache.channels().last_fetch_ok(), Some(true));
+        let first = cache
+            .upstream
+            .status_for("o/r", &tarball_node(&cache))
+            .expect("status recorded")
+            .clone();
+        assert_eq!(first.freshness, crate::flake::Freshness::Behind);
+
+        run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
+        assert_eq!(
+            cache.channels().last_fetch_ok(),
+            Some(false),
+            "pass two's channel fetch failed"
+        );
+        let second = cache
+            .upstream
+            .status_for("o/r", &tarball_node(&cache))
+            .expect("a channel fetch failure must not leave the tarball node's status unpublished")
+            .clone();
+        assert_eq!(second.freshness, first.freshness);
+        assert_eq!(
+            second.outdated_since, first.outdated_since,
+            "pass one's freshness, including its outdated-since clock, must still be published \
+             through the outage"
         );
     }
 
