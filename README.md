@@ -263,6 +263,12 @@ discovery drops repositories with no default branch.
 | `github_repo_monitored`                            | gauge   | `org`, `repo`                                       |
 | `github_repos_skipped`                             | gauge   | `reason`                                            |
 | `github_flake_input_locked_timestamp_seconds`      | gauge   | `repo`, `input`, `path`, `ref`, `channel`           |
+| `github_flake_input_upstream_timestamp_seconds`    | gauge   | `repo`, `input`, `path`, `ref`, `channel`           |
+| `github_flake_input_up_to_date`                    | gauge   | `repo`, `input`, `path`, `ref`, `channel`           |
+| `github_flake_input_outdated_since_timestamp_seconds` | gauge | `repo`, `input`, `path`, `ref`, `channel`          |
+| `github_flake_input_commits_behind`                | gauge   | `repo`, `input`, `path`, `ref`                      |
+| `github_flake_input_update_pr_open`                | gauge   | `repo`, `input`, `number`                           |
+| `github_flake_input_impact`                        | gauge   | `repo`, `input`, `os`, `kind`                       |
 | `github_exporter_rate_limit_remaining`             | gauge   | `resource`                                          |
 | `github_exporter_rate_limit_limit`                 | gauge   | `resource`                                          |
 | `github_exporter_rate_limit_reset_timestamp_seconds` | gauge | `resource`                                          |
@@ -289,6 +295,57 @@ input (`niri`), `path` is the full input path including any owned nixpkgs
 for the default branch or for anything not locked through `github`), and
 `channel` is the NixOS channel it tracks, when it tracks one (empty
 otherwise). See "Flake input tracking" above.
+
+The remaining `github_flake_input_*` families compare that lock against its
+upstream, read from a single aliased GraphQL query every flake pass:
+
+- `github_flake_input_upstream_timestamp_seconds` is the upstream commit time
+  for a branch-tracking input, or the newest release's commit time for a
+  tag-pinned one.
+- `github_flake_input_up_to_date` is `1` when the lock matches that upstream,
+  `0` when it does not. When a node's upstream lookup fails this pass -- a
+  transport error, or the whole GraphQL batch rejected -- the previously
+  published status is retained exactly as it was: a replay of the last
+  successful comparison, not a fresh one, which can go stale if the failure
+  persists across many passes. A repository that resolves to an explicit
+  `null` this pass (deleted, or GraphQL's `NOT_FOUND` for that alias) is
+  different: that is confirmed gone rather than merely unreachable, so any
+  previously cached status for it is dropped instead of kept. "No series at
+  all" therefore covers two cases, not every failed lookup: an input that
+  has never once resolved (including one with no upstream notion yet, a
+  channel tarball), and one whose repository has just been confirmed gone.
+- `github_flake_input_outdated_since_timestamp_seconds` is published only
+  when an input is behind, and is measured from the **oldest** change it is
+  missing, not the newest, so a busy upstream cannot keep resetting the
+  clock. For a branch this comes from a REST compare between the locked
+  revision and the upstream head; for a tag-pinned input, which has no
+  compare to measure from, it is the first time the exporter observed that
+  input behind that particular upstream tag, persisted to
+  `<state_dir>/flake-first-seen.json` and cleared again once it catches up.
+- `github_flake_input_commits_behind` is published only for a branch-tracking
+  input that is behind, from the same REST compare.
+- `github_flake_input_update_pr_open` is `1` for each open
+  `update-<input>` pull request found against the configured repository.
+  `number` matches the label on the existing `github_pull_*` series, so an
+  update PR joins to its own age and check state.
+- `github_flake_input_impact` republishes the flake-watch Action's status
+  file (`status/flake-inputs.json` on the `flake-watch` branch): `1` for
+  each operating system (`linux`, `darwin`) the Action classified a moved
+  input's impact for, with `kind` being `none`, `rebuild`, or `source`. A
+  repository whose watch Action has never run yet (a 404) publishes no
+  impact series rather than failing the pass.
+
+All of this runs on the same `flake_interval` as the lock pass, folded into
+the same hourly request budget -- see "Rate-limit behaviour" above. A cycle
+whose budget cannot cover the pass at all skips it entirely, before a single
+request goes out, so every previously published value is kept exactly as it
+was. That all-or-nothing guarantee applies only to a pass that never starts:
+once it is running, each repository's `flake.lock` fetch and each GraphQL
+batch is its own independent request with its own fallback -- the
+per-repository and per-node behaviour documented throughout this section --
+so a transient failure partway through a pass can update some repositories,
+or some aliases within a batch, while others keep their older, previously
+published values. It is not a single atomic unit once started.
 
 ## What counts as the current CI state
 
@@ -379,9 +436,46 @@ republishes whatever was last observed, since each cycle rebuilds the metrics
 registry from scratch and discards it only once the new one is complete (see
 "Rate-limit behaviour" above).
 
-This first pass publishes only what the lock alone can say: when each tracked
-input was locked. Comparing that against its upstream, detecting an open
-update pull request, and reporting NixOS channel health are later work.
+### Upstream comparison
+
+Every GitHub-locked tracked node (a branch or a release tag, never a channel
+tarball -- that is later work) is compared against its upstream in the same
+pass, through **one** aliased GraphQL query per cycle, batched to at most 50
+aliases per request:
+
+- A **branch** node's upstream is its branch head (or the default branch's
+  head, for a node with no `ref`).
+- A **tag** node's upstream is the newest release, read from
+  `latestRelease`, falling back to the newest tag by commit date when the
+  repository has no GitHub Releases. Tag-pinned inputs are compared against
+  the newest tag, never the default branch, or they would read as
+  permanently outdated -- `nix flake update` cannot move a tag, and Renovate
+  owns them.
+- Each configured repository's open `update-<input>` pull requests are
+  looked up in the same query, one alias per root input.
+
+Identical lookups -- the same owner, repository, and ref -- are deduplicated
+before the query is built, so an owned nixpkgs shared by coincidence costs
+nothing extra. A repository that no longer exists resolves to an explicit
+`null` -- a bare one, or GitHub's `NOT_FOUND` error for that alias -- and is
+logged, not treated as a failed pass; every other alias in the same batch
+still resolves normally, and that node's own previously published status is
+dropped rather than republished (see `github_flake_input_up_to_date` above).
+
+A node that is behind gets one more fetch: a branch gets a REST compare
+between its locked revision and the upstream head, cached the same way every
+other REST response in this exporter is, and a tag gets its first-seen
+timestamp recorded (or left alone, if already recorded) -- see
+`github_flake_input_outdated_since_timestamp_seconds` above.
+
+### Impact
+
+For each repository in `flake_repos`, the exporter also reads
+`status/flake-inputs.json` from the dedicated `flake-watch` branch, written
+by a GitHub Action (not yet part of this exporter) that classifies each moved
+input by evaluating, never building, what it would change. That file is
+published as `github_flake_input_impact`; until the Action exists for a given
+repository, its absence (a 404) is normal and produces no impact series.
 
 ## Configuration
 

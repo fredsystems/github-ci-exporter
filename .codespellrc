@@ -1,0 +1,4 @@
+[codespell]
+# `UpToDate` is `flake::upstream::Freshness::UpToDate`, a Rust enum variant
+# name, not a misspelling of "up-to-date".
+ignore-words-list = uptodate

@@ -1,13 +1,17 @@
-//! Fetches each configured repository's `flake.lock` and publishes the one
-//! metric derivable from the lock alone: when each tracked input was locked.
+//! Orchestrates the whole flake pass.
 //!
-//! Upstream heads, update PRs, impact, and NixOS channel status are later
-//! work (`PLAN_03_FLAKE_INPUT_TRACKING.md` 3.5-3.6 in the `nixos` repo); this
-//! module only reads `flake.lock` and republishes its cached contents every
-//! cycle.
+//! Fetches each configured repository's `flake.lock`, then hands the
+//! resulting tracked node set to [`super::upstream`] (upstream heads,
+//! freshness, update PRs) and [`super::status`] (the flake-watch Action's
+//! impact status file), and republishes everything cached every cycle
+//! regardless of whether the pass itself ran this one.
+//!
+//! NixOS channel status for channel-tarball nodes is later work --
+//! `PLAN_03_FLAKE_INPUT_TRACKING.md` subtask 3.6 in the `nixos` repo.
 
 use std::{
     collections::HashMap,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -15,7 +19,11 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::lock::{self, TrackedNode};
+use super::{
+    lock::{self, TrackedNode},
+    status::{self, StatusCache},
+    upstream::{self, UpstreamCache},
+};
 use crate::{
     github::{Client, ClientError, rest},
     metrics::{FlakeInputLabels, Metrics},
@@ -35,6 +43,12 @@ pub struct FlakeCache {
     nodes: HashMap<String, Vec<TrackedNode>>,
     /// When the flake pass last ran; `None` before the first one.
     last_run: Option<Instant>,
+    /// Cross-cycle state for upstream heads, update PRs, and freshness -- see
+    /// [`upstream`].
+    upstream: UpstreamCache,
+    /// Cross-cycle state for the flake-watch Action's impact status file --
+    /// see [`status`].
+    status: StatusCache,
 }
 
 impl FlakeCache {
@@ -62,10 +76,33 @@ impl FlakeCache {
     fn mark_ran(&mut self) {
         self.last_run = Some(Instant::now());
     }
+
+    /// Requests a due pass should budget for, estimated from the *previous*
+    /// pass's observed state -- this has to be knowable before any of this
+    /// cycle's own fetching happens, since it feeds the pre-flight check that
+    /// decides whether the cycle runs at all.
+    ///
+    /// Returns `(core, graphql_batches)`. The lock fetch itself costs one
+    /// core request per repository; `upstream` folds in its own compare and
+    /// batch estimate, and the status-file fetch costs one core request per
+    /// repository too.
+    #[must_use]
+    pub fn estimate_requests(&self, repos: &[String]) -> (u64, u64) {
+        let lock_cost = u64::try_from(repos.len()).unwrap_or(u64::MAX);
+        let status_cost = u64::try_from(repos.len()).unwrap_or(u64::MAX);
+        let (upstream_core, upstream_graphql) = self.upstream.estimate_requests(repos, &self.nodes);
+        (
+            lock_cost
+                .saturating_add(upstream_core)
+                .saturating_add(status_cost),
+            upstream_graphql,
+        )
+    }
 }
 
-/// Runs the flake-lock pass: fetches every repository in `repos` and
-/// refreshes `cache` with the result.
+/// Runs the flake pass: fetches `flake.lock` for every repository in `repos`,
+/// then resolves every tracked node's upstream and open update PR, then reads
+/// the flake-watch Action's impact status file.
 ///
 /// A fetch failure for one repository is logged and its previous tracked
 /// nodes are kept, so one broken repository cannot blind the exporter to the
@@ -75,14 +112,20 @@ impl FlakeCache {
 /// and the absence is logged once per pass at `info`.
 ///
 /// The pass is marked as run -- which resets [`FlakeCache::should_run`]'s
-/// interval -- only if `repos` is empty or at least one repository actually
-/// produced [`FetchOutcome::Fetched`] or [`FetchOutcome::NotFound`]. If every
-/// repository errored (a transport failure, or the budget check inside
-/// [`Client::get_cached`] refusing the request), marking the pass as run
-/// regardless would start the next `flake_interval`-long wait from a pass
-/// that observed nothing at all, silently extending an outage into a much
-/// longer one.
-pub async fn run_pass(client: &Client, repos: &[String], cache: &mut FlakeCache) {
+/// interval -- only if `repos` is empty or at least one repository's
+/// `flake.lock` fetch actually produced [`FetchOutcome::Fetched`] or
+/// [`FetchOutcome::NotFound`]. If every repository's lock fetch errored (a
+/// transport failure, or the budget check inside [`Client::get_cached_fallible`]
+/// refusing the request), marking the pass as run regardless would start the
+/// next `flake_interval`-long wait from a pass that observed nothing at all,
+/// silently extending an outage into a much longer one. The upstream and
+/// status stages keep their own previous values on failure independently of
+/// this and do not affect whether the pass is marked as run.
+///
+/// The upstream and status stages run against this cycle's freshly-fetched
+/// node set, so a repository whose `flake.lock` fetch failed this cycle is
+/// still resolved against whatever nodes the previous cycle observed for it.
+pub async fn run_pass(client: &Client, repos: &[String], state_dir: &Path, cache: &mut FlakeCache) {
     let mut any_observed = false;
     for repo in repos {
         match fetch_tracked_nodes(client, repo).await {
@@ -107,6 +150,19 @@ pub async fn run_pass(client: &Client, repos: &[String], cache: &mut FlakeCache)
             }
         }
     }
+
+    let now = chrono::Utc::now().timestamp();
+    upstream::run_pass(
+        client,
+        repos,
+        &cache.nodes,
+        &mut cache.upstream,
+        state_dir,
+        now,
+    )
+    .await;
+    status::run_pass(client, repos, &mut cache.status).await;
+
     if repos.is_empty() || any_observed {
         cache.mark_ran();
     }
@@ -134,6 +190,18 @@ pub fn record_metrics(metrics: &Metrics, repo: &str, nodes: &[TrackedNode]) {
             })
             .set(locked_at);
     }
+}
+
+/// Publishes every flake-input metric family for `repo`'s currently cached
+/// state: the lock-derived timestamp, upstream freshness, and impact.
+///
+/// Called every cycle, independent of whether the flake pass itself ran this
+/// cycle -- see [`record_metrics`]'s own documentation for why.
+pub fn record_all_metrics(metrics: &Metrics, repo: &str, cache: &FlakeCache) {
+    let nodes = cache.nodes_for(repo);
+    record_metrics(metrics, repo, nodes);
+    upstream::record_metrics(metrics, repo, nodes, &cache.upstream);
+    status::record_metrics(metrics, repo, nodes, &cache.status);
 }
 
 enum FetchOutcome {
@@ -301,7 +369,8 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
-        run_pass(&client, &repos, &mut cache).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
 
         let nodes = cache.nodes_for("o/r");
         assert_eq!(nodes.len(), 1);
@@ -347,12 +416,13 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         let first = cache.nodes_for("o/r").to_vec();
         assert_eq!(first.len(), 1);
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         let second = cache.nodes_for("o/r");
         assert_eq!(second, first.as_slice(), "a 304 must replay the cached set");
 
@@ -386,12 +456,13 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
         assert!(
             cache.should_run(Duration::from_secs(3600)),
             "the pass has never run, so it is always due"
         );
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             !cache.should_run(Duration::from_secs(3600)),
@@ -411,7 +482,8 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/no-flake".to_owned()];
-        run_pass(&client, &repos, &mut cache).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
 
         assert_eq!(cache.nodes_for("o/no-flake"), []);
 
@@ -449,11 +521,12 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         assert_eq!(cache.nodes_for("o/r").len(), 1);
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         assert_eq!(
             cache.nodes_for("o/r").len(),
             1,
@@ -506,11 +579,12 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/r".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         assert_eq!(cache.nodes_for("o/r").len(), 1, "cycle one parses cleanly");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
         assert_eq!(
             cache.nodes_for("o/r").len(),
             1,
@@ -543,8 +617,9 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/down".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             cache.should_run(Duration::from_secs(3600)),
@@ -576,8 +651,9 @@ mod tests {
         let client = client_for(&server);
         let mut cache = FlakeCache::default();
         let repos = vec!["o/down".to_owned(), "o/up".to_owned()];
+        let dir = tempfile::tempdir().expect("tempdir");
 
-        run_pass(&client, &repos, &mut cache).await;
+        run_pass(&client, &repos, dir.path(), &mut cache).await;
 
         assert!(
             !cache.should_run(Duration::from_secs(3600)),
@@ -595,6 +671,8 @@ mod tests {
             channel: None,
             locked_rev: None,
             locked_last_modified: None,
+            owner: None,
+            repo: None,
         };
         let (metrics, registry) = Metrics::new();
         record_metrics(&metrics, "o/r", &[node]);

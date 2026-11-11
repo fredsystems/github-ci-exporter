@@ -178,7 +178,18 @@ struct CacheEntry {
 /// * 3 -- the runs listing is no longer filtered by `branch=` server-side, so
 ///   the reduction selects the branch itself; and `Workflow` gained the numeric
 ///   `id` the per-workflow top-up addresses. Both a shape and a meaning change.
-const CACHE_FORMAT_VERSION: u32 = 3;
+/// * 4 -- `flake::lock::TrackedNode`, the flake-lock pass's cached
+///   projection, gained `owner`/`repo` fields. Both are `Option<String>`,
+///   and serde's derive treats a missing key for an `Option<T>` field as
+///   `None` rather than a decode error, so a pre-bump entry decoded clean
+///   with them absent instead of tripping the per-entry decode fallback
+///   that would otherwise catch a shape change. With `owner`/`repo` silently
+///   `None`, `upstream::lookup_key_for` saw nothing to look up for any
+///   already-cached node, and the still-valid `ETag` kept replaying that
+///   same empty projection on every `304` -- upstream resolution for every
+///   repository tracked before this change was silently and permanently
+///   inert.
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Versioned envelope for the persisted cache, as read from disk.
 ///
@@ -763,6 +774,63 @@ impl Client {
         query: &str,
         variables: serde_json::Value,
     ) -> Result<T, ClientError> {
+        let envelope = self.graphql_request::<T>(query, variables).await?;
+
+        if let Some(errors) = envelope.errors.filter(|e| !e.is_empty()) {
+            let joined = errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ClientError::GraphQl(joined));
+        }
+
+        envelope
+            .data
+            .ok_or_else(|| ClientError::GraphQl("response contained no data".to_owned()))
+    }
+
+    /// Executes a GraphQL query, returning whatever `data` came back
+    /// alongside any `errors` rather than failing the whole request on the
+    /// first one.
+    ///
+    /// [`Self::graphql`] is all-or-nothing, which is right for a query with
+    /// no internal structure to salvage -- discovery, the activity query --
+    /// but wrong for a batch that aliases many independent lookups into one
+    /// request: a deleted or inaccessible repository behind one alias
+    /// reports a `NOT_FOUND` error for that alias's `path` *and* leaves its
+    /// data `null`, while every other alias in the same response resolves
+    /// normally. Failing the batch over one gone repository would discard
+    /// every healthy alias alongside it. Use this when the caller can
+    /// interpret `errors` per alias (see `flake::upstream::run_pass`);
+    /// otherwise prefer [`Self::graphql`].
+    ///
+    /// # Errors
+    /// Returns [`ClientError::GraphQl`] when the response carries no `data`
+    /// at all (a malformed query, an auth failure reported as a GraphQL
+    /// error), or a transport/decode error. A response with both `data` and
+    /// `errors` is not itself an error here -- the errors are returned
+    /// alongside the data for the caller to interpret.
+    pub async fn graphql_partial<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<(T, Vec<GraphQlError>), ClientError> {
+        let envelope = self.graphql_request::<T>(query, variables).await?;
+        let data = envelope
+            .data
+            .ok_or_else(|| ClientError::GraphQl("response contained no data".to_owned()))?;
+        Ok((data, envelope.errors.unwrap_or_default()))
+    }
+
+    /// Shared request-plus-retry-plus-decode step both [`Self::graphql`] and
+    /// [`Self::graphql_partial`] build on, stopping just short of deciding
+    /// what to do with `errors` -- that is the one place the two differ.
+    async fn graphql_request<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<GraphQlResponse<T>, ClientError> {
         let payload = serde_json::json!({ "query": query, "variables": variables });
 
         self.check_budget(RateLimitResource::GraphQl)?;
@@ -789,24 +857,10 @@ impl Client {
             let body = self
                 .check_status(status, &self.graphql_url, response)
                 .await?;
-            let envelope: GraphQlResponse<T> =
-                serde_json::from_str(&body).map_err(|source| ClientError::Decode {
-                    url: self.graphql_url.clone(),
-                    source,
-                })?;
-
-            if let Some(errors) = envelope.errors.filter(|e| !e.is_empty()) {
-                let joined = errors
-                    .iter()
-                    .map(|e| e.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(ClientError::GraphQl(joined));
-            }
-
-            return envelope
-                .data
-                .ok_or_else(|| ClientError::GraphQl("response contained no data".to_owned()));
+            return serde_json::from_str(&body).map_err(|source| ClientError::Decode {
+                url: self.graphql_url.clone(),
+                source,
+            });
         }
     }
 
@@ -861,9 +915,39 @@ struct GraphQlResponse<T> {
     errors: Option<Vec<GraphQlError>>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct GraphQlError {
-    message: String,
+/// One entry of a GraphQL response's `errors` array.
+///
+/// `kind` and `path` are what let [`Client::graphql_partial`]'s callers tell
+/// a `NOT_FOUND` for one alias apart from every other error type: GitHub's
+/// GraphQL API reports a machine-readable `type` (`NOT_FOUND`, `FORBIDDEN`,
+/// `INTERNAL`, ...) and the response-shaped `path` to the field it applies
+/// to, e.g. `["u3"]` for a top-level aliased lookup.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GraphQlError {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub path: Vec<serde_json::Value>,
+}
+
+impl GraphQlError {
+    /// The first segment of `path`, as a string -- the alias name for any
+    /// error this crate's batched queries produce, since none of them alias
+    /// beyond one level deep.
+    #[must_use]
+    pub fn alias(&self) -> Option<&str> {
+        self.path.first()?.as_str()
+    }
+
+    /// Whether this error's `type` is `NOT_FOUND` -- GitHub's classification
+    /// for a repository (or other node) that does not exist or is not
+    /// visible to this token, as opposed to a transient or structural
+    /// failure that should fail the whole batch.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        self.kind.as_deref() == Some("NOT_FOUND")
+    }
 }
 
 #[cfg(test)]
@@ -1314,6 +1398,107 @@ mod tests {
         };
         assert_eq!(limit.reset_in_secs(900), 100);
         assert_eq!(limit.reset_in_secs(5_000), 0, "past resets clamp to zero");
+    }
+
+    #[tokio::test]
+    async fn graphql_partial_keeps_healthy_aliases_despite_a_not_found_error() {
+        // A deleted/inaccessible repository behind one alias reports
+        // `NOT_FOUND` for that alias's `path` and leaves its data `null`,
+        // without touching any other alias's healthy result.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "u0": null, "u1": { "ok": true } },
+                "errors": [{
+                    "type": "NOT_FOUND",
+                    "path": ["u0"],
+                    "message": "Could not resolve to a Repository with the name 'gone'."
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (data, errors): (HashMap<String, Option<serde_json::Value>>, _) = client
+            .graphql_partial("query {}", json!({}))
+            .await
+            .expect("a NOT_FOUND alongside healthy data must not fail the request");
+
+        assert_eq!(data.get("u1").cloned().flatten(), Some(json!({"ok": true})));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].is_not_found());
+        assert_eq!(errors[0].alias(), Some("u0"));
+    }
+
+    #[tokio::test]
+    async fn graphql_partial_still_fails_with_no_data_at_all() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": null,
+                "errors": [{"type": "INTERNAL", "message": "boom"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let result: Result<(serde_json::Value, _), _> =
+            client.graphql_partial("query {}", json!({})).await;
+        assert!(matches!(result, Err(ClientError::GraphQl(_))));
+    }
+
+    #[test]
+    fn an_old_shape_flake_lock_projection_is_dropped_by_the_cache_format_version_bump() {
+        // `TrackedNode` gained `owner`/`repo` as `Option<String>` fields.
+        // Serde's derive treats a missing key for an `Option<T>` field as
+        // `None` rather than a decode error, so this pre-bump body decodes
+        // cleanly -- proving the per-entry decode fallback alone could never
+        // have caught this shape change. Only the whole-file version bump
+        // does.
+        let pre_bump_body = serde_json::json!([{
+            "input": "nixpkgs",
+            "path": "nixpkgs",
+            "kind": "Branch",
+            "reference": null,
+            "channel": null,
+            "locked_rev": "abc123",
+            "locked_last_modified": 1,
+        }])
+        .to_string();
+        let decoded: Vec<crate::flake::lock::TrackedNode> =
+            serde_json::from_str(&pre_bump_body).expect("the old shape still decodes");
+        assert_eq!(
+            decoded[0].owner, None,
+            "a missing owner/repo key silently becomes None rather than failing to decode"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("etags.json");
+        let stale = serde_json::json!({
+            "version": CACHE_FORMAT_VERSION - 1,
+            "entries": {
+                "https://api.github.com/repos/o/r/contents/flake.lock": {
+                    "etag": "\"old\"",
+                    "body": pre_bump_body,
+                }
+            }
+        });
+        std::fs::write(&path, stale.to_string()).expect("write");
+
+        let client = Client::new(
+            "t",
+            "https://api.github.com",
+            "https://api.github.com/graphql",
+        )
+        .expect("client")
+        .with_cache_file(&path);
+
+        assert!(
+            client.cache.lock().expect("lock").is_empty(),
+            "a pre-bump entry must not be reused even though it would still decode"
+        );
     }
 
     #[tokio::test]

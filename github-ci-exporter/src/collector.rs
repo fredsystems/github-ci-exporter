@@ -59,20 +59,21 @@ const fn estimate_core_requests(monitored: u64, workflows: u64) -> u64 {
         .saturating_add(50)
 }
 
-/// Whether the flake-lock pass is due this cycle, and the request budget to
-/// reserve for it if it runs.
+/// Whether the flake pass is due this cycle, and the request budget --
+/// `(core, graphql)` -- to reserve for it if it runs.
 ///
 /// Split out of [`collect`] so the pre-flight budget check and the
 /// CI-plus-flake affordability check can both price the pass with a single
-/// call.
-fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64) {
+/// call. The estimate itself is [`FlakeCache::estimate_requests`]'s: this
+/// function only decides whether the pass is due and gates the cost to zero
+/// when it is not.
+fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64, u64) {
     let due = cache.flake.should_run(config.flake_interval);
-    let cost = if due {
-        u64::try_from(config.flake_repos.len()).unwrap_or(u64::MAX)
-    } else {
-        0
-    };
-    (due, cost)
+    if !due {
+        return (false, 0, 0);
+    }
+    let (core, graphql) = cache.flake.estimate_requests(&config.flake_repos);
+    (due, core, graphql)
 }
 
 /// Decides whether this cycle may proceed, and if so whether the flake pass
@@ -87,16 +88,18 @@ fn flake_budget(cache: &WorkflowCache, config: &Config) -> (bool, u64) {
 ///
 /// Returns `Some(run_flake)` once CI is known to be affordable on its own.
 /// `run_flake` is `true` only if the flake pass is also due *and* the cycle
-/// can afford CI plus flake together; otherwise it is skipped for just this
-/// cycle (logged once at `warn`) rather than bypassing CI, and stays due so
-/// the next cycle retries it.
+/// can afford CI plus flake together in **both** request pools -- core and
+/// GraphQL, since the flake pass's upstream-resolution batches spend GraphQL
+/// requests the lock fetch alone does not; otherwise the pass is skipped for
+/// just this cycle (logged once at `warn`) rather than bypassing CI, and
+/// stays due so the next cycle retries it.
 fn decide_budget(
     client: &Client,
     config: &Config,
     cache: &WorkflowCache,
     now: DateTime<Utc>,
 ) -> Option<bool> {
-    let (flake_due, flake_request_estimate) = flake_budget(cache, config);
+    let (flake_due, flake_core_estimate, flake_graphql_estimate) = flake_budget(cache, config);
     let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count());
 
     if !client.can_afford(RateLimitResource::Core, estimated_core)
@@ -119,21 +122,26 @@ fn decide_budget(
     let run_flake = flake_due
         && client.can_afford(
             RateLimitResource::Core,
-            estimated_core.saturating_add(flake_request_estimate),
+            estimated_core.saturating_add(flake_core_estimate),
+        )
+        && client.can_afford(
+            RateLimitResource::GraphQl,
+            ESTIMATED_GRAPHQL_REQUESTS.saturating_add(flake_graphql_estimate),
         );
     if flake_due && !run_flake {
         warn!(
             estimated_core,
-            flake_request_estimate,
+            flake_core_estimate,
+            flake_graphql_estimate,
             core_remaining = client.rate_limit(RateLimitResource::Core).remaining,
-            "skipping the flake-lock pass this cycle: budget covers CI but not CI plus flake; will retry next cycle"
+            graphql_remaining = client.rate_limit(RateLimitResource::GraphQl).remaining,
+            "skipping the flake pass this cycle: budget covers CI but not CI plus flake; will retry next cycle"
         );
     }
     Some(run_flake)
 }
 
-/// Runs the flake-lock pass if `run_flake`, then republishes whatever is
-/// cached.
+/// Runs the flake pass if `run_flake`, then republishes whatever is cached.
 ///
 /// Every cycle re-publishes, independent of `run_flake`: the metrics registry
 /// [`collect`] builds is fresh each cycle, so cached data not republished
@@ -151,10 +159,16 @@ async fn run_flake_stage(
     run_flake: bool,
 ) {
     if run_flake {
-        flake::run_pass(client, &config.flake_repos, &mut cache.flake).await;
+        flake::run_pass(
+            client,
+            &config.flake_repos,
+            &config.state_dir,
+            &mut cache.flake,
+        )
+        .await;
     }
     for repo in &config.flake_repos {
-        flake::record_metrics(metrics, repo, cache.flake.nodes_for(repo));
+        flake::record_all_metrics(metrics, repo, &cache.flake);
     }
 }
 
@@ -271,6 +285,7 @@ pub enum CycleOutcome {
 /// # Errors
 /// Returns an error only when discovery fails for every configured owner,
 /// which means the cycle produced no usable data at all.
+#[allow(clippy::too_many_lines)] // One linear cycle; splitting it would scatter the stages it documents.
 pub async fn collect(
     client: &Client,
     config: &Config,
@@ -2547,6 +2562,144 @@ mod tests {
             second,
             CycleOutcome::Complete,
             "a cycle that affords CI must not be bypassed just because it cannot also afford flake"
+        );
+
+        let rendered = publisher.render();
+        assert!(
+            rendered.contains("github_exporter_budget_exhausted 0"),
+            "the cycle must not be reported as budget-exhausted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"repo="o/r""#) && rendered.contains("1700000000"),
+            "the flake metrics cached from cycle one must still be published:\n{rendered}"
+        );
+        assert!(
+            cache.flake.should_run(config.flake_interval),
+            "the flake pass must still be due: it was skipped, not run, this cycle"
+        );
+    }
+
+    /// A `flake.lock` with `n` root inputs, each a distinct `github` repo
+    /// pinned to a release tag (`NodeKind::Tag`, never `Branch`): every one
+    /// contributes an upstream lookup alias and a PR-lookup alias but, unlike
+    /// a branch node, none of them can ever cost a REST compare request --
+    /// what lets this fixture drive the GraphQL batch estimate arbitrarily
+    /// high while keeping the core-request estimate flat at the fixed
+    /// per-repository cost `FlakeCache::estimate_requests` documents.
+    fn many_tag_inputs_flake_lock(n: usize) -> String {
+        let mut inputs = serde_json::Map::new();
+        let mut nodes = serde_json::Map::new();
+        for i in 0..n {
+            let name = format!("input{i}");
+            inputs.insert(name.clone(), serde_json::Value::String(name.clone()));
+            nodes.insert(
+                name,
+                serde_json::json!({
+                    "inputs": {},
+                    "original": {
+                        "type": "github", "owner": format!("o{i}"), "repo": format!("r{i}"), "ref": "1.0",
+                    },
+                    "locked": {
+                        "type": "github", "owner": format!("o{i}"), "repo": format!("r{i}"),
+                        "rev": "abc123", "lastModified": 1_700_000_000_i64,
+                    },
+                }),
+            );
+        }
+        nodes.insert(
+            "root".to_owned(),
+            serde_json::json!({ "inputs": serde_json::Value::Object(inputs) }),
+        );
+        serde_json::json!({ "version": 7, "root": "root", "nodes": nodes }).to_string()
+    }
+
+    #[tokio::test]
+    async fn budget_covering_ci_but_not_ci_plus_flakes_graphql_batches_runs_ci_and_keeps_flake_due()
+    {
+        // Regression guard for the combined rule layered on top of main's
+        // budget fix: 3.5 made the flake pass cost a `(core, graphql)` pair,
+        // so "CI plus flake affordable" must check both pools, not just core.
+        // Here the flake pass's own core cost is negligible (lock fetch plus
+        // status fetch, one request each -- every tracked node is tag-pinned,
+        // so none can cost a REST compare) but its GraphQL cost is not: 26
+        // tag-pinned inputs need 26 upstream-lookup aliases plus 26
+        // update-PR-lookup aliases, 52 total, which spills into a second
+        // `BATCH_SIZE`-sized (50) GraphQL request. CI alone must still run,
+        // the flake pass must be skipped for just this cycle, and its cached
+        // metrics from cycle one must still publish.
+        const TAG_INPUTS: usize = 26;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/graphql"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-limit", "5000")
+                    // Affords CI's own GraphQL estimate (8) alone, but not CI
+                    // plus the two batches this fixture's flake pass needs.
+                    .insert_header(
+                        "x-ratelimit-remaining",
+                        (ESTIMATED_GRAPHQL_REQUESTS + 250 + 1).to_string(),
+                    )
+                    .set_body_json(serde_json::json!({
+                        "data": {
+                            "repositoryOwner": {
+                                "repositories": {
+                                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                    "nodes": [],
+                                },
+                            },
+                        },
+                    })),
+            )
+            .mount(&server)
+            .await;
+        // Exactly one flake.lock fetch across both cycles: the first
+        // populates the cache and the core-side rate-limit budget, the
+        // second must not repeat it.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/o/r/contents/flake.lock"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("x-ratelimit-limit", "5000")
+                    // Ample core budget: this rule is about the GraphQL pool.
+                    .insert_header("x-ratelimit-remaining", "100000")
+                    .set_body_json(serde_json::json!({
+                        "content": github_base64(&many_tag_inputs_flake_lock(TAG_INPUTS)),
+                        "encoding": "base64",
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let config = flake_only_config();
+        let (metrics, registry) = Metrics::new();
+        let publisher = Publisher::new(metrics, registry);
+        let mut cache = WorkflowCache::default();
+
+        // Cycle one: both buckets start unpopulated, so the pre-flight check
+        // cannot yet see a constrained budget. This cycle exists only to
+        // populate the cache and both rate-limit buckets via the response
+        // headers above.
+        let first = collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle one");
+        assert_eq!(first, CycleOutcome::Complete);
+
+        // Cycle two: the core pool comfortably covers CI plus flake, but the
+        // GraphQL pool covers CI alone and not CI plus the flake pass's two
+        // batches.
+        let second = collect(&client, &config, &publisher, &mut cache)
+            .await
+            .expect("cycle two");
+        assert_eq!(
+            second,
+            CycleOutcome::Complete,
+            "a cycle that affords CI must not be bypassed just because it cannot also afford \
+             the flake pass's GraphQL batches"
         );
 
         let rendered = publisher.render();
