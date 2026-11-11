@@ -14,10 +14,28 @@
 //! is, for the same reason: a crash mid-write must not leave a truncated file
 //! that then gets discarded as corrupt.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+/// Disambiguates one process's successive temp-file writes from each other.
+/// Paired with the process id in [`unique_tmp_path`], so two saves -- by
+/// this process or another one sharing the same `state_dir` -- never target
+/// the same temp file and risk one rename clobbering the other's
+/// still-being-written contents.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Builds a temp path for one `persist` call that no other call, in this
+/// process or any other, will ever reuse.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{unique}.tmp", std::process::id()))
+}
 
 /// On-disk format version. A mismatch discards the file wholesale, the same
 /// policy the `ETag` cache uses, since the one thing worse than losing every
@@ -74,6 +92,12 @@ impl FirstSeenStore {
     /// Writes the store to disk, write-then-rename so a crash mid-write
     /// cannot leave a truncated file behind.
     ///
+    /// The temp file's name is unique per call (see [`unique_tmp_path`]),
+    /// not a fixed `<path>.tmp`: a fixed name would let two saves in flight
+    /// at once -- a future concurrent writer, or two exporter instances
+    /// pointed at the same `state_dir` -- race on the same temp file, with
+    /// one rename landing an incomplete write from the other.
+    ///
     /// # Errors
     /// Returns an error if the containing directory cannot be created or the
     /// file cannot be written.
@@ -85,7 +109,7 @@ impl FirstSeenStore {
             version: FORMAT_VERSION,
             entries: self.entries.clone(),
         })?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = unique_tmp_path(path);
         std::fs::write(&tmp, encoded)?;
         std::fs::rename(&tmp, path)
     }
@@ -134,6 +158,17 @@ mod tests {
             store.observe_behind("a", 200),
             200,
             "a cleared entry restarts"
+        );
+    }
+
+    #[test]
+    fn two_saves_do_not_share_a_temp_path() {
+        let path = Path::new("/tmp/does-not-need-to-exist/flake-first-seen.json");
+        let a = unique_tmp_path(path);
+        let b = unique_tmp_path(path);
+        assert_ne!(
+            a, b,
+            "concurrent saves must not be able to race on the same temp file"
         );
     }
 

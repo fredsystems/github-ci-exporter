@@ -10,13 +10,14 @@
 //! logs once at `info`, the same "absence is not an error" contract
 //! `super::collect` already applies to a repository with no `flake.lock`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::{
+    flake::lock::TrackedNode,
     github::{Client, ClientError, rest},
     metrics::{FlakeInputImpactLabels, Metrics},
 };
@@ -175,16 +176,33 @@ fn project_status(response: ContentResponse) -> HashMap<String, InputImpact> {
         .collect()
 }
 
-/// Publishes `flake_input_impact` for `repo`'s currently cached status.
+/// Publishes `flake_input_impact` for `repo`'s currently cached status,
+/// restricted to root inputs `nodes` currently tracks.
 ///
 /// Called every cycle, independent of whether this pass ran this cycle --
 /// the registry is rebuilt from scratch each cycle, so cached data not
 /// republished here simply disappears.
-pub fn record_metrics(metrics: &Metrics, repo: &str, cache: &StatusCache) {
+///
+/// `StatusCache` is fetched and cached independently of the lock pass, so an
+/// input removed from `flake.lock` leaves its impact entry sitting in the
+/// cache with nothing to invalidate it until the watch Action's status file
+/// itself changes -- which, for a removed input, it may never do. Filtering
+/// by `nodes` here, rather than clearing the stale entry eagerly, keeps that
+/// cross-pass cleanup out of `status`'s own cache and in the one place that
+/// already knows the current tracked set.
+pub fn record_metrics(metrics: &Metrics, repo: &str, nodes: &[TrackedNode], cache: &StatusCache) {
     let Some(impact) = cache.impact_for(repo) else {
         return;
     };
+    let current_root_inputs: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| node.path == node.input)
+        .map(|node| node.input.as_str())
+        .collect();
     for (input, input_impact) in impact {
+        if !current_root_inputs.contains(input.as_str()) {
+            continue;
+        }
         for (os, kind) in &input_impact.kinds {
             metrics
                 .flake_input_impact
@@ -213,11 +231,31 @@ mod tests {
     };
 
     use super::*;
-    use crate::metrics::{Metrics, Publisher};
+    use crate::{
+        flake::lock::NodeKind,
+        metrics::{Metrics, Publisher},
+    };
 
     fn client_for(server: &MockServer) -> Client {
         Client::new("t", &server.uri(), &format!("{}/graphql", server.uri()))
             .expect("client builds")
+    }
+
+    /// A minimal root-input node: `path == input`, which is what
+    /// [`record_metrics`] uses to decide an impact entry's input is still
+    /// tracked.
+    fn root_node(input: &str) -> TrackedNode {
+        TrackedNode {
+            input: input.to_owned(),
+            path: input.to_owned(),
+            kind: NodeKind::Branch,
+            reference: None,
+            channel: None,
+            locked_rev: Some("abc".to_owned()),
+            locked_last_modified: Some(1),
+            owner: Some("o".to_owned()),
+            repo: Some("r".to_owned()),
+        }
     }
 
     fn github_base64(content: &str) -> String {
@@ -256,7 +294,7 @@ mod tests {
 
         assert!(cache.impact_for("o/r").is_none());
         let (metrics, registry) = Metrics::new();
-        record_metrics(&metrics, "o/r", &cache);
+        record_metrics(&metrics, "o/r", &[], &cache);
         assert!(
             !Publisher::new(metrics, registry)
                 .render()
@@ -288,12 +326,54 @@ mod tests {
         run_pass(&client, &["o/r".to_owned()], &mut cache).await;
 
         let (metrics, registry) = Metrics::new();
-        record_metrics(&metrics, "o/r", &cache);
+        record_metrics(&metrics, "o/r", &[root_node("niri")], &cache);
         let rendered = Publisher::new(metrics, registry).render();
         assert!(rendered.contains("github_flake_input_impact"));
         assert!(rendered.contains(r#"input="niri""#));
         assert!(rendered.contains(r#"os="linux""#));
         assert!(rendered.contains(r#"kind="source""#));
+    }
+
+    #[tokio::test]
+    async fn an_input_removed_from_the_lock_publishes_no_impact() {
+        // Finding H: `StatusCache` is fetched and cached independently of
+        // the lock pass, so an input dropped from `flake.lock` leaves its
+        // impact entry sitting in the cache with nothing of its own to
+        // invalidate it. `record_metrics` must not publish impact for a
+        // root input the current tracked set no longer has.
+        let body = serde_json::json!({
+            "version": 1,
+            "inputs": {
+                "niri": { "kinds": { "linux": "source" } },
+                "removed-input": { "kinds": { "linux": "rebuild" } },
+            }
+        })
+        .to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/status/flake-inputs.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": github_base64(&body),
+                "encoding": "base64",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let mut cache = StatusCache::default();
+        run_pass(&client, &["o/r".to_owned()], &mut cache).await;
+
+        // Only "niri" is still a tracked root input this cycle.
+        let (metrics, registry) = Metrics::new();
+        record_metrics(&metrics, "o/r", &[root_node("niri")], &cache);
+        let rendered = Publisher::new(metrics, registry).render();
+
+        assert!(rendered.contains(r#"input="niri""#));
+        assert!(
+            !rendered.contains("removed-input"),
+            "an input no longer in flake.lock must not keep publishing impact:\n{rendered}"
+        );
     }
 
     #[test]

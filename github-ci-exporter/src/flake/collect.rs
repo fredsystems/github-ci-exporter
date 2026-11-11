@@ -201,7 +201,7 @@ pub fn record_all_metrics(metrics: &Metrics, repo: &str, cache: &FlakeCache) {
     let nodes = cache.nodes_for(repo);
     record_metrics(metrics, repo, nodes);
     upstream::record_metrics(metrics, repo, nodes, &cache.upstream);
-    status::record_metrics(metrics, repo, &cache.status);
+    status::record_metrics(metrics, repo, nodes, &cache.status);
 }
 
 enum FetchOutcome {

@@ -303,9 +303,17 @@ upstream, read from a single aliased GraphQL query every flake pass:
   for a branch-tracking input, or the newest release's commit time for a
   tag-pinned one.
 - `github_flake_input_up_to_date` is `1` when the lock matches that upstream,
-  `0` when it does not. No series at all when the comparison could not be
-  made this pass -- a failed lookup, a deleted upstream repository, or an
-  input kind with no upstream notion yet (a channel tarball).
+  `0` when it does not. When a node's upstream lookup fails this pass -- a
+  transport error, or the whole GraphQL batch rejected -- the previously
+  published status is retained exactly as it was: a replay of the last
+  successful comparison, not a fresh one, which can go stale if the failure
+  persists across many passes. A repository that resolves to an explicit
+  `null` this pass (deleted, or GraphQL's `NOT_FOUND` for that alias) is
+  different: that is confirmed gone rather than merely unreachable, so any
+  previously cached status for it is dropped instead of kept. "No series at
+  all" therefore covers two cases, not every failed lookup: an input that
+  has never once resolved (including one with no upstream notion yet, a
+  channel tarball), and one whose repository has just been confirmed gone.
 - `github_flake_input_outdated_since_timestamp_seconds` is published only
   when an input is behind, and is measured from the **oldest** change it is
   missing, not the newest, so a busy upstream cannot keep resetting the
@@ -329,8 +337,15 @@ upstream, read from a single aliased GraphQL query every flake pass:
 
 All of this runs on the same `flake_interval` as the lock pass, folded into
 the same hourly request budget -- see "Rate-limit behaviour" above. A cycle
-that cannot afford this pass keeps every previously published value exactly
-as it was; nothing is ever partially updated.
+whose budget cannot cover the pass at all skips it entirely, before a single
+request goes out, so every previously published value is kept exactly as it
+was. That all-or-nothing guarantee applies only to a pass that never starts:
+once it is running, each repository's `flake.lock` fetch and each GraphQL
+batch is its own independent request with its own fallback -- the
+per-repository and per-node behaviour documented throughout this section --
+so a transient failure partway through a pass can update some repositories,
+or some aliases within a batch, while others keep their older, previously
+published values. It is not a single atomic unit once started.
 
 ## What counts as the current CI state
 
@@ -441,9 +456,11 @@ aliases per request:
 
 Identical lookups -- the same owner, repository, and ref -- are deduplicated
 before the query is built, so an owned nixpkgs shared by coincidence costs
-nothing extra. A repository that no longer exists resolves to `null` and is
-logged, not treated as a failed pass; every other node still resolves
-normally.
+nothing extra. A repository that no longer exists resolves to an explicit
+`null` -- a bare one, or GitHub's `NOT_FOUND` error for that alias -- and is
+logged, not treated as a failed pass; every other alias in the same batch
+still resolves normally, and that node's own previously published status is
+dropped rather than republished (see `github_flake_input_up_to_date` above).
 
 A node that is behind gets one more fetch: a branch gets a REST compare
 between its locked revision and the upstream head, cached the same way every
