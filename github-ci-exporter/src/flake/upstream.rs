@@ -559,9 +559,12 @@ async fn apply_upstream(
                         // `flake_interval`.
                         let previous = cache.statuses.get(&cache_key).cloned();
                         match previous {
+                            // The whole identity, not just locked_rev: a node
+                            // that was a tag (or another repository) with the
+                            // same oids must not lend this branch a comparison
+                            // that never succeeded for it.
                             Some(previous)
-                                if previous.identity.locked_rev.as_deref()
-                                    == node.locked_rev.as_deref()
+                                if previous.identity == NodeIdentity::of(node)
                                     && previous.upstream_oid == resolved.oid =>
                             {
                                 status.commits_behind = previous.commits_behind;
@@ -578,7 +581,7 @@ async fn apply_upstream(
         }
         (NodeKind::Tag, Freshness::Behind) => {
             if let Some(locked_tag) = &node.reference {
-                let identity = first_seen_identity(repo, &node.path, locked_tag);
+                let identity = first_seen_identity(repo, node, locked_tag);
                 status.outdated_since = Some(cache.first_seen.observe_behind(&identity, now));
             }
         }
@@ -586,7 +589,7 @@ async fn apply_upstream(
             if let Some(locked_tag) = &node.reference {
                 cache
                     .first_seen
-                    .clear(&first_seen_identity(repo, &node.path, locked_tag));
+                    .clear(&first_seen_identity(repo, node, locked_tag));
             }
         }
         _ => {}
@@ -613,8 +616,16 @@ async fn apply_upstream(
 /// Generic over `locked_identity` rather than hardcoded to a tag name, so a
 /// channel-tarball node (a future addition) can key its own clock on its
 /// locked short revision through the same function.
-fn first_seen_identity(repo: &str, path: &str, locked_identity: &str) -> String {
-    format!("{repo}|{path}|{locked_identity}")
+/// The node's source (`owner/repo`) is part of the key, so repointing an input
+/// at another repository with the same locked tag starts a new clock instead
+/// of inheriting the previous source's.
+fn first_seen_identity(repo: &str, node: &TrackedNode, locked_identity: &str) -> String {
+    let source_owner = node.owner.as_deref().unwrap_or("");
+    let source_repo = node.repo.as_deref().unwrap_or("");
+    format!(
+        "{repo}|{}|{source_owner}/{source_repo}|{locked_identity}",
+        node.path
+    )
 }
 
 fn first_seen_path(state_dir: &Path) -> std::path::PathBuf {
@@ -1444,11 +1455,11 @@ mod tests {
         let client = client_for(&server);
         let node = tag_node("opencode", "sst", "opencode", "v1.0.0", "oid");
         let mut nodes_by_repo = HashMap::new();
-        nodes_by_repo.insert("o/r".to_owned(), vec![node]);
+        nodes_by_repo.insert("o/r".to_owned(), vec![node.clone()]);
         let mut cache = UpstreamCache::default();
         cache
             .first_seen
-            .observe_behind(&first_seen_identity("o/r", "opencode", "v1.0.0"), 1);
+            .observe_behind(&first_seen_identity("o/r", &node, "v1.0.0"), 1);
         let dir = tempfile::tempdir().expect("tempdir");
 
         run_pass(
@@ -1464,7 +1475,7 @@ mod tests {
         assert_eq!(
             cache
                 .first_seen
-                .observe_behind(&first_seen_identity("o/r", "opencode", "v1.0.0"), 999),
+                .observe_behind(&first_seen_identity("o/r", &node, "v1.0.0"), 999),
             999,
             "the stale entry must have been cleared, so this re-observes fresh"
         );
@@ -1912,6 +1923,85 @@ mod tests {
             cache.status_for("o/r", &on_release).is_none(),
             "a status computed for a different ref must not be published for the new one"
         );
+    }
+
+    #[test]
+    fn repointing_an_input_at_another_repository_starts_a_new_first_seen_key() {
+        // Same configured repo, path and locked tag, different source: the
+        // previous source's outdated-since clock must not carry over.
+        let before = tag_node("opencode", "o", "a", "v1", "oid");
+        let after = tag_node("opencode", "o", "b", "v1", "oid");
+        assert_ne!(
+            first_seen_identity("o/r", &before, "v1"),
+            first_seen_identity("o/r", &after, "v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tag_status_does_not_lend_its_comparison_to_a_branch_after_a_failed_compare() {
+        // Same path, same locked oid, same upstream oid -- but pass one saw a
+        // Tag node and pass two sees a Branch node whose compare fails. The
+        // tag's status must not be reused as if a branch comparison had
+        // succeeded: the branch's comparison is Pending.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "u0": {
+                        "latestRelease": {
+                            "tagName": "v2",
+                            "tagCommit": { "oid": "head-oid", "committedDate": "2026-01-01T00:00:00Z" }
+                        },
+                        "defaultBranchRef": {
+                            "target": { "oid": "head-oid", "committedDate": "2026-01-01T00:00:00Z" }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/niri-flake/compare/locked...head-oid"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cache = UpstreamCache::default();
+
+        let tag = tag_node("niri", "o", "niri-flake", "v1", "locked");
+        let mut nodes_by_repo = HashMap::new();
+        nodes_by_repo.insert("o/r".to_owned(), vec![tag]);
+        run_pass(
+            &client,
+            &["o/r".to_owned()],
+            &nodes_by_repo,
+            &mut cache,
+            dir.path(),
+            1,
+        )
+        .await;
+
+        let branch = branch_node("niri", "o", "niri-flake", None, "locked");
+        nodes_by_repo.insert("o/r".to_owned(), vec![branch.clone()]);
+        run_pass(
+            &client,
+            &["o/r".to_owned()],
+            &nodes_by_repo,
+            &mut cache,
+            dir.path(),
+            2,
+        )
+        .await;
+
+        let status = cache
+            .status_for("o/r", &branch)
+            .expect("branch status recorded");
+        assert_eq!(status.comparison, ComparisonState::Pending);
+        assert_eq!(status.commits_behind, None);
+        assert_eq!(status.outdated_since, None);
     }
 
     #[tokio::test]
