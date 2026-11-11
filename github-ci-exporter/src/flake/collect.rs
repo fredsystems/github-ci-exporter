@@ -200,10 +200,14 @@ pub async fn run_pass(
     channels::apply_tarball_freshness(
         repos,
         &cache.nodes,
-        &cache.channels,
+        &mut cache.channels,
         &mut cache.upstream,
         now,
     );
+    // The tarball stage records and clears first-seen entries after
+    // upstream::run_pass already saved the store; save again so they survive
+    // a restart before the next pass.
+    cache.upstream.persist_first_seen(state_dir);
 
     status::run_pass(client, repos, &mut cache.status).await;
 
@@ -778,10 +782,25 @@ mod tests {
         .to_string()
     }
 
+    /// The tarball stage records first-seen entries after
+    /// `upstream::run_pass` already saved the store; they must be on disk
+    /// after the same pass, so a restart before the next one keeps the clock.
+    fn assert_first_seen_persisted(state_dir: &Path, needle: &str) {
+        let persisted = std::fs::read_to_string(state_dir.join("flake-first-seen.json"))
+            .expect("first-seen state written");
+        assert!(
+            persisted.contains(needle),
+            "first-seen entry {needle} not persisted in the pass that observed it: {persisted}"
+        );
+    }
+
     fn mock_channel_revision(revision: &str) -> wiremock::Mock {
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param("query", "channel_revision"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_revision{",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
                 "data": {
@@ -817,9 +836,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param(
+            .and(wiremock::matchers::query_param_contains(
                 "query",
-                "channel_update_time",
+                "channel_update_time{",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
@@ -835,9 +854,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param(
+            .and(wiremock::matchers::query_param_contains(
                 "query",
-                r#"hydra_job_failed{exported_job=~".*tested"}"#,
+                "hydra_job_failed{",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
@@ -882,6 +901,7 @@ mod tests {
             .clone();
         assert_eq!(first.freshness, crate::flake::Freshness::Behind);
         let first_outdated_since = first.outdated_since.expect("behind nodes publish this");
+        assert_first_seen_persisted(dir.path(), "|nixpkgs|");
 
         run_pass(&client, &nixos_client, &repos, dir.path(), &mut cache).await;
         let second = cache
@@ -931,15 +951,18 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param("query", "channel_revision"))
+            .and(wiremock::matchers::query_param_contains(
+                "query",
+                "channel_revision{",
+            ))
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param(
+            .and(wiremock::matchers::query_param_contains(
                 "query",
-                "channel_update_time",
+                "channel_update_time{",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
@@ -955,9 +978,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
-            .and(wiremock::matchers::query_param(
+            .and(wiremock::matchers::query_param_contains(
                 "query",
-                r#"hydra_job_failed{exported_job=~".*tested"}"#,
+                "hydra_job_failed{",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",

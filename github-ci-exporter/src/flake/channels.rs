@@ -25,6 +25,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::BuildHasher,
     time::Duration,
 };
 
@@ -52,9 +53,39 @@ const UA: &str = concat!("github-ci-exporter/", env!("CARGO_PKG_VERSION"));
 /// ride out a blip without turning a real outage into a slow one.
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
-const QUERY_CHANNEL_REVISION: &str = "channel_revision";
-const QUERY_CHANNEL_UPDATE_TIME: &str = "channel_update_time";
-const QUERY_TESTED_FAILED: &str = r#"hydra_job_failed{exported_job=~".*tested"}"#;
+/// A `PromQL` regex alternation matching exactly these channels, for a
+/// `channel=~"..."` selector, so `prometheus.nixos.org` is only asked about
+/// channels a tracked node references.
+///
+/// Channel names are `nixos-26.05`-shaped. Anything outside
+/// `[A-Za-z0-9._-]` is skipped rather than escaped, so nothing unexpected
+/// from a lock file can reach the query; dots are regex-escaped (`\\.`
+/// inside the `PromQL` string literal is the regex `\.`).
+fn channel_matcher(channels: &[&str]) -> String {
+    channels
+        .iter()
+        .filter(|channel| {
+            !channel.is_empty()
+                && channel
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        })
+        .map(|channel| channel.replace('.', "\\\\."))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn query_channel_revision(matcher: &str) -> String {
+    format!(r#"channel_revision{{channel=~"{matcher}"}}"#)
+}
+
+fn query_channel_update_time(matcher: &str) -> String {
+    format!(r#"channel_update_time{{channel=~"{matcher}"}}"#)
+}
+
+fn query_tested_failed(matcher: &str) -> String {
+    format!(r#"hydra_job_failed{{exported_job=~".*tested",channel=~"{matcher}"}}"#)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelFetchError {
@@ -249,7 +280,10 @@ pub enum TestedState {
 pub struct ChannelStatus {
     pub revision: String,
     pub current: ChannelSupport,
-    pub update_time: i64,
+    /// `None` when `channel_update_time` had no sample for this channel and
+    /// no earlier value for the same revision is known: unknown, never 0
+    /// (the epoch would read as "has not moved in decades").
+    pub update_time: Option<i64>,
     pub tested: TestedState,
 }
 
@@ -257,6 +291,11 @@ pub struct ChannelStatus {
 #[derive(Debug, Default)]
 pub struct ChannelCache {
     statuses: HashMap<String, ChannelStatus>,
+    /// The tarball statuses [`apply_tarball_freshness`] set on the last pass
+    /// whose channel fetch succeeded, keyed by `(repo, path)`. Re-applied
+    /// during an outage only to a node whose identity is unchanged, since
+    /// [`super::upstream`]'s pass removes every tarball status each time.
+    tarball_statuses: HashMap<(String, String), NodeStatus>,
     /// `None` before the first attempt is ever made -- gating
     /// `nixos_channel_status_up`'s absence until then, since no node has
     /// ever referenced a channel is a materially different state from "the
@@ -295,20 +334,50 @@ impl ChannelCache {
 /// decode failure, or a non-"success" response body) abandons the whole
 /// attempt: the previously cached channel data is kept, a warning is logged,
 /// and [`ChannelCache::last_fetch_ok`] reports the failure.
-#[allow(clippy::implicit_hasher)]
-// `channels` is always `collect::FlakeCache::referenced_channels`'s own
-// std-hasher set; this is an internal collector, not a library API meant to
-// be generic over it.
-pub async fn run_pass(client: &NixosClient, channels: &HashSet<String>, cache: &mut ChannelCache) {
+pub async fn run_pass<S: BuildHasher + Sync>(
+    client: &NixosClient,
+    channels: &HashSet<String, S>,
+    cache: &mut ChannelCache,
+) {
+    // Channels no longer referenced by any tracked node are dropped first, so
+    // they stop being republished even if this pass's fetch then fails. With
+    // none referenced at all, the channel state is reset entirely: there is
+    // nothing to report on, including the last fetch's outcome.
+    cache
+        .statuses
+        .retain(|channel, _| channels.contains(channel));
     if channels.is_empty() {
+        cache.last_fetch_ok = None;
+        cache.tarball_statuses.clear();
         return;
     }
 
-    match fetch_all(client).await {
+    let mut sorted: Vec<&str> = channels.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let matcher = channel_matcher(&sorted);
+    if matcher.is_empty() {
+        warn!("no referenced NixOS channel has a queryable name; skipping the channel fetch");
+        return;
+    }
+
+    match fetch_all(client, &matcher).await {
         Ok(fetched) => {
+            let previous = std::mem::take(&mut cache.statuses);
             cache.statuses = fetched
                 .into_iter()
                 .filter(|(channel, _)| channels.contains(channel))
+                .map(|(channel, mut status)| {
+                    // A missing update time keeps the last known one, but only
+                    // for the same revision: a new revision's update time is
+                    // unknown until reported.
+                    if status.update_time.is_none()
+                        && let Some(prior) = previous.get(&channel)
+                        && prior.revision == status.revision
+                    {
+                        status.update_time = prior.update_time;
+                    }
+                    (channel, status)
+                })
                 .collect();
             cache.last_fetch_ok = Some(true);
         }
@@ -334,10 +403,11 @@ struct PartialStatus {
 
 async fn fetch_all(
     client: &NixosClient,
+    matcher: &str,
 ) -> Result<HashMap<String, ChannelStatus>, ChannelFetchError> {
-    let revision = client.query(QUERY_CHANNEL_REVISION).await?;
-    let update_time = client.query(QUERY_CHANNEL_UPDATE_TIME).await?;
-    let tested = client.query(QUERY_TESTED_FAILED).await?;
+    let revision = client.query(&query_channel_revision(matcher)).await?;
+    let update_time = client.query(&query_channel_update_time(matcher)).await?;
+    let tested = client.query(&query_tested_failed(matcher)).await?;
 
     let mut partials: HashMap<String, PartialStatus> = HashMap::new();
 
@@ -395,7 +465,7 @@ async fn fetch_all(
                 ChannelStatus {
                     revision,
                     current,
-                    update_time: partial.update_time.unwrap_or(0),
+                    update_time: partial.update_time,
                     tested,
                 },
             ))
@@ -406,27 +476,36 @@ async fn fetch_all(
 /// Feeds every channel-tarball node's freshness into [`super::upstream`]'s
 /// own `github_flake_input_*` families.
 ///
-/// A node whose channel has no cached data this pass, or whose own
-/// `locked_rev` could not be extracted (see `super::lock`), is left
-/// untouched: whatever an earlier pass published (or nothing, before the
-/// first one) keeps being served, the same "no evidence this pass, no
-/// change" contract every other lookup in this crate follows.
+/// Runs after [`super::upstream::run_pass`], which removes every tarball
+/// node's status (none of them has a GitHub lookup), so this re-establishes
+/// them each pass:
+///
+/// * When this pass's channel fetch succeeded, each tarball node is compared
+///   against its channel's revision. A node whose channel has no data, whose
+///   channel has no known update time, or whose own `locked_rev` could not be
+///   extracted (see `super::lock`) is left unresolved this pass.
+/// * When the fetch failed (an outage), nothing is recomputed: comparing a
+///   lock that changed during the outage against the stale cached revision
+///   could report an up-to-date node as behind and start a false
+///   outdated-since clock. The status from the last successful pass is
+///   re-applied only to a node whose identity (kind, locked revision, ...) is
+///   unchanged; a changed node stays unresolved until a fetch succeeds.
 ///
 /// `outdated_since` is measured from the node's own locked revision, not the
 /// channel's: the channel's revision advances independently of whether this
 /// node's lock has moved, and keying the clock to it would restart
 /// "how long has this been outdated" every time the channel moves while the
 /// node stays exactly as behind as before.
-#[allow(clippy::implicit_hasher)]
-// `nodes_by_repo` is always `collect::FlakeCache`'s own std-hasher map; this
-// is an internal collector, not a library API meant to be generic over it.
-pub fn apply_tarball_freshness(
+pub fn apply_tarball_freshness<S: BuildHasher>(
     repos: &[String],
-    nodes_by_repo: &HashMap<String, Vec<TrackedNode>>,
-    channels: &ChannelCache,
+    nodes_by_repo: &HashMap<String, Vec<TrackedNode>, S>,
+    channels: &mut ChannelCache,
     upstream: &mut UpstreamCache,
     now: i64,
 ) {
+    let fetch_succeeded = channels.last_fetch_ok == Some(true);
+    let mut applied = HashMap::new();
+
     for repo in repos {
         let Some(nodes) = nodes_by_repo.get(repo) else {
             continue;
@@ -435,10 +514,25 @@ pub fn apply_tarball_freshness(
             if node.kind != NodeKind::ChannelTarball {
                 continue;
             }
+            let key = (repo.clone(), node.path.clone());
+
+            if !fetch_succeeded {
+                if let Some(previous) = channels.tarball_statuses.get(&key)
+                    && previous.is_for(node)
+                {
+                    upstream.set_status(repo, &node.path, previous.clone());
+                    applied.insert(key, previous.clone());
+                }
+                continue;
+            }
+
             let Some(channel_name) = node.channel.as_deref() else {
                 continue;
             };
             let Some(channel_status) = channels.status_for(channel_name) else {
+                continue;
+            };
+            let Some(update_time) = channel_status.update_time else {
                 continue;
             };
             let Some(locked) = node.locked_rev.as_deref() else {
@@ -455,7 +549,7 @@ pub fn apply_tarball_freshness(
                 node,
                 channel_status.revision.clone(),
                 None,
-                channel_status.update_time,
+                update_time,
                 freshness,
             );
 
@@ -468,9 +562,14 @@ pub fn apply_tarball_freshness(
                 Freshness::Unknown => {}
             }
 
-            upstream.set_status(repo, &node.path, status);
+            upstream.set_status(repo, &node.path, status.clone());
+            applied.insert(key, status);
         }
     }
+
+    // Only nodes still tracked (and, during an outage, still identical) carry
+    // over, so a removed or changed tarball node never resurfaces later.
+    channels.tarball_statuses = applied;
 }
 
 /// The identity a channel-tarball node's first-seen entry is stored under:
@@ -494,10 +593,12 @@ pub fn record_metrics(metrics: &ChannelMetrics, cache: &ChannelCache) {
         let labels = ChannelLabels {
             channel: channel.clone(),
         };
-        metrics
-            .update_timestamp
-            .get_or_create(&labels)
-            .set(status.update_time);
+        if let Some(update_time) = status.update_time {
+            metrics
+                .update_timestamp
+                .get_or_create(&labels)
+                .set(update_time);
+        }
         metrics
             .current
             .get_or_create(&labels)
@@ -551,7 +652,7 @@ mod tests {
         clippy::needless_pass_by_value,
         reason = "owned value makes every call site a one-line inline json!(...) literal"
     )]
-    fn mock_query(query: &'static str, result: serde_json::Value) -> wiremock::Mock {
+    fn mock_query(query: &str, result: serde_json::Value) -> wiremock::Mock {
         Mock::given(method("GET"))
             .and(path("/api/v1/query"))
             .and(query_param("query", query))
@@ -575,13 +676,16 @@ mod tests {
         update_time: serde_json::Value,
         tested: serde_json::Value,
     ) {
-        mock_query(QUERY_CHANNEL_REVISION, revision)
+        let matcher = channel_matcher(&["nixos-unstable"]);
+        mock_query(&query_channel_revision(&matcher), revision)
             .mount(server)
             .await;
-        mock_query(QUERY_CHANNEL_UPDATE_TIME, update_time)
+        mock_query(&query_channel_update_time(&matcher), update_time)
             .mount(server)
             .await;
-        mock_query(QUERY_TESTED_FAILED, tested).mount(server).await;
+        mock_query(&query_tested_failed(&matcher), tested)
+            .mount(server)
+            .await;
     }
 
     fn one_channel() -> HashSet<String> {
@@ -621,7 +725,7 @@ mod tests {
         let status = cache.status_for("nixos-unstable").expect("cached");
         assert_eq!(status.revision, "abcdef0123456789");
         assert_eq!(status.current, ChannelSupport::Current);
-        assert_eq!(status.update_time, 1_700_000_100);
+        assert_eq!(status.update_time, Some(1_700_000_100));
         assert_eq!(status.tested, TestedState::Passing);
         assert_eq!(cache.last_fetch_ok(), Some(true));
     }
@@ -805,13 +909,16 @@ mod tests {
 
     #[test]
     fn a_tarball_node_behind_its_channel_gets_a_commits_behind_free_status() {
-        let mut channels = ChannelCache::default();
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
         channels.statuses.insert(
             "nixos-unstable".to_owned(),
             ChannelStatus {
                 revision: "e62746b0b472753ef019baceab6f1e2e52014980".to_owned(),
                 current: ChannelSupport::Current,
-                update_time: 1_700_000_200,
+                update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
             },
         );
@@ -821,7 +928,7 @@ mod tests {
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_300,
         );
@@ -836,13 +943,16 @@ mod tests {
 
     #[test]
     fn a_tarball_node_matching_the_channel_prefix_is_up_to_date() {
-        let mut channels = ChannelCache::default();
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
         channels.statuses.insert(
             "nixos-unstable".to_owned(),
             ChannelStatus {
                 revision: "e62746b0b472753ef019baceab6f1e2e52014980".to_owned(),
                 current: ChannelSupport::Current,
-                update_time: 1_700_000_200,
+                update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
             },
         );
@@ -852,7 +962,7 @@ mod tests {
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_300,
         );
@@ -873,20 +983,23 @@ mod tests {
         let node = tarball_node("catppuccin/nixpkgs", "nixos-unstable", "oldrev000000");
         let mut upstream = UpstreamCache::default();
 
-        let mut channels = ChannelCache::default();
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
         channels.statuses.insert(
             "nixos-unstable".to_owned(),
             ChannelStatus {
                 revision: "revisionone00000000000000000000000000000".to_owned(),
                 current: ChannelSupport::Current,
-                update_time: 1_700_000_200,
+                update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
             },
         );
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_300,
         );
@@ -903,14 +1016,14 @@ mod tests {
             ChannelStatus {
                 revision: "revisiontwo00000000000000000000000000000".to_owned(),
                 current: ChannelSupport::Current,
-                update_time: 1_700_000_900,
+                update_time: Some(1_700_000_900),
                 tested: TestedState::Passing,
             },
         );
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_001_000,
         );
@@ -938,20 +1051,23 @@ mod tests {
         // documentation on that).
         let node = tarball_node("catppuccin/nixpkgs", "nixos-unstable", "oldrev000000");
         let mut upstream = UpstreamCache::default();
-        let mut channels = ChannelCache::default();
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
         channels.statuses.insert(
             "nixos-unstable".to_owned(),
             ChannelStatus {
                 revision: "revisionone00000000000000000000000000000".to_owned(),
                 current: ChannelSupport::Current,
-                update_time: 1_700_000_200,
+                update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
             },
         );
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_300,
         );
@@ -970,7 +1086,7 @@ mod tests {
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(caught_up.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_400,
         );
@@ -985,12 +1101,16 @@ mod tests {
     fn an_unresolvable_channel_leaves_the_tarball_node_unpublished() {
         let node = tarball_node("catppuccin/nixpkgs", "nixos-unstable", "oldrev000000");
         let mut upstream = UpstreamCache::default();
-        let channels = ChannelCache::default();
+        // A successful fetch that simply has no data for this channel.
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
 
         apply_tarball_freshness(
             &["fredsystems/nixos".to_owned()],
             &nodes_by_repo(node.clone()),
-            &channels,
+            &mut channels,
             &mut upstream,
             1_700_000_300,
         );
@@ -999,6 +1119,175 @@ mod tests {
             upstream.status_for("fredsystems/nixos", &node).is_none(),
             "no cached channel data this pass must publish no series, not a guess"
         );
+    }
+
+    #[test]
+    fn queries_select_only_the_referenced_channels_with_dots_escaped() {
+        let matcher = channel_matcher(&["nixos-26.05", "nixos-unstable", "bad\"name"]);
+        assert_eq!(
+            query_channel_revision(&matcher),
+            r#"channel_revision{channel=~"nixos-26\\.05|nixos-unstable"}"#
+        );
+        assert_eq!(
+            query_tested_failed(&matcher),
+            r#"hydra_job_failed{exported_job=~".*tested",channel=~"nixos-26\\.05|nixos-unstable"}"#
+        );
+    }
+
+    fn cached_status(revision: &str, update_time: Option<i64>) -> ChannelStatus {
+        ChannelStatus {
+            revision: revision.to_owned(),
+            current: ChannelSupport::Current,
+            update_time,
+            tested: TestedState::Passing,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_referenced_channel_resets_the_channel_state() {
+        let server = MockServer::start().await;
+        let client = client_for(&server);
+        let mut cache = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
+        cache
+            .statuses
+            .insert("nixos-unstable".to_owned(), cached_status("abc", Some(1)));
+
+        run_pass(&client, &HashSet::new(), &mut cache).await;
+
+        assert_eq!(cache.statuses().count(), 0);
+        assert_eq!(cache.last_fetch_ok(), None);
+    }
+
+    #[tokio::test]
+    async fn an_unreferenced_channel_is_pruned_even_when_the_fetch_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        cache
+            .statuses
+            .insert("nixos-unstable".to_owned(), cached_status("abc", Some(1)));
+        cache
+            .statuses
+            .insert("nixos-25.11".to_owned(), cached_status("def", Some(1)));
+
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        assert!(cache.status_for("nixos-unstable").is_some());
+        assert!(cache.status_for("nixos-25.11").is_none());
+        assert_eq!(cache.last_fetch_ok(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_missing_update_time_is_unknown_or_kept_for_the_same_revision() {
+        let revision = serde_json::json!([sample(
+            serde_json::json!({ "channel": "nixos-unstable", "revision": "abc", "current": "1" }),
+            "1"
+        )]);
+        let tested = serde_json::json!([]);
+
+        // No earlier value: unknown, not 0, and no timestamp series.
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            revision.clone(),
+            serde_json::json!([]),
+            tested.clone(),
+        )
+        .await;
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+        assert_eq!(
+            cache
+                .status_for("nixos-unstable")
+                .expect("cached")
+                .update_time,
+            None
+        );
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        record_metrics(&channel_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, channel_registry).render();
+        assert!(!rendered.contains("nixos_channel_update_timestamp_seconds{"));
+
+        // An earlier value for the same revision is kept.
+        cache
+            .statuses
+            .insert("nixos-unstable".to_owned(), cached_status("abc", Some(42)));
+        run_pass(&client, &one_channel(), &mut cache).await;
+        assert_eq!(
+            cache
+                .status_for("nixos-unstable")
+                .expect("cached")
+                .update_time,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn an_outage_never_compares_a_changed_lock_against_the_cached_revision() {
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
+        channels.statuses.insert(
+            "nixos-unstable".to_owned(),
+            cached_status(
+                "aaaaaaaaaaaa000000000000000000000000000",
+                Some(1_700_000_200),
+            ),
+        );
+        let repos = ["fredsystems/nixos".to_owned()];
+        let mut upstream = UpstreamCache::default();
+
+        // Pass one, fetch fine: lock A matches channel A.
+        let lock_a = tarball_node("catppuccin/nixpkgs", "nixos-unstable", "aaaaaaaaaaaa");
+        apply_tarball_freshness(
+            &repos,
+            &nodes_by_repo(lock_a.clone()),
+            &mut channels,
+            &mut upstream,
+            1,
+        );
+
+        // Pass two, outage, lock unchanged: the previous status is kept.
+        channels.last_fetch_ok = Some(false);
+        let mut upstream = UpstreamCache::default();
+        apply_tarball_freshness(
+            &repos,
+            &nodes_by_repo(lock_a.clone()),
+            &mut channels,
+            &mut upstream,
+            2,
+        );
+        assert_eq!(
+            upstream
+                .status_for("fredsystems/nixos", &lock_a)
+                .expect("kept")
+                .freshness,
+            Freshness::UpToDate
+        );
+
+        // Pass three, outage continues, lock moved to B: unresolved, not a
+        // false Behind against the stale cached revision.
+        let lock_b = tarball_node("catppuccin/nixpkgs", "nixos-unstable", "bbbbbbbbbbbb");
+        let mut upstream = UpstreamCache::default();
+        apply_tarball_freshness(
+            &repos,
+            &nodes_by_repo(lock_b.clone()),
+            &mut channels,
+            &mut upstream,
+            3,
+        );
+        assert!(upstream.status_for("fredsystems/nixos", &lock_b).is_none());
     }
 
     fn tarball_node(path: &str, channel: &str, locked_rev: &str) -> TrackedNode {

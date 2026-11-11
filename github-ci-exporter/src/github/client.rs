@@ -189,7 +189,12 @@ struct CacheEntry {
 ///   same empty projection on every `304` -- upstream resolution for every
 ///   repository tracked before this change was silently and permanently
 ///   inert.
-const CACHE_FORMAT_VERSION: u32 = 4;
+/// * 5 -- channel-tarball nodes in that same projection gained a
+///   `locked_rev` (the short revision extracted from the locked URL). A
+///   cached projection has `locked_rev: null` for them and still decodes, so
+///   a `304` would replay it and tarball freshness would stay unpublished
+///   until the lock changed.
+const CACHE_FORMAT_VERSION: u32 = 5;
 
 /// Versioned envelope for the persisted cache, as read from disk.
 ///

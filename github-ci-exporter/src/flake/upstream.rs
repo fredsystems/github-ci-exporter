@@ -131,6 +131,13 @@ impl NodeStatus {
     /// `comparison` is always [`ComparisonState::Complete`]: there is no
     /// REST compare to fail for a node with no GitHub lookup at all, so
     /// nothing here can ever be `Pending`.
+    /// Whether this status was computed for `node` as it is now (same kind,
+    /// source, ref and locked revision).
+    #[must_use]
+    pub fn is_for(&self, node: &TrackedNode) -> bool {
+        self.identity == NodeIdentity::of(node)
+    }
+
     #[must_use]
     pub fn for_node(
         node: &TrackedNode,
@@ -225,6 +232,16 @@ impl UpstreamCache {
 
     /// Clears `identity`'s first-seen entry -- see
     /// [`FirstSeenStore::clear`] and [`Self::observe_behind`].
+    /// Writes the first-seen store to `state_dir`. [`run_pass`] does this at
+    /// its end; callers that record further first-seen entries afterwards
+    /// (the channel-tarball stage) call it again so those are durable in the
+    /// pass that observes them.
+    pub fn persist_first_seen(&self, state_dir: &Path) {
+        if let Err(error) = self.first_seen.persist(&first_seen_path(state_dir)) {
+            warn!(%error, "failed to persist flake first-seen state");
+        }
+    }
+
     pub fn clear_behind(&mut self, identity: &str) {
         self.first_seen.clear(identity);
     }
