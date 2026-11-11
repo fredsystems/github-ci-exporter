@@ -596,6 +596,11 @@ The flake exports a NixOS module:
     enable = true;
     orgs = [ "sdr-enthusiasts" "fredsystems" "fredclausen" ];
     tokenFile = config.sops.secrets."monitoring/github_exporter_token".path;
+
+    # Optional: track these repositories' flake inputs (see "Flake input
+    # tracking"). flakeInterval defaults to "1h" (minimum 15m);
+    # nixosPrometheusUrl defaults to https://prometheus.nixos.org.
+    flakeRepos = [ "fredsystems/nixos" ];
   };
 }
 ```
