@@ -61,6 +61,7 @@
               "github-ci-exporter"
             ];
             nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.aws-lc ];
             meta = {
               description = "Prometheus exporter for GitHub issues, PRs, and Actions CI state";
               homepage = "https://github.com/fredsystems/github-ci-exporter";
