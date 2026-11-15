@@ -32,6 +32,10 @@ jobs:
       # because the cargo-driven hooks need network access for the crates.io
       # registry and the Nix sandbox has none.
       - name: Run checks in devShell
+        env:
+          # Lets the lychee link check use the GitHub API for github.com links
+          # instead of being rate limited.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           nix develop --impure --command bash -e -c '
             set -euxo pipefail
