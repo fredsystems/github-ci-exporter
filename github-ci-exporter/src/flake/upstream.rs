@@ -18,7 +18,7 @@ use std::{
     path::Path,
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -870,7 +870,7 @@ impl UpstreamNode {
         let target = wrapper.target.as_ref()?;
         Some(ResolvedUpstream {
             oid: target.oid.clone(),
-            committed_at: target.committed_date.timestamp(),
+            committed_at: target.committed_date.as_second(),
             tag_name: None,
             shadow_branch_oid: None,
         })
@@ -887,7 +887,7 @@ impl UpstreamNode {
         {
             return Some(ResolvedUpstream {
                 oid: commit.oid.clone(),
-                committed_at: commit.committed_date.timestamp(),
+                committed_at: commit.committed_date.as_second(),
                 tag_name: Some(release.tag_name.clone()),
                 shadow_branch_oid,
             });
@@ -902,7 +902,7 @@ impl UpstreamNode {
         };
         Some(ResolvedUpstream {
             oid: commit.oid.clone(),
-            committed_at: commit.committed_date.timestamp(),
+            committed_at: commit.committed_date.as_second(),
             tag_name: Some(node.name.clone()),
             shadow_branch_oid,
         })
@@ -918,7 +918,7 @@ struct RefWrapper {
 struct CommitTarget {
     oid: String,
     #[serde(rename = "committedDate")]
-    committed_date: DateTime<Utc>,
+    committed_date: Timestamp,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1031,9 +1031,7 @@ async fn fetch_compare(
 }
 
 fn parse_date_secs(raw: &str) -> Option<i64> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.timestamp())
+    raw.parse::<Timestamp>().ok().map(Timestamp::as_second)
 }
 
 /// Publishes every metric this module derives, for the nodes currently

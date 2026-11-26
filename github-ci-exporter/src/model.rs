@@ -208,7 +208,7 @@ pub struct RepoIndex {
     /// `None` only before the first sweep finishes. Clients use it to show how
     /// stale the list is rather than silently presenting hours-old data as
     /// current.
-    pub generated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub generated_at: Option<jiff::Timestamp>,
     pub repos: Vec<RepoIndexEntry>,
 }
 
@@ -229,7 +229,7 @@ pub struct RepoIndexEntry {
     /// reachable. Clients are expected to mark them rather than hide them.
     pub archived: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pushed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pushed_at: Option<jiff::Timestamp>,
 }
 
 /// A reference to one pull request, as `owner/name#number`.
@@ -499,6 +499,27 @@ mod tests {
     fn pull_ref_tolerates_surrounding_whitespace() {
         let parsed: PullRef = "  owner/name#7  ".parse().expect("parse");
         assert_eq!(parsed, PullRef::new("owner/name", 7));
+    }
+
+    #[test]
+    fn repo_index_entry_timestamps_serialise_as_rfc_3339_with_a_z_offset() {
+        // `RepoIndex` is served as `/repos.json` and parsed by a landing
+        // page's JavaScript `Date`, which needs an explicit offset. Pinned
+        // here against a known instant so a future jiff upgrade that changed
+        // the default serialisation (sub-second formatting, a `+00:00`
+        // offset instead of `Z`, ...) would be caught immediately.
+        let entry = RepoIndexEntry {
+            owner: "fredsystems".to_owned(),
+            name: "nixos".to_owned(),
+            description: None,
+            archived: false,
+            pushed_at: Some("2026-01-01T00:00:00Z".parse().expect("valid timestamp")),
+        };
+        let json = serde_json::to_string(&entry).expect("serialises");
+        assert!(
+            json.contains(r#""pushed_at":"2026-01-01T00:00:00Z""#),
+            "got {json}"
+        );
     }
 
     #[test]

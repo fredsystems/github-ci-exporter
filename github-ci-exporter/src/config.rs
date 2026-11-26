@@ -62,7 +62,7 @@ pub struct Config {
     pub orgs: Vec<String>,
 
     /// How often to refresh from the GitHub API.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "jiff_duration")]
     pub interval: Duration,
 
     /// Repositories to exclude, as `owner/name`. Applied after the automatic
@@ -85,7 +85,7 @@ pub struct Config {
     /// Skip repositories with no push in this window. `None` disables the
     /// check, which is the default: dormant-but-released repos still deserve
     /// CI visibility.
-    #[serde(default, with = "humantime_serde_option")]
+    #[serde(default, with = "jiff_duration_option")]
     pub max_repo_age: Option<Duration>,
 
     /// Drop repositories with no workflow files. These are content-hosting
@@ -121,7 +121,7 @@ pub struct Config {
     /// default would spend most of that budget re-fetching a file that has
     /// not moved. Every cycle still republishes the cached result, since the
     /// metrics registry is rebuilt from scratch each cycle.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "jiff_duration")]
     pub flake_interval: Duration,
 
     /// Base URL for NixOS channel status (`channel_revision`,
@@ -304,8 +304,35 @@ impl Config {
     }
 }
 
-/// `humantime_serde` for `Option<Duration>` under `serde(default)`.
-mod humantime_serde_option {
+/// jiff-backed replacement for `humantime_serde`: parses and renders the
+/// friendly duration format `jiff::Span` already understands (`"5m"`,
+/// `"1h 30m"`, `"90 seconds"`, `"365d"`, `"30 days"`, `"2w"`, ...), with a day
+/// fixed at 24 hours (`jiff::SpanRelativeTo::days_are_24_hours`) since a
+/// configuration duration has no calendar date to measure a variable one
+/// against. See [`parse_duration`] for why a month or year unit is rejected
+/// rather than silently accepted.
+mod jiff_duration {
+    use std::time::Duration;
+
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Duration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::format_duration(*value))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Duration, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        super::parse_duration(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// As [`jiff_duration`], for `Option<Duration>` under `serde(default)`.
+mod jiff_duration_option {
     use std::time::Duration;
 
     use serde::{Deserialize, Deserializer, Serializer};
@@ -316,7 +343,7 @@ mod humantime_serde_option {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         match value {
-            Some(d) => serializer.serialize_some(&humantime::format_duration(*d).to_string()),
+            Some(d) => serializer.serialize_some(&super::format_duration(*d)),
             None => serializer.serialize_none(),
         }
     }
@@ -325,9 +352,58 @@ mod humantime_serde_option {
         deserializer: D,
     ) -> Result<Option<Duration>, D::Error> {
         let raw = Option::<String>::deserialize(deserializer)?;
-        raw.map(|s| humantime::parse_duration(&s).map_err(serde::de::Error::custom))
+        raw.map(|s| super::parse_duration(&s).map_err(serde::de::Error::custom))
             .transpose()
     }
+}
+
+/// Parses the friendly duration format into a [`Duration`] -- see
+/// [`jiff_duration`]'s module documentation for the accepted shapes.
+///
+/// A month or year unit parses into a `Span` just fine, but is rejected here
+/// with a dedicated error: neither has a fixed length to convert to a
+/// `Duration` without a calendar date to measure it from (how many days are
+/// in "1 month" depends on which one), and this crate's durations -- poll
+/// intervals, a repository-activity window -- have no such date. Days and
+/// weeks are fine, since they are fixed at 24 hours here.
+///
+/// # Errors
+/// Returns [`DurationError`] if `raw` does not parse as a friendly duration,
+/// uses a month or year unit, or parses to a negative duration.
+fn parse_duration(raw: &str) -> Result<Duration, DurationError> {
+    let span: jiff::Span = raw
+        .parse()
+        .map_err(|_| DurationError::Unparsable(raw.to_owned()))?;
+    if span.get_years() != 0 || span.get_months() != 0 {
+        return Err(DurationError::CalendarUnit(raw.to_owned()));
+    }
+    let signed = span
+        .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+        .map_err(|_| DurationError::Unparsable(raw.to_owned()))?;
+    Duration::try_from(signed).map_err(|_| DurationError::Negative(raw.to_owned()))
+}
+
+/// Renders a [`Duration`] the way [`parse_duration`] accepts back.
+///
+/// Used by `Config`'s own `Serialize` impl, which [`Config::load`] uses to
+/// seed figment's defaults -- so this has to round-trip through
+/// [`parse_duration`] exactly, not just be human-readable.
+fn format_duration(value: Duration) -> String {
+    // The `Err` arm is unreachable for any duration this crate ever
+    // configures (it would need more seconds than fit in an `i64`), but
+    // formatting must not panic even so.
+    jiff::SignedDuration::try_from(value)
+        .map_or_else(|_| format!("{value:?}"), |signed| format!("{signed:#}"))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DurationError {
+    #[error("`{0}` is not a valid duration; examples: \"5m\", \"1h30m\", \"365d\"")]
+    Unparsable(String),
+    #[error("`{0}` uses a month or year unit, which has no fixed length; use days instead")]
+    CalendarUnit(String),
+    #[error("`{0}` parses to a negative duration")]
+    Negative(String),
 }
 
 #[cfg(test)]
@@ -375,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_toml_with_humantime_durations() {
+    fn parses_toml_with_friendly_durations() {
         {
             let mut file = tempfile::NamedTempFile::new().expect("create temp config");
             write!(
@@ -395,6 +471,64 @@ mod tests {
             assert_eq!(config.interval, Duration::from_secs(600));
             assert_eq!(config.max_repo_age, Some(Duration::from_secs(365 * 86400)));
             assert_eq!(config.listen.port(), 9418);
+        }
+    }
+
+    #[test]
+    fn every_duration_shape_the_operator_relies_on_still_parses() {
+        for (raw, expected) in [
+            ("5m", Duration::from_secs(5 * 60)),
+            ("1h", Duration::from_secs(3600)),
+            ("30s", Duration::from_secs(30)),
+            ("90 seconds", Duration::from_secs(90)),
+            ("1h 30m", Duration::from_secs(3600 + 30 * 60)),
+            ("365d", Duration::from_secs(365 * 86_400)),
+            ("30 days", Duration::from_secs(30 * 86_400)),
+            ("2w", Duration::from_secs(2 * 7 * 86_400)),
+        ] {
+            assert_eq!(
+                parse_duration(raw).unwrap_or_else(|e| panic!("{raw:?} must parse: {e}")),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_month_or_year_unit_is_rejected_with_a_message_pointing_at_days() {
+        // Deliberate behaviour change from `humantime`: a month or year has no
+        // fixed length to convert to a `Duration` without a calendar date,
+        // which none of this crate's durations have. The error must say what
+        // to use instead rather than just "invalid".
+        for raw in ["1year", "6 months", "1y", "2mo"] {
+            let error = parse_duration(raw)
+                .expect_err(&format!("{raw:?} must be rejected, not silently accepted"));
+            assert!(
+                matches!(error, DurationError::CalendarUnit(_)),
+                "{raw:?} produced {error:?}"
+            );
+            assert!(
+                error.to_string().contains("use days instead"),
+                "{raw:?}'s error must say to use days instead: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duration_serialises_to_a_string_parse_duration_accepts_back() {
+        for value in [
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+            Duration::from_secs(365 * 86_400),
+        ] {
+            let rendered = format_duration(value);
+            assert_eq!(
+                parse_duration(&rendered).unwrap_or_else(|e| panic!(
+                    "{value:?} rendered as {rendered:?}, which must parse back: {e}"
+                )),
+                value,
+                "{rendered:?}"
+            );
         }
     }
 

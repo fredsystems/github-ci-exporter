@@ -22,16 +22,16 @@ axum = { version = "0.8.7", default-features = false, features = [
   "http1",
   "tokio",
 ] }
-chrono = { version = "0.4.42", default-features = false, features = [
-  "clock",
-  "serde",
+clap = { version = "4.5.51", features = ["derive", "env"] }
+# `default-features = false` so the default `chrono` feature, which the
+# unmaintained `chrono` crate (RUSTSEC-2026-0543) would otherwise pull in,
+# never reaches the dependency graph.
+croner = { version = "5.0.1", default-features = false, features = [
+  "jiff",
   "std",
 ] }
-clap = { version = "4.5.51", features = ["derive", "env"] }
-cron = "0.17.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
-humantime = "2.3.0"
-humantime-serde = "1.1.1"
+jiff = { version = "1.0.3", features = ["serde"] }
 prometheus-client = "0.25.0"
 # `rustls` was `rustls-tls` before 0.13. default-features stays off so the
 # native-tls backend and the OpenSSL build dependency it drags in are excluded.

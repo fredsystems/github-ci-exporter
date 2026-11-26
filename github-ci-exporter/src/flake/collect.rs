@@ -180,7 +180,7 @@ pub async fn run_pass(
         }
     }
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     upstream::run_pass(
         client,
         repos,

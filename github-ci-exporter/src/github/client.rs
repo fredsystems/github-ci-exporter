@@ -445,7 +445,7 @@ impl Client {
         }
         let limit = self.rate_limit(resource);
         let reset_in =
-            u64::try_from(limit.reset_in_secs(chrono::Utc::now().timestamp())).unwrap_or(0);
+            u64::try_from(limit.reset_in_secs(jiff::Timestamp::now().as_second())).unwrap_or(0);
         self.record_skipped(1);
         Err(ClientError::RateLimited {
             resource,

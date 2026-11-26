@@ -168,7 +168,7 @@ mod tests {
         let (metrics, registry) = Metrics::new();
         let publisher = Publisher::new(metrics, registry);
         publisher.publish_repo_index(RepoIndex {
-            generated_at: Some(chrono::Utc::now()),
+            generated_at: Some(jiff::Timestamp::now()),
             repos: vec![
                 RepoIndexEntry {
                     owner: "fredsystems".to_owned(),

@@ -803,7 +803,7 @@ mod tests {
         assert!(before.generated_at.is_none());
 
         publisher.publish_repo_index(RepoIndex {
-            generated_at: Some(chrono::Utc::now()),
+            generated_at: Some(jiff::Timestamp::now()),
             repos: vec![crate::model::RepoIndexEntry {
                 owner: "fredsystems".to_owned(),
                 name: "nixos".to_owned(),
@@ -826,7 +826,7 @@ mod tests {
         // from discovery at the start of it.
         let publisher = publisher_monitoring("kept");
         publisher.publish_repo_index(RepoIndex {
-            generated_at: Some(chrono::Utc::now()),
+            generated_at: Some(jiff::Timestamp::now()),
             repos: vec![crate::model::RepoIndexEntry {
                 owner: "fredsystems".to_owned(),
                 name: "nixos".to_owned(),
