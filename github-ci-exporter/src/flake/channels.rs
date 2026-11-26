@@ -40,7 +40,7 @@ use super::{
     lock::{NodeKind, TrackedNode},
     upstream::{Freshness, NodeStatus, UpstreamCache},
 };
-use crate::metrics::{ChannelAttemptLabels, ChannelLabels, ChannelMetrics};
+use crate::metrics::{ChannelAttemptLabels, ChannelInfoLabels, ChannelLabels, ChannelMetrics};
 
 /// `github-ci-exporter` identifies itself here too, even though
 /// `prometheus.nixos.org` needs no credential: it is still someone else's
@@ -275,6 +275,72 @@ pub enum TestedState {
     Unknown,
 }
 
+/// Only forwards a label value drawn from the same restricted character set
+/// `channel_matcher` already allows for a channel name -- ASCII alphanumeric
+/// plus `.`, `-`, `_` -- folded to lowercase to match what
+/// `prometheus.nixos.org` has always sent for `status`. This label's text
+/// comes straight from a third party, so a value outside that charset is
+/// treated as absent rather than forwarded un-sanitised to a Prometheus label.
+fn restricted_label(raw: &str) -> Option<String> {
+    let lowered = raw.to_ascii_lowercase();
+    (!lowered.is_empty()
+        && lowered
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    .then_some(lowered)
+}
+
+/// A NixOS channel's lifecycle stage, read verbatim off `channel_revision`'s
+/// `status` label.
+///
+/// Known values today are `rolling`, `beta`, `stable`, `deprecated`, and
+/// `unmaintained` -- `deprecated` meaning a newer stable release exists but
+/// this one is still supported, `unmaintained` meaning it is end of life.
+/// `Other` preserves any value `prometheus.nixos.org` adds later rather than
+/// silently discarding it, the same way [`TestedState::Unknown`] treats
+/// missing data as its own state instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelLifecycle {
+    Rolling,
+    Beta,
+    Stable,
+    Deprecated,
+    Unmaintained,
+    /// An upstream `status` value not in the set this crate recognises
+    /// today, carried through unchanged (after `restricted_label`'s
+    /// sanitisation) rather than discarded.
+    Other(String),
+}
+
+impl ChannelLifecycle {
+    /// Parses a `status` label value, applying [`restricted_label`] first.
+    /// Returns `None` for an empty or disallowed-character value -- the same
+    /// outcome as the label being absent entirely.
+    fn parse(raw: &str) -> Option<Self> {
+        let value = restricted_label(raw)?;
+        Some(match value.as_str() {
+            "rolling" => Self::Rolling,
+            "beta" => Self::Beta,
+            "stable" => Self::Stable,
+            "deprecated" => Self::Deprecated,
+            "unmaintained" => Self::Unmaintained,
+            _ => Self::Other(value),
+        })
+    }
+
+    /// The exact text published as `nixos_channel_info`'s `status` label.
+    fn as_label(&self) -> &str {
+        match self {
+            Self::Rolling => "rolling",
+            Self::Beta => "beta",
+            Self::Stable => "stable",
+            Self::Deprecated => "deprecated",
+            Self::Unmaintained => "unmaintained",
+            Self::Other(value) => value,
+        }
+    }
+}
+
 /// One channel's status, as of the last successful fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelStatus {
@@ -285,6 +351,11 @@ pub struct ChannelStatus {
     /// (the epoch would read as "has not moved in decades").
     pub update_time: Option<i64>,
     pub tested: TestedState,
+    /// This channel's lifecycle stage, read off `channel_revision`'s `status`
+    /// label. `None` when upstream reports no `status` label for this
+    /// channel -- [`record_metrics`] then publishes no `nixos_channel_info`
+    /// series for it, rather than inventing a value.
+    pub lifecycle: Option<ChannelLifecycle>,
 }
 
 /// Cross-cycle state for the channel-status pass.
@@ -399,6 +470,7 @@ struct PartialStatus {
     update_time: Option<i64>,
     has_tested_data: bool,
     any_tested_job_failing: bool,
+    lifecycle: Option<ChannelLifecycle>,
 }
 
 async fn fetch_all(
@@ -422,9 +494,14 @@ async fn fetch_all(
             Some("1") => ChannelSupport::Current,
             _ => ChannelSupport::EndOfLife,
         };
+        let lifecycle = sample
+            .metric
+            .get("status")
+            .and_then(|raw| ChannelLifecycle::parse(raw));
         let entry = partials.entry(channel).or_default();
         entry.revision = Some(rev);
         entry.current = Some(current);
+        entry.lifecycle = lifecycle;
     }
 
     for sample in update_time {
@@ -467,6 +544,7 @@ async fn fetch_all(
                     current,
                     update_time: partial.update_time,
                     tested,
+                    lifecycle: partial.lifecycle,
                 },
             ))
         })
@@ -614,6 +692,15 @@ pub fn record_metrics(metrics: &ChannelMetrics, cache: &ChannelCache) {
                 metrics.tested_failed.get_or_create(&labels).set(1);
             }
             TestedState::Unknown => {}
+        }
+        if let Some(lifecycle) = &status.lifecycle {
+            metrics
+                .info
+                .get_or_create(&ChannelInfoLabels {
+                    channel: channel.clone(),
+                    status: lifecycle.as_label().to_owned(),
+                })
+                .set(1);
         }
     }
 
@@ -786,6 +873,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_label_parses_into_the_known_lifecycle_variant() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-unstable",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "deprecated",
+                }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        assert_eq!(
+            cache
+                .status_for("nixos-unstable")
+                .expect("cached")
+                .lifecycle,
+            Some(ChannelLifecycle::Deprecated)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_status_label_is_kept_as_other_rather_than_dropped() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-unstable",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "canary",
+                }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        assert_eq!(
+            cache
+                .status_for("nixos-unstable")
+                .expect("cached")
+                .lifecycle,
+            Some(ChannelLifecycle::Other("canary".to_owned())),
+            "an upstream status this crate does not yet recognise must still reach the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_status_label_caches_no_lifecycle_and_renders_no_info_series() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({ "channel": "nixos-unstable", "revision": "a", "current": "1" }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        assert_eq!(
+            cache
+                .status_for("nixos-unstable")
+                .expect("cached")
+                .lifecycle,
+            None,
+            "no status label means unknown, not a guessed value"
+        );
+
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        record_metrics(&channel_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, channel_registry).render();
+        assert!(
+            !rendered.contains("nixos_channel_info"),
+            "no status label must publish no info series at all:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_info_series_renders_in_the_expected_format() {
+        let server = MockServer::start().await;
+        let channels = HashSet::from(["nixos-26.05".to_owned()]);
+        let matcher = channel_matcher(&["nixos-26.05"]);
+        mock_query(
+            &query_channel_revision(&matcher),
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-26.05",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "deprecated",
+                }),
+                "1"
+            )]),
+        )
+        .mount(&server)
+        .await;
+        mock_query(&query_channel_update_time(&matcher), serde_json::json!([]))
+            .mount(&server)
+            .await;
+        mock_query(&query_tested_failed(&matcher), serde_json::json!([]))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &channels, &mut cache).await;
+
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        record_metrics(&channel_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, channel_registry).render();
+        assert!(
+            rendered.contains(r#"nixos_channel_info{channel="nixos-26.05",status="deprecated"} 1"#),
+            "exact rendered series not found:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_transition_leaves_exactly_one_info_series() {
+        // Production rebuilds `ChannelMetrics` (a fresh `Family` per label
+        // set) every cycle and republishes from the cache -- see
+        // `ChannelMetrics::info`'s documentation. This pins that contract
+        // down: a channel moving from `stable` to `deprecated` must not
+        // leave both label combinations alive at once.
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-unstable",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "stable",
+                }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        let (first_metrics, first_registry) = ChannelMetrics::new();
+        record_metrics(&first_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let first_rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, first_registry).render();
+        assert!(first_rendered.contains(r#"status="stable""#));
+
+        // The channel is superseded: the next pass reports `deprecated` for
+        // the same revision.
+        drop(server);
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-unstable",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "deprecated",
+                }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+        let client = client_for(&server);
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        let (second_metrics, second_registry) = ChannelMetrics::new();
+        record_metrics(&second_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let second_rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, second_registry).render();
+        assert!(second_rendered.contains(r#"status="deprecated""#));
+        assert!(
+            !second_rendered.contains(r#"status="stable""#),
+            "a superseded status must not linger alongside the new one:\n{second_rendered}"
+        );
+        assert_eq!(
+            second_rendered.matches("nixos_channel_info{").count(),
+            1,
+            "exactly one info series must exist per channel:\n{second_rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetch_failure_keeps_the_previous_info_series() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            serde_json::json!([sample(
+                serde_json::json!({
+                    "channel": "nixos-unstable",
+                    "revision": "a",
+                    "current": "1",
+                    "status": "deprecated",
+                }),
+                "1"
+            )]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+        .await;
+
+        let client = client_for(&server);
+        let mut cache = ChannelCache::default();
+        run_pass(&client, &one_channel(), &mut cache).await;
+
+        drop(server);
+        let broken = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&broken)
+            .await;
+        let broken_client = client_for(&broken);
+        run_pass(&broken_client, &one_channel(), &mut cache).await;
+        assert_eq!(cache.last_fetch_ok(), Some(false));
+
+        let (channel_metrics, channel_registry) = ChannelMetrics::new();
+        record_metrics(&channel_metrics, &cache);
+        let (gh_metrics, gh_registry) = crate::metrics::Metrics::new();
+        let rendered =
+            Publisher::new_with_channels(gh_metrics, gh_registry, channel_registry).render();
+        assert!(
+            rendered
+                .contains(r#"nixos_channel_info{channel="nixos-unstable",status="deprecated"} 1"#),
+            "a failed fetch must keep serving the previously cached info series:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn any_failing_tested_job_marks_the_channel_failing() {
         let server = MockServer::start().await;
         mount_all(
@@ -920,6 +1271,7 @@ mod tests {
                 current: ChannelSupport::Current,
                 update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
+                lifecycle: None,
             },
         );
 
@@ -954,6 +1306,7 @@ mod tests {
                 current: ChannelSupport::Current,
                 update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
+                lifecycle: None,
             },
         );
 
@@ -994,6 +1347,7 @@ mod tests {
                 current: ChannelSupport::Current,
                 update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
+                lifecycle: None,
             },
         );
         apply_tarball_freshness(
@@ -1018,6 +1372,7 @@ mod tests {
                 current: ChannelSupport::Current,
                 update_time: Some(1_700_000_900),
                 tested: TestedState::Passing,
+                lifecycle: None,
             },
         );
         apply_tarball_freshness(
@@ -1062,6 +1417,7 @@ mod tests {
                 current: ChannelSupport::Current,
                 update_time: Some(1_700_000_200),
                 tested: TestedState::Passing,
+                lifecycle: None,
             },
         );
         apply_tarball_freshness(
@@ -1140,6 +1496,7 @@ mod tests {
             current: ChannelSupport::Current,
             update_time,
             tested: TestedState::Passing,
+            lifecycle: None,
         }
     }
 

@@ -160,6 +160,16 @@ pub struct ChannelLabels {
     pub channel: String,
 }
 
+/// Labels for `nixos_channel_info` -- see [`ChannelMetrics::info`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ChannelInfoLabels {
+    pub channel: String,
+    /// The channel's lifecycle stage, read verbatim off `channel_revision`'s
+    /// `status` label (`rolling`, `beta`, `stable`, `deprecated`,
+    /// `unmaintained`).
+    pub status: String,
+}
+
 /// The (empty) label set for `nixos_channel_status_up`.
 ///
 /// A plain [`Gauge`] always encodes, even at its default value, so one would
@@ -186,6 +196,14 @@ pub struct ChannelMetrics {
     pub current: Family<ChannelLabels, Gauge>,
     pub tested_failed: Family<ChannelLabels, Gauge>,
     pub status_up: Family<ChannelAttemptLabels, Gauge>,
+    /// `1` for a channel's current lifecycle status; no series when upstream
+    /// reports none. A fresh [`Family`] every cycle -- the same contract
+    /// every other field here relies on -- is what keeps a status
+    /// transition (`stable` -> `deprecated`, say) from leaving the old
+    /// status label's series alongside the new one: only the labels this
+    /// cycle's [`crate::flake::channels::record_metrics`] call actually
+    /// creates ever exist.
+    pub info: Family<ChannelInfoLabels, Gauge>,
 }
 
 impl ChannelMetrics {
@@ -222,12 +240,20 @@ impl ChannelMetrics {
             status_up.clone(),
         );
 
+        let info = Family::<ChannelInfoLabels, Gauge>::default();
+        registry.register(
+            "info",
+            "1 for a channel's current lifecycle status (rolling, beta, stable, deprecated, or unmaintained), read verbatim from prometheus.nixos.org; absent if upstream reports none",
+            info.clone(),
+        );
+
         (
             Self {
                 update_timestamp,
                 current,
                 tested_failed,
                 status_up,
+                info,
             },
             registry,
         )

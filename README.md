@@ -494,8 +494,11 @@ the exporter runs three instant queries against `nixos_prometheus_url`
 (`https://prometheus.nixos.org` by default) for exactly the channels those
 nodes reference:
 
-- `channel_revision` for each channel's current revision and whether it is
-  still supported (`current="1"`, `current="0"` for end of life).
+- `channel_revision` for each channel's current revision, whether it is
+  still supported (`current="1"`, `current="0"` for end of life), and its
+  lifecycle `status` (`rolling`, `beta`, `stable`, `deprecated`, or
+  `unmaintained`): `deprecated` means a newer stable release exists but this
+  one is still supported, `unmaintained` means it is end of life.
 - `channel_update_time` for when that revision last changed.
 - `hydra_job_failed{exported_job=~".*tested"}` for whether any of a
   channel's `tested`-suffixed Hydra jobs -- the gate every package in the
@@ -524,21 +527,30 @@ Published **unprefixed**, alongside the exporter's `github_`-prefixed
 registry in the same `/metrics` response, because these describe NixOS
 infrastructure the exporter merely observes:
 
-| Metric                                   | Type  | Labels    |
-| ----------------------------------------- | ----- | --------- |
-| `nixos_channel_update_timestamp_seconds` | gauge | `channel` |
-| `nixos_channel_current`                  | gauge | `channel` |
-| `nixos_channel_tested_failed`            | gauge | `channel` |
-| `nixos_channel_status_up`                | gauge | --        |
+| Metric                                    | Type  | Labels              |
+| ------------------------------------------ | ----- | -------------------- |
+| `nixos_channel_update_timestamp_seconds` | gauge | `channel`            |
+| `nixos_channel_current`                  | gauge | `channel`            |
+| `nixos_channel_tested_failed`            | gauge | `channel`            |
+| `nixos_channel_info`                     | gauge | `channel`, `status`  |
+| `nixos_channel_status_up`                | gauge | --                   |
 
 `nixos_channel_current` is `1` if the channel is still supported, `0` if it
 is end of life. `nixos_channel_tested_failed` is `1` if any of a channel's
 `tested`-suffixed Hydra jobs is failing, `0` if all are passing, and absent
-if the channel has never been evaluated by one. `nixos_channel_status_up` is
-`1` if the last fetch succeeded, `0` if it failed and cached values are
-being served, and absent entirely before the exporter has ever attempted a
-fetch -- which, since the fetch itself only runs when a tracked node
-references a channel, includes every deployment that never configures one.
+if the channel has never been evaluated by one. `nixos_channel_info` is
+always `1`; its `status` label carries the channel's lifecycle verbatim from
+`prometheus.nixos.org` (`rolling`, `beta`, `stable`, `deprecated`, or
+`unmaintained`), and no series is published for a channel upstream reports no
+`status` for. `deprecated` means a newer stable release has superseded this
+one but it is still supported; `unmaintained` means it is end of life --
+`nixos_channel_current` tracks that same boundary as `0`, so `deprecated` is
+the status to alert on for "move off this input soon" while it is still `1`.
+`nixos_channel_status_up` is `1` if the last fetch succeeded, `0` if it
+failed and cached values are being served, and absent entirely before the
+exporter has ever attempted a fetch -- which, since the fetch itself only
+runs when a tracked node references a channel, includes every deployment
+that never configures one.
 
 ### Impact
 
