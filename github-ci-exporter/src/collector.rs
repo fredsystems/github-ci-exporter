@@ -170,6 +170,7 @@ async fn run_flake_stage(
             client,
             nixos_client,
             &config.flake_repos,
+            &config.release_branch_repos,
             &config.state_dir,
             &mut cache.flake,
         )

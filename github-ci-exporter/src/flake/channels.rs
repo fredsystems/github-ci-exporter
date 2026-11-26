@@ -1672,7 +1672,62 @@ mod tests {
         }
     }
 
+    /// A `Branch` node that happens to carry a mapped `channel` label -- the
+    /// shape `lock::branch_channel`'s `release_branch_repos` rule produces
+    /// for something like `nix-community/home-manager` on `release-26.05`.
+    fn release_branch_node(path: &str, channel: &str, locked_rev: &str) -> TrackedNode {
+        let input = path.split('/').next().unwrap_or(path).to_owned();
+        TrackedNode {
+            input,
+            path: path.to_owned(),
+            kind: NodeKind::Branch,
+            reference: Some("release-26.05".to_owned()),
+            channel: Some(channel.to_owned()),
+            locked_rev: Some(locked_rev.to_owned()),
+            locked_last_modified: Some(1_700_000_000),
+            owner: Some("nix-community".to_owned()),
+            repo: Some("home-manager".to_owned()),
+        }
+    }
+
     fn nodes_by_repo(node: TrackedNode) -> HashMap<String, Vec<TrackedNode>> {
         HashMap::from([("fredsystems/nixos".to_owned(), vec![node])])
+    }
+
+    #[test]
+    fn a_branch_node_with_a_mapped_channel_is_untouched_by_tarball_freshness() {
+        // `apply_tarball_freshness` only ever resolves `NodeKind::ChannelTarball`
+        // nodes against a channel's revision; a `Branch` node that happens to
+        // carry a mapped `channel` label (home-manager on `release-26.05`,
+        // say) must keep getting its freshness from the normal branch-head
+        // comparison in `super::upstream`, never from this channel's
+        // revision, regardless of what that revision says.
+        let node = release_branch_node("nix-community/home-manager", "nixos-26.05", "oldrev00000");
+        let mut channels = ChannelCache {
+            last_fetch_ok: Some(true),
+            ..ChannelCache::default()
+        };
+        channels.statuses.insert(
+            "nixos-26.05".to_owned(),
+            cached_status(
+                "e62746b0b472753ef019baceab6f1e2e52014980",
+                Some(1_700_000_200),
+            ),
+        );
+        let mut upstream = UpstreamCache::default();
+
+        apply_tarball_freshness(
+            &["fredsystems/nixos".to_owned()],
+            &nodes_by_repo(node.clone()),
+            &mut channels,
+            &mut upstream,
+            1_700_000_300,
+        );
+
+        assert!(
+            upstream.status_for("fredsystems/nixos", &node).is_none(),
+            "a Branch node must never get a channel-tarball-style status, \
+             even though it carries a channel label the channel cache has data for"
+        );
     }
 }

@@ -129,6 +129,23 @@ pub struct Config {
     /// pass for the channels any tracked node references. Overridable for
     /// tests, which point it at a wiremock server.
     pub nixos_prometheus_url: String,
+
+    /// Repositories, as `owner/name`, that cut a `release-YY.MM` branch in
+    /// lockstep with the matching NixOS release -- `release-26.05` tracks
+    /// the same lifecycle as the `nixos-26.05` channel, even though the
+    /// repository is not `nixos/nixpkgs` itself.
+    ///
+    /// A tracked `Branch` node locked to exactly that ref shape, on a
+    /// repository in this list, gets `channel = "nixos-<major>.<minor>"`,
+    /// which feeds it into the same `nixos_channel_*` machinery (and
+    /// therefore the EOL/superseded alerts) as a nixpkgs channel branch or a
+    /// channel-tarball node. Matching is case-insensitive on `owner/name`,
+    /// like [`Self::is_denylisted`].
+    ///
+    /// Does not apply to `nixos/nixpkgs` itself: its own `release-*`
+    /// branches are not channels, and that handling is unchanged regardless
+    /// of this list's contents.
+    pub release_branch_repos: Vec<String>,
 }
 
 impl Default for Config {
@@ -148,6 +165,10 @@ impl Default for Config {
             flake_repos: Vec::new(),
             flake_interval: DEFAULT_FLAKE_INTERVAL,
             nixos_prometheus_url: DEFAULT_NIXOS_PROMETHEUS_URL.to_owned(),
+            release_branch_repos: vec![
+                "nix-community/home-manager".to_owned(),
+                "catppuccin/nix".to_owned(),
+            ],
         }
     }
 }
@@ -164,6 +185,8 @@ pub enum ConfigError {
     IgnorePull(#[from] crate::model::PullRefError),
     #[error("invalid `flake_repos` entry `{0}`; expected `owner/name`")]
     InvalidFlakeRepo(String),
+    #[error("invalid `release_branch_repos` entry `{0}`; expected `owner/name`")]
+    InvalidReleaseBranchRepo(String),
     #[error("flake_interval must be at least {MIN_FLAKE_INTERVAL:?}, got {0:?}")]
     FlakeIntervalTooShort(Duration),
     #[error("nixos_prometheus_url must be an http(s) URL, got `{0}`")]
@@ -227,6 +250,11 @@ impl Config {
         for repo in &self.flake_repos {
             if !crate::model::is_full_repo_name(repo) {
                 return Err(ConfigError::InvalidFlakeRepo(repo.clone()));
+            }
+        }
+        for repo in &self.release_branch_repos {
+            if !crate::model::is_full_repo_name(repo) {
+                return Err(ConfigError::InvalidReleaseBranchRepo(repo.clone()));
             }
         }
         if self.flake_interval < MIN_FLAKE_INTERVAL {
@@ -795,6 +823,58 @@ mod tests {
 
         let config = Config::load(Some(file.path())).expect("config should load");
         assert_eq!(config.nixos_prometheus_url, "http://127.0.0.1:9091");
+    }
+
+    #[test]
+    fn release_branch_repos_defaults_to_home_manager_and_catppuccin() {
+        assert_eq!(
+            Config::default().release_branch_repos,
+            ["nix-community/home-manager", "catppuccin/nix"]
+        );
+    }
+
+    #[test]
+    fn a_well_formed_release_branch_repo_entry_passes_validation() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            release_branch_repos: vec!["nix-community/home-manager".into()],
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_malformed_release_branch_repo_entry_fails_validation() {
+        let config = Config {
+            orgs: vec!["fredsystems".into()],
+            release_branch_repos: vec!["not-a-repo".into()],
+            ..Config::default()
+        };
+        assert!(matches!(
+            config
+                .validate()
+                .expect_err("a malformed release branch repo must be rejected"),
+            ConfigError::InvalidReleaseBranchRepo(entry) if entry == "not-a-repo"
+        ));
+    }
+
+    #[test]
+    fn release_branch_repos_is_read_from_toml() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+            orgs = ["fredsystems"]
+            release_branch_repos = ["nix-community/home-manager", "catppuccin/nix", "o/r"]
+            "#
+        )
+        .expect("write temp config");
+
+        let config = Config::load(Some(file.path())).expect("config should load");
+        assert_eq!(
+            config.release_branch_repos,
+            ["nix-community/home-manager", "catppuccin/nix", "o/r"]
+        );
     }
 
     #[test]

@@ -27,6 +27,7 @@ let
     flake_repos = cfg.flakeRepos;
     flake_interval = cfg.flakeInterval;
     nixos_prometheus_url = cfg.nixosPrometheusUrl;
+    release_branch_repos = cfg.releaseBranchRepos;
   }
   // lib.optionalAttrs (cfg.maxRepoAge != null) { max_repo_age = cfg.maxRepoAge; };
 
@@ -181,6 +182,35 @@ in
         pass for the channels any tracked input references. Published
         unprefixed as `nixos_channel_*`, alongside the exporter's own
         `github_`-prefixed metrics.
+      '';
+    };
+
+    releaseBranchRepos = mkOption {
+      type = types.listOf types.str;
+      default = [
+        "nix-community/home-manager"
+        "catppuccin/nix"
+      ];
+      example = [
+        "nix-community/home-manager"
+        "catppuccin/nix"
+      ];
+      description = ''
+        Repositories, as `owner/name`, that cut a `release-YY.MM` branch in
+        lockstep with the matching NixOS release. A tracked branch node
+        locked to exactly that ref shape on a listed repository gets
+        `channel = "nixos-<major>.<minor>"`, the same as a `nixos/nixpkgs`
+        channel branch or a `channels.nixos.org` tarball node, which feeds it
+        into the same `nixos_channel_*` series (and therefore the same
+        EOL/superseded alerting) even though the repository is not
+        `nixos/nixpkgs` itself.
+
+        This assumes the listed repository's `release-YY.MM` branch genuinely
+        shares that NixOS release's lifecycle -- the default entries
+        (`home-manager`, `catppuccin/nix`) are both known to cut theirs that
+        way. Matching is case-insensitive on `owner/name`. Does not apply to
+        `nixos/nixpkgs` itself, whose own `release-*` branches (if any
+        existed) are not channels.
       '';
     };
 

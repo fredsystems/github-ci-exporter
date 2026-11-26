@@ -442,6 +442,22 @@ Each tracked input is classified from how it is locked -- a GitHub branch
 `channels.nixos.org` tarball -- and, where it applies, labelled with the NixOS
 channel it tracks (`nixos-unstable`, `nixos-26.05`, ...).
 
+A branch of `nixos/nixpkgs` itself is labelled this way when it is named
+`nixos-*` or `nixpkgs-*`. Separately, a branch of a repository listed in
+`release_branch_repos` (`owner/name`, matched case-insensitively) is labelled
+the same way when it is locked to exactly `release-<major>.<minor>`
+(`release-26.05` -> `nixos-26.05`) -- some inputs cut that branch in lockstep
+with the matching NixOS release even though the repository is not
+`nixos/nixpkgs`, so its branch lifecycle *is* that channel's. Defaults to
+`["nix-community/home-manager", "catppuccin/nix"]`, both confirmed to cut
+their `release-YY.MM` branch that way; anything else -- `release-1.x`,
+`release-26.05-foo`, a different ref shape, or a repository not in the list
+-- gets no channel label. A mapped branch is still resolved as a normal
+branch against its own upstream head (see "Upstream comparison" below); only
+the `channel` label changes, which feeds it into the same `nixos_channel_*`
+series -- and therefore the same EOL/superseded alerting -- as a
+`nixos/nixpkgs` channel branch or a `channels.nixos.org` tarball node.
+
 This pass runs on its own interval (`flake_interval`, default `1h`, minimum
 `15m`), separate from and much slower than the CI poll interval:
 `flake.lock` changes on the order of days to weeks, so polling it every few
@@ -578,6 +594,7 @@ skip_repos_without_workflows = true
 flake_repos = []
 flake_interval = "1h"
 nixos_prometheus_url = "https://prometheus.nixos.org"
+release_branch_repos = ["nix-community/home-manager", "catppuccin/nix"]
 ```
 
 The token is never a config-file field. Supply it with `GHCI_TOKEN` or
@@ -611,7 +628,9 @@ The flake exports a NixOS module:
 
     # Optional: track these repositories' flake inputs (see "Flake input
     # tracking"). flakeInterval defaults to "1h" (minimum 15m);
-    # nixosPrometheusUrl defaults to https://prometheus.nixos.org.
+    # nixosPrometheusUrl defaults to https://prometheus.nixos.org;
+    # releaseBranchRepos defaults to [ "nix-community/home-manager"
+    # "catppuccin/nix" ].
     flakeRepos = [ "fredsystems/nixos" ];
   };
 }

@@ -109,7 +109,14 @@ pub enum LockError {
 /// # Errors
 /// Returns [`LockError`] for unparsable JSON, a missing root node, or a
 /// version other than the one this parser understands. Never panics.
-pub fn tracked_nodes(raw: &str) -> Result<Vec<TrackedNode>, LockError> {
+///
+/// `release_branch_repos` is [`crate::config::Config::release_branch_repos`]
+/// -- see `branch_channel` (below) for how it extends channel detection
+/// beyond `nixos/nixpkgs`.
+pub fn tracked_nodes(
+    raw: &str,
+    release_branch_repos: &[String],
+) -> Result<Vec<TrackedNode>, LockError> {
     let lock: RawLock = serde_json::from_str(raw)?;
     if lock.version != SUPPORTED_VERSION {
         return Err(LockError::UnsupportedVersion(lock.version));
@@ -131,12 +138,17 @@ pub fn tracked_nodes(raw: &str) -> Result<Vec<TrackedNode>, LockError> {
             // nothing sane can be reported for it.
             continue;
         };
-        tracked.push(classify(key, key, node));
+        tracked.push(classify(key, key, node, release_branch_repos));
 
         if let Some(InputRef::Node(nested_name)) = node.inputs.get("nixpkgs")
             && let Some(nested_node) = lock.nodes.get(nested_name)
         {
-            tracked.push(classify(key, &format!("{key}/nixpkgs"), nested_node));
+            tracked.push(classify(
+                key,
+                &format!("{key}/nixpkgs"),
+                nested_node,
+                release_branch_repos,
+            ));
         }
     }
 
@@ -149,7 +161,12 @@ pub fn tracked_nodes(raw: &str) -> Result<Vec<TrackedNode>, LockError> {
 /// `input` is the owning root input's key; `path` is this node's own full
 /// path (equal to `input` for a root node, `<input>/nixpkgs` for a nested
 /// one).
-fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
+fn classify(
+    input: &str,
+    path: &str,
+    node: &RawNode,
+    release_branch_repos: &[String],
+) -> TrackedNode {
     // `original` reflects what the flake *asked for*; `locked` is the
     // resolved result. A node's `original` is normally present, but falling
     // back to `locked` keeps this from panicking on the ones that are not.
@@ -189,7 +206,7 @@ fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
     };
 
     let channel = match kind {
-        NodeKind::Branch => branch_channel(source, reference.as_deref()),
+        NodeKind::Branch => branch_channel(source, reference.as_deref(), release_branch_repos),
         NodeKind::ChannelTarball => source
             .and_then(|r| r.url.as_deref())
             .and_then(channel_of_url),
@@ -224,17 +241,66 @@ fn classify(input: &str, path: &str, node: &RawNode) -> TrackedNode {
 
 /// The NixOS channel label for a `Branch` node, if it tracks one.
 ///
-/// Only `nixos/nixpkgs` (case-insensitive owner) branches named `nixos-*` or
-/// `nixpkgs-*` count -- those are the channel names `channels.nixos.org` and
-/// `prometheus.nixos.org` use, e.g. `nixos-unstable`, `nixos-26.05`.
-fn branch_channel(source: Option<&RawRef>, reference: Option<&str>) -> Option<String> {
+/// Two independent rules, checked in order:
+///
+/// * `nixos/nixpkgs` (case-insensitive owner) branches named `nixos-*` or
+///   `nixpkgs-*` -- those are the channel names `channels.nixos.org` and
+///   `prometheus.nixos.org` use, e.g. `nixos-unstable`, `nixos-26.05`.
+/// * A `release_branch_repos`-listed repository (case-insensitive
+///   `owner/name`) on a branch named exactly `release-<major>.<minor>`
+///   maps to `nixos-<major>.<minor>` -- some inputs (`home-manager`,
+///   `catppuccin/nix`) cut that branch in lockstep with the matching NixOS
+///   release, so its lifecycle *is* that channel's, even on a repository
+///   that is not `nixos/nixpkgs` itself.
+///
+/// `nixos/nixpkgs` is deliberately excluded from the second rule even if it
+/// were ever listed in `release_branch_repos`: its own `release-*` branches
+/// (if any existed) are not channels, and only the first rule's `nixos-*` /
+/// `nixpkgs-*` naming applies to it.
+fn branch_channel(
+    source: Option<&RawRef>,
+    reference: Option<&str>,
+    release_branch_repos: &[String],
+) -> Option<String> {
     let source = source?;
     let owner = source.owner.as_deref()?;
     let repo = source.repo.as_deref()?;
     let reference = reference?;
-    let is_nixpkgs = owner.eq_ignore_ascii_case("nixos") && repo.eq_ignore_ascii_case("nixpkgs");
-    let is_channel_ref = reference.starts_with("nixos-") || reference.starts_with("nixpkgs-");
-    (is_nixpkgs && is_channel_ref).then(|| reference.to_owned())
+
+    if owner.eq_ignore_ascii_case("nixos") && repo.eq_ignore_ascii_case("nixpkgs") {
+        let is_channel_ref = reference.starts_with("nixos-") || reference.starts_with("nixpkgs-");
+        return is_channel_ref.then(|| reference.to_owned());
+    }
+
+    if is_release_branch_tracked_repo(owner, repo, release_branch_repos) {
+        return release_cadence_channel(reference);
+    }
+
+    None
+}
+
+/// Whether `owner/repo` (case-insensitive) appears in `configured`, a list
+/// of `owner/name` entries such as [`crate::config::Config::release_branch_repos`].
+fn is_release_branch_tracked_repo(owner: &str, repo: &str, configured: &[String]) -> bool {
+    configured.iter().any(|entry| {
+        entry.split_once('/').is_some_and(|(cfg_owner, cfg_repo)| {
+            cfg_owner.eq_ignore_ascii_case(owner) && cfg_repo.eq_ignore_ascii_case(repo)
+        })
+    })
+}
+
+/// Maps a `release-<major>.<minor>` ref, anchored with nothing before or
+/// after, to its NixOS channel name (`release-26.05` -> `nixos-26.05`).
+///
+/// Anything else -- `release-1.x`, `release-26.05-foo`, a ref not starting
+/// with `release-` at all -- returns `None` rather than a guess: this is
+/// deliberately narrower than [`is_tag_ref`]'s digit check, since a ref this
+/// strict is the only shape the NixOS release cadence actually produces.
+fn release_cadence_channel(reference: &str) -> Option<String> {
+    let rest = reference.strip_prefix("release-")?;
+    let (major, minor) = rest.split_once('.')?;
+    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    (is_digits(major) && is_digits(minor)).then(|| format!("nixos-{major}.{minor}"))
 }
 
 /// Whether `reference` looks like a release tag: an optional leading `v`,
@@ -412,7 +478,7 @@ mod tests {
             &serde_json::json!({ "nixpkgs": ["colmena", "nixpkgs"] }),
             &serde_json::json!({}),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert!(
             tracked.is_empty(),
             "a follows path resolves to another input's node, not one of its own"
@@ -434,7 +500,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked.len(), 1, "only the root input itself is tracked");
         assert_eq!(tracked[0].path, "niri");
     }
@@ -455,7 +521,7 @@ mod tests {
                 "niri-nixpkgs": github_node("NixOS", "nixpkgs", Some("nixos-unstable"), "def", 2),
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked.len(), 2);
         let nested = tracked
             .iter()
@@ -475,7 +541,7 @@ mod tests {
             &serde_json::json!({ "niri": "niri" }),
             &serde_json::json!({ "niri": github_node("epireyn", "niri-flake", None, "abc", 1) }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].owner.as_deref(), Some("epireyn"));
         assert_eq!(tracked[0].repo.as_deref(), Some("niri-flake"));
     }
@@ -494,7 +560,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].owner.as_deref(), Some("o"));
         assert_eq!(tracked[0].repo.as_deref(), Some("r"));
     }
@@ -518,7 +584,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].owner, None);
         assert_eq!(tracked[0].repo, None);
     }
@@ -529,7 +595,7 @@ mod tests {
             &serde_json::json!({ "colmena": "colmena" }),
             &serde_json::json!({ "colmena": github_node("zhaofengli", "colmena", None, "abc", 1) }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked.len(), 1);
         assert_eq!(tracked[0].kind, NodeKind::Branch);
         assert_eq!(tracked[0].reference, None);
@@ -557,7 +623,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].kind, NodeKind::Untracked);
         assert_eq!(tracked[0].reference, None);
     }
@@ -584,7 +650,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(
             tracked[0].kind,
             NodeKind::Untracked,
@@ -599,7 +665,7 @@ mod tests {
                 &serde_json::json!({ "input": "input" }),
                 &serde_json::json!({ "input": github_node("o", "r", Some(r), "abc", 1) }),
             );
-            let tracked = tracked_nodes(&raw).expect("parses");
+            let tracked = tracked_nodes(&raw, &[]).expect("parses");
             assert_eq!(tracked[0].kind, NodeKind::Tag, "{r} must classify as a tag");
             assert_eq!(tracked[0].reference.as_deref(), Some(r));
         }
@@ -612,7 +678,7 @@ mod tests {
                 &serde_json::json!({ "input": "input" }),
                 &serde_json::json!({ "input": github_node("o", "r", Some(r), "abc", 1) }),
             );
-            let tracked = tracked_nodes(&raw).expect("parses");
+            let tracked = tracked_nodes(&raw, &[]).expect("parses");
             assert_eq!(
                 tracked[0].kind,
                 NodeKind::Branch,
@@ -629,7 +695,7 @@ mod tests {
                 "nixpkgs": github_node("nixos", "nixpkgs", Some("nixos-unstable"), "abc", 1),
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].channel.as_deref(), Some("nixos-unstable"));
     }
 
@@ -641,7 +707,7 @@ mod tests {
                 "nixpkgs": github_node("NixOS", "nixpkgs", Some("nixos-26.05"), "abc", 1),
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].channel.as_deref(), Some("nixos-26.05"));
     }
 
@@ -651,7 +717,88 @@ mod tests {
             &serde_json::json!({ "input": "input" }),
             &serde_json::json!({ "input": github_node("someone", "else", Some("nixos-unstable"), "abc", 1) }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
+        assert_eq!(tracked[0].channel, None);
+    }
+
+    /// The default-shaped `release_branch_repos` list used across the
+    /// mapping tests below.
+    fn release_branch_repos() -> Vec<String> {
+        vec![
+            "nix-community/home-manager".to_owned(),
+            "catppuccin/nix".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn a_release_branch_repo_on_release_yy_mm_maps_onto_its_channel() {
+        for (owner, repo) in [("nix-community", "home-manager"), ("catppuccin", "nix")] {
+            let raw = lock_json(
+                &serde_json::json!({ "input": "input" }),
+                &serde_json::json!({ "input": github_node(owner, repo, Some("release-26.05"), "abc", 1) }),
+            );
+            let tracked = tracked_nodes(&raw, &release_branch_repos()).expect("parses");
+            assert_eq!(
+                tracked[0].channel.as_deref(),
+                Some("nixos-26.05"),
+                "{owner}/{repo} on release-26.05 must map onto nixos-26.05"
+            );
+        }
+    }
+
+    #[test]
+    fn release_branch_repo_matching_is_case_insensitive_on_owner_and_repo() {
+        let raw = lock_json(
+            &serde_json::json!({ "input": "input" }),
+            &serde_json::json!({ "input": github_node("Nix-Community", "Home-Manager", Some("release-26.05"), "abc", 1) }),
+        );
+        let tracked = tracked_nodes(&raw, &release_branch_repos()).expect("parses");
+        assert_eq!(tracked[0].channel.as_deref(), Some("nixos-26.05"));
+    }
+
+    #[test]
+    fn a_repo_not_in_release_branch_repos_gets_no_channel() {
+        let raw = lock_json(
+            &serde_json::json!({ "input": "input" }),
+            &serde_json::json!({ "input": github_node("someone", "else", Some("release-26.05"), "abc", 1) }),
+        );
+        let tracked = tracked_nodes(&raw, &release_branch_repos()).expect("parses");
+        assert_eq!(
+            tracked[0].channel, None,
+            "a release-shaped ref on an unconfigured repo must not map to a channel"
+        );
+    }
+
+    #[test]
+    fn only_release_yy_mm_refs_map_not_other_shapes() {
+        for r in [
+            "release-1.x",
+            "release-26.05-foo",
+            "master",
+            "v26.05",
+            "release-26",
+        ] {
+            let raw = lock_json(
+                &serde_json::json!({ "input": "input" }),
+                &serde_json::json!({ "input": github_node("nix-community", "home-manager", Some(r), "abc", 1) }),
+            );
+            let tracked = tracked_nodes(&raw, &release_branch_repos()).expect("parses");
+            assert_eq!(tracked[0].channel, None, "{r} must not map onto a channel");
+        }
+    }
+
+    #[test]
+    fn nixos_nixpkgs_release_branches_are_not_mapped_by_the_release_branch_repo_rule() {
+        // Even if `nixos/nixpkgs` were wrongly configured into
+        // `release_branch_repos`, its own `release-*` branches (were they
+        // to exist) are not channels -- only the first rule's `nixos-*` /
+        // `nixpkgs-*` naming ever applies to it.
+        let raw = lock_json(
+            &serde_json::json!({ "input": "input" }),
+            &serde_json::json!({ "input": github_node("nixos", "nixpkgs", Some("release-26.05"), "abc", 1) }),
+        );
+        let configured = vec!["nixos/nixpkgs".to_owned()];
+        let tracked = tracked_nodes(&raw, &configured).expect("parses");
         assert_eq!(tracked[0].channel, None);
     }
 
@@ -675,7 +822,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked.len(), 1);
         assert_eq!(tracked[0].kind, NodeKind::ChannelTarball);
         assert_eq!(tracked[0].channel.as_deref(), Some("nixpkgs-unstable"));
@@ -711,7 +858,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].locked_rev, Some("e62746b0b472".to_owned()));
     }
 
@@ -734,7 +881,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(
             tracked[0].locked_rev, None,
             "no `.` in the directory segment means no revision to extract"
@@ -760,7 +907,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked[0].kind, NodeKind::Untracked);
         assert_eq!(tracked[0].channel, None);
     }
@@ -777,7 +924,7 @@ mod tests {
                 },
             }),
         );
-        let tracked = tracked_nodes(&raw).expect("parses");
+        let tracked = tracked_nodes(&raw, &[]).expect("parses");
         assert_eq!(tracked.len(), 1);
         assert_eq!(tracked[0].kind, NodeKind::Untracked);
         assert_eq!(tracked[0].locked_rev, None);
@@ -787,7 +934,7 @@ mod tests {
     #[test]
     fn invalid_json_is_an_error_not_a_panic() {
         assert!(matches!(
-            tracked_nodes("not json"),
+            tracked_nodes("not json", &[]),
             Err(LockError::InvalidJson(_))
         ));
     }
@@ -801,7 +948,7 @@ mod tests {
         })
         .to_string();
         assert!(matches!(
-            tracked_nodes(&raw),
+            tracked_nodes(&raw, &[]),
             Err(LockError::MissingRoot(name)) if name == "root"
         ));
     }
@@ -815,7 +962,7 @@ mod tests {
         })
         .to_string();
         assert!(matches!(
-            tracked_nodes(&raw),
+            tracked_nodes(&raw, &[]),
             Err(LockError::UnsupportedVersion(6))
         ));
     }
@@ -823,7 +970,7 @@ mod tests {
     #[test]
     fn the_real_nixos_flake_lock_resolves_the_expected_tracked_set() {
         let raw = include_str!("testdata/nixos-flake.lock");
-        let tracked = tracked_nodes(raw).expect("a real flake.lock must parse");
+        let tracked = tracked_nodes(raw, &[]).expect("a real flake.lock must parse");
 
         let by_path = |path: &str| tracked.iter().find(|n| n.path == path);
 
@@ -861,5 +1008,37 @@ mod tests {
             by_path("nixos-needsreboot/nixpkgs").is_none(),
             "nixos-needsreboot follows our nixpkgs and must not be tracked separately"
         );
+    }
+
+    #[test]
+    fn the_real_nixos_flake_lock_maps_release_branch_repos_onto_their_channel() {
+        // `home-manager-stable` (nix-community/home-manager) and
+        // `catppuccin-stable` (catppuccin/nix) both lock `release-26.05` in
+        // this real fixture, and both repositories are in the default
+        // `release_branch_repos` list -- real-world confirmation that the
+        // mapping fires exactly where it is meant to.
+        let raw = include_str!("testdata/nixos-flake.lock");
+        let release_branch_repos = [
+            "nix-community/home-manager".to_owned(),
+            "catppuccin/nix".to_owned(),
+        ];
+        let tracked =
+            tracked_nodes(raw, &release_branch_repos).expect("a real flake.lock must parse");
+        let by_path = |path: &str| tracked.iter().find(|n| n.path == path);
+
+        let home_manager_stable =
+            by_path("home-manager-stable").expect("home-manager-stable root input");
+        assert_eq!(home_manager_stable.kind, NodeKind::Branch);
+        assert_eq!(home_manager_stable.channel.as_deref(), Some("nixos-26.05"));
+
+        let catppuccin_stable = by_path("catppuccin-stable").expect("catppuccin-stable root input");
+        assert_eq!(catppuccin_stable.kind, NodeKind::Branch);
+        assert_eq!(catppuccin_stable.channel.as_deref(), Some("nixos-26.05"));
+
+        // The unstable, non-release-branch siblings must stay unaffected.
+        let home_manager = by_path("home-manager").expect("home-manager root input");
+        assert_eq!(home_manager.channel, None);
+        let catppuccin = by_path("catppuccin").expect("catppuccin root input");
+        assert_eq!(catppuccin.channel, None);
     }
 }
