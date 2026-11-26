@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp, tz::TimeZone};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -97,7 +97,7 @@ fn decide_budget(
     client: &Client,
     config: &Config,
     cache: &WorkflowCache,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Option<bool> {
     let (flake_due, flake_core_estimate, flake_graphql_estimate) = flake_budget(cache, config);
     let estimated_core = estimate_core_requests(cache.monitored_count(), cache.workflow_count());
@@ -112,7 +112,7 @@ fn decide_budget(
             graphql_remaining = graphql_budget.remaining,
             reserve = client.reserve(),
             estimated_core,
-            reset_in_secs = core.reset_in_secs(now.timestamp()),
+            reset_in_secs = core.reset_in_secs(now.as_second()),
             "skipping collection cycle: insufficient API budget"
         );
         client.record_skipped(estimated_core);
@@ -170,6 +170,7 @@ async fn run_flake_stage(
             client,
             nixos_client,
             &config.flake_repos,
+            &config.release_branch_repos,
             &config.state_dir,
             &mut cache.flake,
         )
@@ -303,7 +304,7 @@ pub async fn collect(
     cache: &mut WorkflowCache,
 ) -> anyhow::Result<CycleOutcome> {
     let started = std::time::Instant::now();
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Built off to the side and published at the end. A fresh registry starts
     // empty, so repositories, pull requests, and workflows that no longer
@@ -349,7 +350,7 @@ pub async fn collect(
 
     let max_age = config
         .max_repo_age
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(|d| SignedDuration::try_from(d).ok());
     let (candidates, mut skipped) =
         graphql::partition_repos(discovered, &|name| config.is_denylisted(name), max_age, now);
 
@@ -423,7 +424,7 @@ pub async fn collect(
     record_budget_metrics(client, metrics);
     metrics.scrape_duration.set(started.elapsed().as_secs_f64());
     metrics.scrape_success.set(1);
-    metrics.last_success_timestamp.set(now.timestamp());
+    metrics.last_success_timestamp.set(now.as_second());
 
     // The single point at which any of this becomes visible to a scrape.
     publisher.publish_with_channels(cycle_metrics, registry, channel_registry);
@@ -453,7 +454,7 @@ fn publish_repo_index(
     publisher: &Publisher,
     discovered: &[DiscoveredRepo],
     discovery_failures: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) {
     if discovery_failures > 0 {
         warn!(
@@ -854,7 +855,7 @@ fn record_activity(
             metrics
                 .pull_created_timestamp
                 .get_or_create(&labels)
-                .set(pull.created_at.timestamp());
+                .set(pull.created_at.as_second());
             metrics
                 .pull_needs_attention
                 .get_or_create(&labels)
@@ -883,7 +884,7 @@ fn record_runs(
     repo: &Repo,
     runs: &rest::RepoRuns,
     cache: &WorkflowCache,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) {
     let full_name = repo.full_name();
     let intervals = cache.intervals.get(&full_name);
@@ -984,7 +985,7 @@ fn record_runs(
                 repo: repo.name.clone(),
                 workflow: run.workflow.clone(),
             })
-            .set(run.created_at.timestamp());
+            .set(run.created_at.as_second());
 
         if let Some(interval) = path_for_name
             .get(run.workflow.as_str())
@@ -1016,7 +1017,7 @@ fn record_runs(
                 repo: repo.name.clone(),
                 workflow: workflow.clone(),
             })
-            .set(at.timestamp());
+            .set(at.as_second());
     }
 }
 
@@ -1078,35 +1079,44 @@ pub fn expected_interval_seconds(crons: &[String]) -> Option<i64> {
 /// Returns `None` if the expression does not parse or fires fewer than twice
 /// in the scan window; a caller with several expressions still resolves from
 /// the others.
+///
+/// One `croner` schedule, walked in UTC (GitHub Actions schedules always run
+/// in UTC), is all this needs: unlike the `cron` crate this replaced,
+/// `croner`'s default parser already reproduces POSIX/Vixie day semantics --
+/// a restricted day-of-month *or* day-of-week field matches on either, not
+/// their intersection -- and accepts GitHub's own day-of-week numbering
+/// (`0..=6` for Sunday..Saturday, with `7` also meaning Sunday) directly, so
+/// no splitting into a day-of-month/day-of-week union and no remapping is
+/// needed. The one gap [`expand_wrapping_day_of_week_range`] still closes:
+/// `croner` only wraps a reversed day-of-week range (`5-1` for
+/// Friday..Monday) in its separate Quartz-numbered mode, which uses `1..=7`
+/// rather than GitHub's own `0..=6` and so cannot be used here. `TimeZone::UTC`
+/// is a built-in constant rather than a time zone database lookup, so this
+/// never touches the system's tzdata, which matters under the service's
+/// minimal systemd sandbox.
 fn longest_gap_seconds(expression: &str) -> Option<i64> {
-    let schedules = posix_schedules(&normalise_day_of_week(expression)?)?;
+    let normalised = expand_wrapping_day_of_week_range(expression);
+    let cron: croner::Cron = normalised.as_deref().unwrap_or(expression).parse().ok()?;
 
-    let anchor = DateTime::<Utc>::from_timestamp(0, 0)?;
-    let horizon = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_HORIZON_DAYS))?;
-    let settled = anchor.checked_add_signed(chrono::TimeDelta::days(GAP_SCAN_SETTLED_DAYS))?;
+    let anchor = Timestamp::from_second(0).ok()?;
+    let horizon = anchor
+        .checked_add(SignedDuration::from_hours(GAP_SCAN_HORIZON_DAYS * 24))
+        .ok()?;
+    let settled = anchor
+        .checked_add(SignedDuration::from_hours(GAP_SCAN_SETTLED_DAYS * 24))
+        .ok()?;
 
-    let mut streams: Vec<_> = schedules
-        .iter()
-        .map(|schedule| schedule.after(&anchor).peekable())
-        .collect();
-
-    let mut previous: Option<DateTime<Utc>> = None;
+    let mut previous: Option<Timestamp> = None;
     let mut longest = 0_i64;
     let mut samples = 0_usize;
 
-    while let Some(occurrence) = streams.iter_mut().filter_map(|s| s.peek().copied()).min() {
-        // Advance every stream sitting on this instant, so a moment produced by
-        // both halves of a day-of-month/day-of-week union counts once.
-        for stream in &mut streams {
-            if stream.peek() == Some(&occurrence) {
-                stream.next();
-            }
-        }
+    for occurrence in cron.iter_after(anchor.to_zoned_datetime(TimeZone::UTC)) {
+        let occurrence = occurrence.timestamp();
         if occurrence > horizon {
             break;
         }
         if let Some(previous) = previous {
-            longest = longest.max((occurrence - previous).num_seconds());
+            longest = longest.max((occurrence - previous).as_secs());
         }
         previous = Some(occurrence);
 
@@ -1121,137 +1131,53 @@ fn longest_gap_seconds(expression: &str) -> Option<i64> {
     (longest > 0).then_some(longest)
 }
 
-/// Builds the schedules whose union reproduces POSIX day semantics.
+/// Rewrites a day-of-week field's reversed numeric range (`5-1` for
+/// Friday..Monday) into the non-wrapping union `croner` accepts under
+/// GitHub's own `0..=7` Sunday..Saturday numbering.
 ///
-/// When a cron expression restricts *both* day-of-month and day-of-week, POSIX
-/// fires if either matches. The `cron` crate intersects them instead, so
-/// `0 0 1 * 1` means "the 1st, and every Monday" to GitHub but "the 1st, but
-/// only when it falls on a Monday" to the crate — 273 days between fires
-/// rather than 7, which is long enough to suppress a genuinely dead workflow.
+/// `croner` only wraps a range whose end precedes its start in its separate
+/// Quartz-numbered mode (`1..=7` for Sunday..Saturday, enabled together with
+/// wrapping by its `alternative_weekdays` option), which this crate does not
+/// otherwise use -- it would also require remapping every other day-of-week
+/// term, which is exactly the complexity `croner`'s default `0..=7` numbering
+/// lets the rest of this module avoid. `5-1` (Friday..Monday) expands to
+/// `5-7,0-1`, which `croner` evaluates as the union it already is: `7` folds
+/// to `0` (Sunday) the same way a plain `7` does.
 ///
-/// Splitting into one schedule per day field and walking them as a union
-/// restores the POSIX reading. When either field is `*` the crate's
-/// intersection already agrees, and a single schedule is used.
-fn posix_schedules(expression: &str) -> Option<Vec<cron::Schedule>> {
-    use std::str::FromStr as _;
-
+/// Every other shape -- a non-wrapping range, a step, a named day, a
+/// wildcard, or anything not a clean 5-field expression -- returns `None`,
+/// so the caller parses the expression unchanged; `croner` already
+/// understands all of those directly.
+fn expand_wrapping_day_of_week_range(expression: &str) -> Option<String> {
     let fields: Vec<&str> = expression.split_whitespace().collect();
     let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
         return None;
     };
-
-    // GitHub uses 5-field POSIX cron; the `cron` crate expects a leading
-    // seconds field, so one is prepended.
-    let build = |day_of_month: &str, day_of_week: &str| {
-        cron::Schedule::from_str(&format!(
-            "0 {minute} {hour} {day_of_month} {month} {day_of_week}"
-        ))
-        .ok()
-    };
-
-    if *day_of_month == "*" || *day_of_week == "*" {
-        return build(day_of_month, day_of_week).map(|schedule| vec![schedule]);
-    }
-    Some(vec![build(day_of_month, "*")?, build("*", day_of_week)?])
-}
-
-/// Rewrites a cron expression's day-of-week field from GitHub's numbering into
-/// the numbering the `cron` crate accepts.
-///
-/// GitHub follows POSIX: `0..=6` for Sunday..Saturday, with `7` also accepted
-/// for Sunday. The `cron` crate uses `1..=7` for Sunday..Saturday and rejects
-/// `0` outright. Left unnormalised, an ordinary Sunday schedule written
-/// `0 5 * * 0` fails to parse and is discarded silently, leaving the workflow
-/// with no cadence at all — or, when it shares a workflow with a second
-/// expression, with the wrong one. Observed live on fredsystems/nixos, whose
-/// weekly `0 5 * * 0` vanished and left a monthly baseline behind.
-///
-/// Returns `None` for anything that is not a 5-field expression, so malformed
-/// input is rejected here rather than reaching the parser.
-fn normalise_day_of_week(expression: &str) -> Option<String> {
-    let fields: Vec<&str> = expression.split_whitespace().collect();
-    let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
-        return None;
-    };
-    let day_of_week = remap_day_of_week_field(day_of_week);
-    Some(format!(
-        "{minute} {hour} {day_of_month} {month} {day_of_week}"
-    ))
-}
-
-/// Remaps every numeric term in a day-of-week field.
-///
-/// Named days (`SUN`) and wildcards pass through untouched: the parser
-/// understands those, and a bare `*/n` selects the same days under either
-/// numbering because both start counting at their own Sunday.
-fn remap_day_of_week_field(field: &str) -> String {
-    field
+    let expanded = day_of_week
         .split(',')
-        .map(remap_day_of_week_term)
+        .map(expand_term_if_reversed)
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    (expanded != *day_of_week).then(|| format!("{minute} {hour} {day_of_month} {month} {expanded}"))
 }
 
-/// Remaps one term of a day-of-week field, expanding ranges to an explicit
-/// list.
-///
-/// A range cannot simply have both endpoints remapped, because the two
-/// numberings disagree about where the week starts and any range spanning
-/// Sunday comes out inverted or collapsed. `0-7` (every day) would become
-/// `1-1`, Sunday alone, and `1-7` would become the empty range `2-1`.
-/// Enumerating the days first and emitting a list sidesteps the ordering.
-fn remap_day_of_week_term(term: &str) -> String {
-    let (range, step) = match term.split_once('/') {
-        Some((range, step)) => match step.parse::<u8>() {
-            Ok(step) if step > 0 => (range, step),
-            _ => return term.to_owned(),
-        },
-        None => (term, 1),
-    };
-
-    let Some(days) = posix_days_of_week(range, step) else {
+/// Expands one day-of-week term if it is a plain numeric range (no step,
+/// no name) whose end precedes its start; otherwise returns it unchanged.
+fn expand_term_if_reversed(term: &str) -> String {
+    let Some((start, end)) = term.split_once('-') else {
         return term.to_owned();
     };
-
-    let mut remapped: Vec<u8> = days.iter().map(|day| day % 7 + 1).collect();
-    remapped.sort_unstable();
-    remapped.dedup();
-
-    remapped
-        .iter()
-        .map(u8::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Enumerates the POSIX day-of-week numbers a single numeric term selects.
-///
-/// Returns `None` for wildcards and named days, which are left for the parser.
-/// Ranges may wrap through Sunday (`5-1` for Friday..Monday), which a plain
-/// endpoint comparison would read as empty.
-fn posix_days_of_week(range: &str, step: u8) -> Option<Vec<u8>> {
-    let (start, end) = if let Some((start, end)) = range.split_once('-') {
-        (start.parse::<u8>().ok()?, end.parse::<u8>().ok()?)
-    } else {
-        let single = range.parse::<u8>().ok()?;
-        (single, single)
+    let Ok(start) = start.parse::<u8>() else {
+        return term.to_owned();
     };
-    if start > 7 || end > 7 {
-        return None;
+    let Ok(end) = end.parse::<u8>() else {
+        return term.to_owned();
+    };
+    if start > end && start <= 7 && end <= 7 {
+        format!("{start}-7,0-{end}")
+    } else {
+        term.to_owned()
     }
-
-    // Both 0 and 7 mean Sunday, so the span is measured modulo the week.
-    let span = if start <= end {
-        end - start
-    } else {
-        7 - start + end
-    };
-    Some(
-        (0..=span)
-            .step_by(usize::from(step))
-            .map(|offset| (start + offset) % 7)
-            .collect(),
-    )
 }
 
 /// Marks a cycle as failed without clearing the previous values.
@@ -1322,10 +1248,11 @@ mod tests {
     }
 
     // GitHub uses POSIX day-of-week numbering, where 0 and 7 both mean Sunday.
-    // The `cron` crate uses 1..=7 with 1 = Sunday, so an unnormalised
-    // `0 5 * * 0` expression fails to parse and the schedule is silently
-    // dropped. Observed live: fredsystems/nixos declares `0 5 * * 0` and the
-    // exporter reported no weekly cadence for it at all.
+    // The `cron` crate this exporter used before croner numbered 1..=7 with
+    // 1 = Sunday, so an unnormalised `0 5 * * 0` failed to parse and the
+    // schedule was silently dropped. Observed live: fredsystems/nixos declares
+    // `0 5 * * 0` and the exporter reported no weekly cadence for it at all.
+    // Kept as a regression test for croner's native 0..=7 handling.
     #[test]
     fn sunday_as_zero_is_a_valid_weekly_cron() {
         let interval = expected_interval_seconds(&["0 5 * * 0".to_owned()])
@@ -1435,9 +1362,10 @@ mod tests {
     }
 
     // POSIX fires when EITHER day field matches, whenever both are restricted.
-    // The `cron` crate intersects them, which read `0 0 1 * 1` as "the 1st,
-    // but only when it is a Monday" -- 273 days between fires instead of 7,
-    // long enough to hide a genuinely dead workflow.
+    // The `cron` crate this exporter used before croner intersected them,
+    // reading `0 0 1 * 1` as "the 1st, but only when it is a Monday" -- 273
+    // days between fires instead of 7, long enough to hide a genuinely dead
+    // workflow. croner unions them by default; this pins that.
     #[test]
     fn a_restricted_day_of_month_and_day_of_week_are_unioned() {
         let interval = expected_interval_seconds(&["0 0 1 * 1".to_owned()]).expect("interval");
@@ -1882,7 +1810,7 @@ mod tests {
             &repo,
             &replayed_reduction_containing("Lint"),
             &cache,
-            Utc::now(),
+            Timestamp::now(),
         );
 
         let rendered = Publisher::new(metrics, registry).render();
@@ -1917,7 +1845,7 @@ mod tests {
             &repo,
             &replayed_reduction_containing("Deploy"),
             &cache,
-            Utc::now(),
+            Timestamp::now(),
         );
 
         let rendered = Publisher::new(metrics, registry).render();
@@ -2207,8 +2135,8 @@ mod tests {
             "a truncated page must not publish a fossil failure"
         );
         assert_eq!(
-            second.latest[0].created_at.to_rfc3339(),
-            "2026-08-16T05:31:31+00:00",
+            second.latest[0].created_at.to_string(),
+            "2026-08-16T05:31:31Z",
             "nor regress the timestamp the staleness alert reads"
         );
     }

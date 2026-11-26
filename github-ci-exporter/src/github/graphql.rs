@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 use super::client::{Client, ClientError};
@@ -112,7 +112,7 @@ struct DiscoveryNode {
     #[serde(rename = "isArchived")]
     is_archived: bool,
     #[serde(rename = "pushedAt")]
-    pushed_at: Option<DateTime<Utc>>,
+    pushed_at: Option<Timestamp>,
     #[serde(rename = "defaultBranchRef")]
     default_branch_ref: Option<BranchRef>,
 }
@@ -132,7 +132,7 @@ struct BranchRef {
 pub struct DiscoveredRepo {
     pub repo: Repo,
     pub is_archived: bool,
-    pub pushed_at: Option<DateTime<Utc>>,
+    pub pushed_at: Option<Timestamp>,
     /// Carried for [`crate::model::RepoIndex`] only; no filter reads it.
     pub description: Option<String>,
 }
@@ -227,7 +227,7 @@ pub struct OpenPull {
     pub author: String,
     pub author_kind: AuthorKind,
     pub is_draft: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Aggregate state of checks on the head commit.
     pub checks: ChecksState,
     pub mergeable: MergeableState,
@@ -289,7 +289,7 @@ struct PullNode {
     #[serde(rename = "isDraft")]
     is_draft: bool,
     #[serde(rename = "createdAt")]
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     author: Option<Actor>,
     mergeable: Option<String>,
     #[serde(rename = "autoMergeRequest")]
@@ -300,7 +300,7 @@ struct PullNode {
 #[derive(Debug, Deserialize)]
 struct AutoMergeRequest {
     #[serde(rename = "enabledAt")]
-    _enabled_at: Option<DateTime<Utc>>,
+    _enabled_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,8 +467,8 @@ pub async fn fetch_activity(
 pub fn partition_repos(
     discovered: Vec<DiscoveredRepo>,
     is_denylisted: &dyn Fn(&str) -> bool,
-    max_age: Option<chrono::Duration>,
-    now: DateTime<Utc>,
+    max_age: Option<SignedDuration>,
+    now: Timestamp,
 ) -> (Vec<Repo>, Vec<(Repo, SkipReason)>) {
     let mut keep = Vec::new();
     let mut skip = Vec::new();
@@ -671,7 +671,7 @@ mod tests {
         }
     }
 
-    fn discovered(name: &str, archived: bool, pushed: Option<DateTime<Utc>>) -> DiscoveredRepo {
+    fn discovered(name: &str, archived: bool, pushed: Option<Timestamp>) -> DiscoveredRepo {
         DiscoveredRepo {
             repo: repo("sdr-enthusiasts", name),
             is_archived: archived,
@@ -769,7 +769,8 @@ mod tests {
             .map(|d| d.to_index_entry().name)
             .collect();
 
-        let (monitored, _skipped) = partition_repos(discovered_repos, &|_| false, None, Utc::now());
+        let (monitored, _skipped) =
+            partition_repos(discovered_repos, &|_| false, None, Timestamp::now());
         let watched: Vec<String> = monitored.into_iter().map(|r| r.name).collect();
 
         assert_eq!(indexed, ["live", "archived"], "the index keeps both");
@@ -801,7 +802,7 @@ mod tests {
             author: "someone".to_owned(),
             author_kind: AuthorKind::Human,
             is_draft,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             checks,
             mergeable,
             auto_merge,
@@ -913,7 +914,7 @@ mod tests {
             discovered("sdre-hub", true, None),
             discovered("docker-tar1090", false, None),
         ];
-        let (keep, skip) = partition_repos(input, &|_| false, None, Utc::now());
+        let (keep, skip) = partition_repos(input, &|_| false, None, Timestamp::now());
 
         assert_eq!(keep.len(), 1);
         assert_eq!(keep[0].name, "docker-tar1090");
@@ -931,24 +932,28 @@ mod tests {
             input,
             &|name| name == "sdr-enthusiasts/sdr-enthusiast-website",
             None,
-            Utc::now(),
+            Timestamp::now(),
         );
 
         assert_eq!(keep.len(), 1);
         assert_eq!(skip[0].1, SkipReason::Denylisted);
     }
 
+    /// Days expressed as a [`SignedDuration`], for the max-age tests below.
+    fn days(count: i64) -> SignedDuration {
+        SignedDuration::from_hours(count * 24)
+    }
+
     #[test]
     fn inactive_repos_are_skipped_only_when_a_window_is_set() {
-        let now = Utc::now();
-        let stale = now - chrono::Duration::days(900);
+        let now = Timestamp::now();
+        let stale = now - days(900);
         let input = vec![discovered("rbfeeder", false, Some(stale))];
 
         let (keep, _) = partition_repos(input.clone(), &|_| false, None, now);
         assert_eq!(keep.len(), 1, "no window means keep everything");
 
-        let (keep, skip) =
-            partition_repos(input, &|_| false, Some(chrono::Duration::days(365)), now);
+        let (keep, skip) = partition_repos(input, &|_| false, Some(days(365)), now);
         assert_eq!(keep, Vec::<crate::model::Repo>::new());
         assert_eq!(skip[0].1, SkipReason::Inactive);
     }
@@ -956,12 +961,7 @@ mod tests {
     #[test]
     fn repos_with_unknown_push_date_are_kept() {
         let input = vec![discovered("mystery", false, None)];
-        let (keep, _) = partition_repos(
-            input,
-            &|_| false,
-            Some(chrono::Duration::days(30)),
-            Utc::now(),
-        );
+        let (keep, _) = partition_repos(input, &|_| false, Some(days(30)), Timestamp::now());
         assert_eq!(keep.len(), 1);
     }
 }

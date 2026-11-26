@@ -50,7 +50,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -68,7 +68,7 @@ const RUNS_PER_PAGE: usize = 100;
 /// that ancient conclusion produces an alert nobody can clear without an
 /// artificial push. Past this age the run is marked stale and stops
 /// contributing a conclusion.
-pub const STALE_RUN_AGE: chrono::TimeDelta = chrono::TimeDelta::days(90);
+pub const STALE_RUN_AGE: SignedDuration = SignedDuration::from_hours(90 * 24);
 
 #[derive(Debug, Deserialize)]
 struct WorkflowsResponse {
@@ -303,7 +303,7 @@ struct RunEntry {
     status: String,
     conclusion: Option<String>,
     event: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     html_url: String,
 }
 
@@ -313,14 +313,14 @@ pub struct LatestRun {
     pub workflow: String,
     pub conclusion: RunConclusion,
     pub event: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub html_url: String,
 }
 
 impl LatestRun {
     /// Whether this run is too old to describe the current code.
     #[must_use]
-    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_stale(&self, now: Timestamp) -> bool {
         now - self.created_at > STALE_RUN_AGE
     }
 }
@@ -334,7 +334,7 @@ pub struct RepoRuns {
     pub latest: Vec<LatestRun>,
     /// Last success per workflow, used to express "how long has this been
     /// broken" and to detect stalled scheduled workflows.
-    pub last_success: HashMap<String, DateTime<Utc>>,
+    pub last_success: HashMap<String, Timestamp>,
 }
 
 impl RepoRuns {
@@ -633,7 +633,7 @@ fn reduce_runs(runs: Vec<RunEntry>, live: &[Workflow], default_branch: &str) -> 
         live.iter().map(|w| (w.path.as_str(), w)).collect();
 
     let mut latest: HashMap<String, LatestRun> = HashMap::new();
-    let mut last_success: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut last_success: HashMap<String, Timestamp> = HashMap::new();
 
     for run in runs {
         // The branch is selected here, not by the API. See this module's "Why
@@ -1113,8 +1113,8 @@ mod tests {
         assert_eq!(reduced.latest.len(), 1);
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Success);
         assert_eq!(
-            reduced.latest[0].created_at.to_rfc3339(),
-            "2026-08-09T00:00:00+00:00"
+            reduced.latest[0].created_at.to_string(),
+            "2026-08-09T00:00:00Z"
         );
     }
 
@@ -1153,8 +1153,8 @@ mod tests {
             .expect("CI present");
         assert_eq!(ci.conclusion, RunConclusion::Success);
         assert_eq!(
-            ci.created_at.to_rfc3339(),
-            "2026-08-09T00:00:00+00:00",
+            ci.created_at.to_string(),
+            "2026-08-09T00:00:00Z",
             "newest run must win regardless of input order"
         );
     }
@@ -1203,8 +1203,8 @@ mod tests {
 
         assert_eq!(reduced.latest[0].conclusion, RunConclusion::Failure);
         assert_eq!(
-            reduced.last_success.get("CI").map(DateTime::to_rfc3339),
-            Some("2026-08-01T00:00:00+00:00".to_owned()),
+            reduced.last_success.get("CI").map(Timestamp::to_string),
+            Some("2026-08-01T00:00:00Z".to_owned()),
             "a later failure must not erase the last known success"
         );
     }
@@ -1472,7 +1472,7 @@ mod tests {
         let reduced = reduce(vec![run], &live(&["Lint"]));
         let latest = reduced.latest.first().expect("run retained");
 
-        let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
+        let now: Timestamp = "2026-08-10T00:00:00Z".parse().expect("timestamp");
         assert!(latest.is_stale(now), "an 8-month-old run must be stale");
     }
 
@@ -1488,7 +1488,7 @@ mod tests {
         let reduced = reduce(vec![run], &live(&["CI"]));
         let latest = reduced.latest.first().expect("run retained");
 
-        let now: DateTime<Utc> = "2026-08-10T00:00:00Z".parse().expect("timestamp");
+        let now: Timestamp = "2026-08-10T00:00:00Z".parse().expect("timestamp");
         assert!(!latest.is_stale(now), "a 9-day-old failure is actionable");
     }
 
@@ -1507,7 +1507,7 @@ mod tests {
         // Exactly 90 days is not yet stale; a second past it is.
         let at_horizon = latest.created_at + STALE_RUN_AGE;
         assert!(!latest.is_stale(at_horizon));
-        assert!(latest.is_stale(at_horizon + chrono::TimeDelta::seconds(1)));
+        assert!(latest.is_stale(at_horizon + SignedDuration::from_secs(1)));
     }
 
     #[test]
@@ -1778,7 +1778,7 @@ on:
 
     /// A reduction asserting `workflow`'s newest run.
     fn reduction(workflow: &str, conclusion: RunConclusion, created: &str) -> RepoRuns {
-        let created_at: DateTime<Utc> = created.parse().expect("valid timestamp");
+        let created_at: Timestamp = created.parse().expect("valid timestamp");
         RepoRuns {
             latest: vec![LatestRun {
                 workflow: workflow.to_owned(),
@@ -1795,7 +1795,7 @@ on:
         runs.latest
             .iter()
             .find(|r| r.workflow == workflow)
-            .map(|r| (r.conclusion, r.created_at.to_rfc3339()))
+            .map(|r| (r.conclusion, r.created_at.to_string()))
     }
 
     #[test]
@@ -1840,10 +1840,7 @@ on:
 
         assert_eq!(
             newest_of(&reconciled, "update-flakes"),
-            Some((
-                RunConclusion::Success,
-                "2026-08-16T05:31:31+00:00".to_owned()
-            )),
+            Some((RunConclusion::Success, "2026-08-16T05:31:31Z".to_owned())),
             "an older observation must not overwrite a newer one"
         );
     }
@@ -1865,10 +1862,7 @@ on:
 
         assert_eq!(
             newest_of(&reconciled, "update-flakes"),
-            Some((
-                RunConclusion::Success,
-                "2026-08-16T05:31:31+00:00".to_owned()
-            )),
+            Some((RunConclusion::Success, "2026-08-16T05:31:31Z".to_owned())),
             "an empty response is a lost update, not a deletion"
         );
     }
@@ -1885,10 +1879,7 @@ on:
 
         assert_eq!(
             newest_of(&reconciled, "CI"),
-            Some((
-                RunConclusion::Failure,
-                "2026-08-19T00:00:00+00:00".to_owned()
-            )),
+            Some((RunConclusion::Failure, "2026-08-19T00:00:00Z".to_owned())),
             "a real failure must still be published"
         );
     }
@@ -1949,8 +1940,8 @@ on:
         let reconciled = truncated.reconciled_with(&known, &live(&["CI"]));
 
         assert_eq!(
-            reconciled.last_success.get("CI").map(DateTime::to_rfc3339),
-            Some("2026-08-16T00:00:00+00:00".to_owned())
+            reconciled.last_success.get("CI").map(Timestamp::to_string),
+            Some("2026-08-16T00:00:00Z".to_owned())
         );
     }
 
@@ -1970,8 +1961,8 @@ on:
         let reconciled = fresh.reconciled_with(&known, &live(&["CI"]));
 
         assert_eq!(
-            reconciled.last_success.get("CI").map(DateTime::to_rfc3339),
-            Some("2026-08-16T00:00:00+00:00".to_owned())
+            reconciled.last_success.get("CI").map(Timestamp::to_string),
+            Some("2026-08-16T00:00:00Z".to_owned())
         );
     }
 

@@ -442,6 +442,22 @@ Each tracked input is classified from how it is locked -- a GitHub branch
 `channels.nixos.org` tarball -- and, where it applies, labelled with the NixOS
 channel it tracks (`nixos-unstable`, `nixos-26.05`, ...).
 
+A branch of `nixos/nixpkgs` itself is labelled this way when it is named
+`nixos-*` or `nixpkgs-*`. Separately, a branch of a repository listed in
+`release_branch_repos` (`owner/name`, matched case-insensitively) is labelled
+the same way when it is locked to exactly `release-<major>.<minor>`
+(`release-26.05` -> `nixos-26.05`) -- some inputs cut that branch in lockstep
+with the matching NixOS release even though the repository is not
+`nixos/nixpkgs`, so its branch lifecycle *is* that channel's. Defaults to
+`["nix-community/home-manager", "catppuccin/nix"]`, both confirmed to cut
+their `release-YY.MM` branch that way; anything else -- `release-1.x`,
+`release-26.05-foo`, a different ref shape, or a repository not in the list
+-- gets no channel label. A mapped branch is still resolved as a normal
+branch against its own upstream head (see "Upstream comparison" below); only
+the `channel` label changes, which feeds it into the same `nixos_channel_*`
+series -- and therefore the same EOL/superseded alerting -- as a
+`nixos/nixpkgs` channel branch or a `channels.nixos.org` tarball node.
+
 This pass runs on its own interval (`flake_interval`, default `1h`, minimum
 `15m`), separate from and much slower than the CI poll interval:
 `flake.lock` changes on the order of days to weeks, so polling it every few
@@ -494,8 +510,11 @@ the exporter runs three instant queries against `nixos_prometheus_url`
 (`https://prometheus.nixos.org` by default) for exactly the channels those
 nodes reference:
 
-- `channel_revision` for each channel's current revision and whether it is
-  still supported (`current="1"`, `current="0"` for end of life).
+- `channel_revision` for each channel's current revision, whether it is
+  still supported (`current="1"`, `current="0"` for end of life), and its
+  lifecycle `status` (`rolling`, `beta`, `stable`, `deprecated`, or
+  `unmaintained`): `deprecated` means a newer stable release exists but this
+  one is still supported, `unmaintained` means it is end of life.
 - `channel_update_time` for when that revision last changed.
 - `hydra_job_failed{exported_job=~".*tested"}` for whether any of a
   channel's `tested`-suffixed Hydra jobs -- the gate every package in the
@@ -524,21 +543,30 @@ Published **unprefixed**, alongside the exporter's `github_`-prefixed
 registry in the same `/metrics` response, because these describe NixOS
 infrastructure the exporter merely observes:
 
-| Metric                                   | Type  | Labels    |
-| ----------------------------------------- | ----- | --------- |
-| `nixos_channel_update_timestamp_seconds` | gauge | `channel` |
-| `nixos_channel_current`                  | gauge | `channel` |
-| `nixos_channel_tested_failed`            | gauge | `channel` |
-| `nixos_channel_status_up`                | gauge | --        |
+| Metric                                    | Type  | Labels              |
+| ------------------------------------------ | ----- | -------------------- |
+| `nixos_channel_update_timestamp_seconds` | gauge | `channel`            |
+| `nixos_channel_current`                  | gauge | `channel`            |
+| `nixos_channel_tested_failed`            | gauge | `channel`            |
+| `nixos_channel_info`                     | gauge | `channel`, `status`  |
+| `nixos_channel_status_up`                | gauge | --                   |
 
 `nixos_channel_current` is `1` if the channel is still supported, `0` if it
 is end of life. `nixos_channel_tested_failed` is `1` if any of a channel's
 `tested`-suffixed Hydra jobs is failing, `0` if all are passing, and absent
-if the channel has never been evaluated by one. `nixos_channel_status_up` is
-`1` if the last fetch succeeded, `0` if it failed and cached values are
-being served, and absent entirely before the exporter has ever attempted a
-fetch -- which, since the fetch itself only runs when a tracked node
-references a channel, includes every deployment that never configures one.
+if the channel has never been evaluated by one. `nixos_channel_info` is
+always `1`; its `status` label carries the channel's lifecycle verbatim from
+`prometheus.nixos.org` (`rolling`, `beta`, `stable`, `deprecated`, or
+`unmaintained`), and no series is published for a channel upstream reports no
+`status` for. `deprecated` means a newer stable release has superseded this
+one but it is still supported; `unmaintained` means it is end of life --
+`nixos_channel_current` tracks that same boundary as `0`, so `deprecated` is
+the status to alert on for "move off this input soon" while it is still `1`.
+`nixos_channel_status_up` is `1` if the last fetch succeeded, `0` if it
+failed and cached values are being served, and absent entirely before the
+exporter has ever attempted a fetch -- which, since the fetch itself only
+runs when a tracked node references a channel, includes every deployment
+that never configures one.
 
 ### Impact
 
@@ -566,6 +594,7 @@ skip_repos_without_workflows = true
 flake_repos = []
 flake_interval = "1h"
 nixos_prometheus_url = "https://prometheus.nixos.org"
+release_branch_repos = ["nix-community/home-manager", "catppuccin/nix"]
 ```
 
 The token is never a config-file field. Supply it with `GHCI_TOKEN` or
@@ -599,7 +628,9 @@ The flake exports a NixOS module:
 
     # Optional: track these repositories' flake inputs (see "Flake input
     # tracking"). flakeInterval defaults to "1h" (minimum 15m);
-    # nixosPrometheusUrl defaults to https://prometheus.nixos.org.
+    # nixosPrometheusUrl defaults to https://prometheus.nixos.org;
+    # releaseBranchRepos defaults to [ "nix-community/home-manager"
+    # "catppuccin/nix" ].
     flakeRepos = [ "fredsystems/nixos" ];
   };
 }
